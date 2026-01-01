@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::error::{Result, ThermiteError};
 use crate::steps::changelog::read_current_version;
 use crate::types::package_version::RustcPackageVersion;
-use crate::types::ubuntu::UbuntuRelease;
+use crate::types::ubuntu::{UbuntuRelease, is_known_series};
 use crate::types::versions::RustVersion;
 
 // ---------------------------------------------------------------------------
@@ -264,7 +264,14 @@ fn resolve_series(series: Option<&str>, release: Option<&str>) -> Result<Option<
         (Some(_), Some(_)) => Err(ThermiteError::InvalidRustVersion(
             "--series and --release are mutually exclusive".to_owned(),
         )),
-        (Some(s), None) => Ok(Some(s.to_owned())),
+        (Some(s), None) => {
+            if !is_known_series(s) {
+                return Err(ThermiteError::InvalidRustVersion(format!(
+                    "unknown Ubuntu series '{s}': expected a known series number (e.g. '24.04')"
+                )));
+            }
+            Ok(Some(s.to_owned()))
+        }
         (None, Some(r)) => {
             let ubuntu_release = UbuntuRelease::parse(r)?;
             Ok(Some(ubuntu_release.series_number().to_owned()))
@@ -446,6 +453,13 @@ mod tests {
     fn resolve_series_unknown_release() {
         let result = resolve_series(None, Some("nonexistent"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_series_rejects_unknown_series_number() {
+        assert!(resolve_series(Some("banana"), None).is_err());
+        assert!(resolve_series(Some("20.4"), None).is_err());
+        assert!(resolve_series(Some(""), None).is_err());
     }
 
     #[test]
