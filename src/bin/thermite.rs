@@ -663,3 +663,51 @@ fn convert_bump_operation(cmd: BumpOperationCmd) -> (Option<String>, bool, versi
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bump_operation_precedes_the_input_argument() {
+        // Documented order: `thermite version bump <operation> [INPUT]`.
+        assert!(
+            Cli::try_parse_from([
+                "thermite",
+                "version",
+                "bump",
+                "ubuntu-revision",
+                "1.95.0+dfsg-0ubuntu1",
+            ])
+            .is_ok()
+        );
+        // The version string is not a subcommand name.
+        assert!(
+            Cli::try_parse_from([
+                "thermite",
+                "version",
+                "bump",
+                "1.95.0+dfsg-0ubuntu1",
+                "ubuntu-revision",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn changelog_input_is_positional_not_a_flag() {
+        // INPUT defaults to the current directory; there is no --from-changelog.
+        assert!(Cli::try_parse_from(["thermite", "version", "parse"]).is_ok());
+        assert!(Cli::try_parse_from(["thermite", "version", "parse", "--from-changelog"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "thermite",
+                "version",
+                "bump",
+                "ubuntu-revision",
+                "--from-changelog",
+            ])
+            .is_err()
+        );
+    }
+}

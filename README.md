@@ -249,8 +249,8 @@ thermite version parse "1.90.0+dfsg2~24.04-0ubuntu3~24.04.1"
 thermite version parse "1.90.0+dfsg2~24.04-0ubuntu3~24.04.1" --json
 # {"upstream":{"major":1,"minor":90,"patch":0},"repack_number":2,...}
 
-# Or read from debian/changelog:
-thermite version parse --from-changelog
+# Or read the version from debian/changelog in the current directory:
+thermite version parse
 ```
 
 #### `thermite version explain`
@@ -279,23 +279,24 @@ Apply a bump operation to a version string:
 
 ```sh
 # Increment Ubuntu revision
-thermite version bump "1.95.0+dfsg-0ubuntu1" ubuntu-revision
+thermite version bump ubuntu-revision "1.95.0+dfsg-0ubuntu1"
 # 1.95.0+dfsg-0ubuntu2
 
 # Generate a backport version
-thermite version bump "1.95.0+dfsg-0ubuntu2" backport --release noble
+thermite version bump backport "1.95.0+dfsg-0ubuntu2" --release noble
 # 1.95.0+dfsg~24.04-0ubuntu2~24.04.1
 
 # Retarget to a different series
-thermite version bump "1.90.0+dfsg2~24.04-0ubuntu3~24.04.1" retarget --series 22.04
+thermite version bump retarget "1.90.0+dfsg2~24.04-0ubuntu3~24.04.1" --series 22.04
 # 1.90.0+dfsg2~22.04-0ubuntu3~22.04.1
 
 # Increment PPA number
-thermite version bump "1.95.0+dfsg-0ubuntu1" ppa
+thermite version bump ppa "1.95.0+dfsg-0ubuntu1"
 # 1.95.0+dfsg-0ubuntu1~ppa1
 
-# Read from changelog:
-thermite version bump --from-changelog ubuntu-revision
+# Read the version from debian/changelog in the current directory
+# (omit INPUT):
+thermite version bump ubuntu-revision
 ```
 
 ### `thermite tarball`
