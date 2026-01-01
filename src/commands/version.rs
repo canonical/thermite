@@ -140,12 +140,15 @@ pub fn run_bump(input: Option<&str>, operation: &BumpOperation, json: bool) -> R
             v.to_backport(&resolved);
         }
         BumpOperation::BackportRevision => {
+            require_backport(&v)?;
             v.bump_backport_revision();
         }
         BumpOperation::BackportRepack => {
+            require_backport(&v)?;
             v.bump_backport_repack();
         }
         BumpOperation::Retarget { series, release } => {
+            require_backport(&v)?;
             let resolved =
                 resolve_series(series.as_deref(), release.as_deref())?.ok_or_else(|| {
                     ThermiteError::InvalidRustVersion(
@@ -241,6 +244,19 @@ pub enum BumpOperation {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Reject bump operations that presuppose an existing backport version.
+fn require_backport(v: &RustcPackageVersion) -> Result<()> {
+    if v.is_backport() {
+        Ok(())
+    } else {
+        Err(ThermiteError::InvalidRustVersion(
+            "operation requires a backport version (one with a '~<series>' suffix); \
+             use 'thermite version bump backport' to create one"
+                .to_owned(),
+        ))
+    }
+}
 
 /// Resolve a series from `--series` or `--release` (mutually exclusive).
 fn resolve_series(series: Option<&str>, release: Option<&str>) -> Result<Option<String>> {
@@ -632,6 +648,41 @@ mod tests {
             Some("1.95.0+dfsg-0ubuntu2"),
             &BumpOperation::Backport {
                 series: None,
+                release: None,
+            },
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_bump_backport_revision_requires_backport() {
+        // Without a '~<series>' suffix the bump is a silent no-op; it must
+        // error instead.
+        let result = run_bump(
+            Some("1.95.0+dfsg-0ubuntu1"),
+            &BumpOperation::BackportRevision,
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_bump_backport_repack_requires_backport() {
+        let result = run_bump(
+            Some("1.95.0+dfsg-0ubuntu1"),
+            &BumpOperation::BackportRepack,
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_bump_retarget_requires_backport() {
+        let result = run_bump(
+            Some("1.95.0+dfsg-0ubuntu1"),
+            &BumpOperation::Retarget {
+                series: Some("22.04".to_owned()),
                 release: None,
             },
             false,
