@@ -91,7 +91,7 @@ impl RustcPackageVersion {
         let upstream = RustVersion::parse(before_dfsg)?;
 
         // Parse what comes after "+dfsg": [<repack_number>][~<series>[.<bp_repack>]][~stage0]
-        let (repack_number, after_repack) = parse_repack_number(after_dfsg);
+        let (repack_number, after_repack) = parse_repack_number(after_dfsg)?;
 
         // Check for ~stage0 and ~<series>[.<backport_repack>]
         let (series, backport_repack, stage0) = parse_upstream_suffixes(after_repack)?;
@@ -131,6 +131,7 @@ impl RustcPackageVersion {
     /// - Sets `series` to the target series.
     /// - Resets `backport_repack` to `None`.
     /// - Resets `backport_revision` to `1`.
+    /// - Clears the stage0 marker (`stage0 = false`).
     /// - Clears `ppa` suffix.
     /// - Preserves `upstream`, `repack_number`, and `ubuntu_revision`.
     ///
@@ -314,9 +315,9 @@ fn strip_ppa_suffix(s: &str) -> (&str, Option<u32>) {
 /// Returns `(repack_number, remaining_str)`.
 /// If the first character(s) after `+dfsg` are digits, those form the repack
 /// number. Otherwise `repack_number` is `None`.
-fn parse_repack_number(s: &str) -> (Option<u32>, &str) {
+fn parse_repack_number(s: &str) -> Result<(Option<u32>, &str)> {
     if s.is_empty() {
-        return (None, s);
+        return Ok((None, s));
     }
 
     // Count leading digits.
@@ -328,12 +329,16 @@ fn parse_repack_number(s: &str) -> (Option<u32>, &str) {
         .unwrap_or(0);
 
     if digit_end == 0 {
-        return (None, s);
+        return Ok((None, s));
     }
 
     let num_str = &s[..digit_end];
-    let number = num_str.parse::<u32>().ok();
-    (number, &s[digit_end..])
+    let number = num_str.parse::<u32>().map_err(|_| {
+        ThermiteError::InvalidRustVersion(format!(
+            "repack number '{num_str}' after '+dfsg' is not a valid number"
+        ))
+    })?;
+    Ok((Some(number), &s[digit_end..]))
 }
 
 /// Parse the suffixes after the repack number in the upstream part.
@@ -782,6 +787,12 @@ mod tests {
     #[test]
     fn parse_non_numeric_ubuntu_revision() {
         assert!(RustcPackageVersion::parse("1.85.0+dfsg-0ubuntux").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_repack_number_overflow() {
+        // The digits must not be silently swallowed when they don't fit u32.
+        assert!(RustcPackageVersion::parse("1.95.0+dfsg99999999999-0ubuntu1").is_err());
     }
 
     #[test]
