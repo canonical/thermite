@@ -1,3 +1,5 @@
+<img width="1024" height="559" alt="thermite_logo-small" src="https://github.com/user-attachments/assets/b680da77-5fc6-452c-a24c-5c49d6f9cbf9" />
+
 # thermite
 
 **thermite is beta software.  Please use it with caution and report any bugs you discover.**
