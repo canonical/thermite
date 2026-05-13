@@ -1,0 +1,21 @@
+{
+    "name": "Ubuntu Rust Toolchain Packaging Container",
+    "initializeCommand": "echo 'FROM scratch' | podman build -t scratch-alias -",
+    "dockerFile": "Containerfile",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer"
+            ]
+        }
+    },
+    "forwardPorts": [
+        8000,
+        8080
+    ],
+    "runArgs": [
+        "--gpus", "all",
+        "--userns=keep-id",
+        "--security-opt=label=disable"
+    ]
+}
