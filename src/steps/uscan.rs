@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use tracing::warn;
+
 use crate::error::{Result, ThermiteError};
 use crate::shell::run_command;
 use crate::types::versions::RustVersion;
@@ -8,6 +10,47 @@ use crate::types::versions::RustVersion;
 /// 403 rate-limit response is detected: first retry after 15 s, second after
 /// 30 s, third after 60 s.
 const RETRY_DELAYS: [u64; 3] = [15, 30, 60];
+
+/// Update `debian/watch` so that the URL regex matches the new upstream version
+/// rather than the old one.
+///
+/// The watch file for a versioned Rust package pins the minor version inside
+/// the URL regex (e.g. `1\.84\.\d+`) so that uscan only picks up point
+/// releases within that series. When creating a new versioned package branch
+/// (e.g. moving from `rustc-1.84` to `rustc-1.85`), this pattern must be
+/// updated before uscan is run, otherwise `--download-version X.Y.Z` finds no
+/// matching URL and the download fails.
+///
+/// Replaces both:
+/// * The regex-escaped form: `1\.84` → `1\.85`
+/// * The literal form: `1.84` → `1.85`
+///
+/// A warning is logged (but no error returned) when neither form is found,
+/// so that the caller can surface it to the user without failing hard.
+pub fn update_watch_version(watch_path: &Path, old_short: &str, new_short: &str) -> Result<()> {
+    let content = std::fs::read_to_string(watch_path)?;
+
+    // Build the regex-escaped form by replacing `.` with `\.`.
+    let old_escaped = old_short.replace('.', r"\.");
+    let new_escaped = new_short.replace('.', r"\.");
+
+    // Replace escaped form first so the subsequent literal replacement does
+    // not accidentally re-process already-updated text.
+    let updated = content
+        .replace(&old_escaped, &new_escaped)
+        .replace(old_short, new_short);
+
+    if updated == content {
+        warn!(
+            "debian/watch did not contain old version '{}' — \
+             the file may need to be updated manually",
+            old_short
+        );
+    }
+
+    std::fs::write(watch_path, updated)?;
+    Ok(())
+}
 
 /// Returns `true` when the combined uscan output suggests a 403 rate-limit
 /// error, allowing the caller to decide whether to retry.

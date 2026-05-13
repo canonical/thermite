@@ -137,6 +137,14 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
         .collect();
     print!("{first_lines}");
 
+    let watch_path = repo_dir.join("debian/watch");
+    info!(
+        "updating debian/watch version {} -> {}",
+        old_short, new_short
+    );
+    uscan::update_watch_version(&watch_path, &old_short.to_string(), &new_short.to_string())?;
+    println!("  debian/watch updated: {old_short} → {new_short}");
+
     // ── Phase 4: Temporarily Include All Vendored Dependencies ───────────────
     print_phase_header(4, "Temporarily Include All Vendored Dependencies");
 
