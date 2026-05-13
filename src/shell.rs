@@ -1,11 +1,30 @@
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, info};
 
 use crate::error::{Result, ThermiteError};
+
+/// Whether verbose output is enabled for this process.
+///
+/// Set once at startup via [`set_verbose`]; read anywhere via [`is_verbose`].
+static VERBOSE: OnceLock<bool> = OnceLock::new();
+
+/// Enable or disable verbose command output.
+///
+/// Must be called before any commands are run.  Subsequent calls are silently
+/// ignored (the flag is immutable after the first call).
+pub fn set_verbose(verbose: bool) {
+    let _ = VERBOSE.set(verbose);
+}
+
+/// Returns `true` if verbose mode is active.
+pub fn is_verbose() -> bool {
+    VERBOSE.get().copied().unwrap_or(false)
+}
 
 /// Output captured from a completed external command.
 #[derive(Debug)]
@@ -28,6 +47,9 @@ pub async fn run_command(
 ) -> Result<CommandOutput> {
     let display_cmd = format!("{} {}", program, args.join(" "));
     debug!("running: {display_cmd}");
+    if is_verbose() {
+        println!("+ {display_cmd}");
+    }
 
     // Check the program exists on PATH before spawning so we surface a clear
     // error rather than a cryptic OS error.

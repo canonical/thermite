@@ -5,12 +5,17 @@ use tracing_subscriber::EnvFilter;
 
 use thermite::commands::update;
 use thermite::error::Result;
+use thermite::shell;
 use thermite::types::params::UpdateParams;
 
 /// thermite — Ubuntu Rust toolchain packaging tool.
 #[derive(Debug, Parser)]
 #[command(name = "thermite", version, about)]
 struct Cli {
+    /// Print each external command before it is executed.
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -66,6 +71,8 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    shell::set_verbose(cli.verbose);
 
     match cli.command {
         Commands::Update {
