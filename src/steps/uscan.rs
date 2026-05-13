@@ -1,35 +1,85 @@
 use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{Result, ThermiteError};
 use crate::shell::run_command;
 use crate::types::versions::RustVersion;
+
+/// Delays (in seconds) between successive uscan retry attempts when a
+/// 403 rate-limit response is detected: first retry after 15 s, second after
+/// 30 s, third after 60 s.
+const RETRY_DELAYS: [u64; 3] = [15, 30, 60];
+
+/// Returns `true` when the combined uscan output suggests a 403 rate-limit
+/// error, allowing the caller to decide whether to retry.
+fn is_rate_limit_error(stdout: &str, stderr: &str) -> bool {
+    [stdout, stderr].iter().any(|s| {
+        let lower = s.to_ascii_lowercase();
+        lower.contains("403") || lower.contains("rate limit")
+    })
+}
 
 /// Run `uscan --download-version <version>` from `repo_dir`, streaming output
 /// to the terminal and saving it to `log_path`.
 ///
+/// If uscan exits with a 403 rate-limit error the step is retried up to three
+/// times, pausing for 15 s, 30 s, and 60 s respectively between attempts.
+///
 /// Returns the path to the generated orig tarball in the parent directory.
 pub async fn run_uscan(repo_dir: &Path, version: &RustVersion, log_path: &Path) -> Result<PathBuf> {
     let version_str = version.to_string();
-    let output = run_command(
-        "uscan",
-        &["--download-version", &version_str, "-v"],
-        repo_dir,
-        &[],
-    )
-    .await?;
+    // attempt 0 = first try, attempts 1-3 = retries after rate-limit.
+    let mut last_rate_limit_err: Option<ThermiteError> = None;
 
-    // uscan places the tarball in the parent directory. By convention the name
-    // ends with `1` (the uscan-generated suffix) before we rename it.
-    let short = version.short();
-    let tarball_name = format!("rustc-{short}_{version}+dfsg1.orig.tar.xz");
-    let tarball = repo_dir.parent().unwrap_or(repo_dir).join(&tarball_name);
+    for attempt in 0_u32..4 {
+        if attempt > 0 {
+            let secs = RETRY_DELAYS[(attempt - 1) as usize];
+            println!("  Rate limit detected. Retrying in {secs} seconds . . .");
+            crate::ui::countdown_secs(secs).await;
+        }
 
-    // Finding 7: write the full uscan output to log_path so that the audit
-    // trail is available for debugging file-exclusion and repack issues.
-    let log_content = output.stdout.clone() + &output.stderr;
-    std::fs::write(log_path, &log_content)?;
+        match run_command(
+            "uscan",
+            &["--download-version", &version_str, "-v"],
+            repo_dir,
+            &[],
+        )
+        .await
+        {
+            Ok(output) => {
+                let short = version.short();
+                let tarball_name = format!("rustc-{short}_{version}+dfsg1.orig.tar.xz");
+                let tarball = repo_dir.parent().unwrap_or(repo_dir).join(&tarball_name);
 
-    Ok(tarball)
+                let log_content = output.stdout + &output.stderr;
+                std::fs::write(log_path, &log_content)?;
+
+                return Ok(tarball);
+            }
+            Err(e) => {
+                let rate_limited = if let ThermiteError::CommandFailed {
+                    ref stdout,
+                    ref stderr,
+                    ..
+                } = e
+                {
+                    is_rate_limit_error(stdout, stderr)
+                } else {
+                    false
+                };
+
+                if rate_limited && attempt < 3 {
+                    last_rate_limit_err = Some(e);
+                    // continue to next attempt
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // All three retries exhausted — surface the last rate-limit error.
+    Err(last_rate_limit_err
+        .expect("loop invariant: last_rate_limit_err is set before reaching this point"))
 }
 
 /// Rename a tarball by replacing its current stem suffix with `new_suffix`.

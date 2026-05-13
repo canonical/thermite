@@ -75,3 +75,18 @@ pub fn prompt_input(prompt: &str) -> String {
     io::stdin().read_line(&mut buf).ok();
     buf.trim().to_owned()
 }
+
+/// Print a countdown from `secs` to 1, rewriting the same terminal line each
+/// second, then erase the line when done.
+///
+/// Call this immediately after printing a "Retrying in X seconds" message.
+pub async fn countdown_secs(secs: u64) {
+    for remaining in (1..=secs).rev() {
+        print!("\r  {remaining:3}s remaining...   ");
+        io::stdout().flush().ok();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+    // Erase the countdown line so subsequent output starts cleanly.
+    print!("\r{:30}\r", "");
+    io::stdout().flush().ok();
+}
