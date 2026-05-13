@@ -43,7 +43,7 @@ These parameters are used as described in the 'backport' workflow: https://docum
 - `/src/bin`: binary entry points for the application; the thermite.rs source code for the thermite command-line tool is found here
 - `/src/lib.rs`: top-level library for shared modules and functionality
 - `/test`: top-level folder for integration tests
-- `/plan`: top-level folder containing implementation plans for the 'update' and 'backport' workflows.  These are markdown files that describe the implementation plan for each workflow in detail, including the steps to be taken, the expected inputs and outputs, and any relevant references or documentation.
+- `/plans`: top-level folder containing implementation plans for the 'update' and 'backport' workflows.  These are markdown files that describe the implementation plan for each workflow in detail, including the steps to be taken, the expected inputs and outputs, and any relevant references or documentation.
 - `/docs`: top-level folder for documentation related to the project, including design documents, user guides, and reference materials.
 - `/examples`: top-level folder for example code and usage demonstrations for the thermite tool.
 

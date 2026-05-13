@@ -1,0 +1,12 @@
+pub mod autopkgtest;
+pub mod build;
+pub mod changelog;
+pub mod control;
+pub mod copyright;
+pub mod gbp;
+pub mod git;
+pub mod lintian;
+pub mod patches;
+pub mod ppa;
+pub mod uscan;
+pub mod vendor;
