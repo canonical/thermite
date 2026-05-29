@@ -47,6 +47,10 @@ pub async fn install_cargo_vendor_filterer(version: &RustVersion) -> Result<()> 
 /// Generate the pruned vendor tarball component by running
 /// `debian/rules vendor-tarball` with `RUST_BOOTSTRAP_DIR` set.
 ///
+/// `dfsg_suffix` is appended after `+dfsg` in the tarball filename to match
+/// the upstream version in `debian/changelog`.  For backports this is the
+/// series suffix (e.g. `"~20.04"`); for main-series builds pass `""`.
+///
 /// Returns the path to the generated vendor tarball component.
 ///
 /// Finding 6: use the known naming convention derived from `version` instead
@@ -56,6 +60,7 @@ pub async fn generate_vendor_tarball(
     repo_dir: &Path,
     rust_bootstrap_dir: &Path,
     version: &RustVersion,
+    dfsg_suffix: &str,
 ) -> Result<PathBuf> {
     let bootstrap_str = rust_bootstrap_dir.to_string_lossy().to_string();
     run_command(
@@ -70,7 +75,7 @@ pub async fn generate_vendor_tarball(
     // Rust version rather than picking the first .orig-vendor.tar.xz found.
     let parent = repo_dir.parent().unwrap_or(repo_dir);
     let short = version.short();
-    let tarball_name = format!("rustc-{short}_{version}+dfsg.orig-vendor.tar.xz");
+    let tarball_name = format!("rustc-{short}_{version}+dfsg{dfsg_suffix}.orig-vendor.tar.xz");
     let tarball_path = parent.join(&tarball_name);
 
     if !tarball_path.exists() {

@@ -9,7 +9,7 @@ use crate::steps::{
 };
 use crate::types::params::UpdateParams;
 use crate::types::versions::RustVersion;
-use crate::ui::{print_info_box, print_phase_header, prompt_continue, prompt_input, prompt_yes_no};
+use crate::ui::{print_info_box, print_phase_header, prompt_input, prompt_select};
 
 /// Required external tools for the update workflow.
 /// Finding 9: rustup, ppa, autopkgtest, and autopkgtest-buildvm-ubuntu-cloud are
@@ -76,7 +76,7 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
             &format!("  Repo dir         : {}", repo_dir.display()),
         ],
     );
-    if !prompt_yes_no("Proceed with these parameters?") {
+    if prompt_select("Proceed with these parameters?", &["Proceed", "Abort"], 0) != 0 {
         println!("Aborted.");
         return Ok(());
     }
@@ -91,14 +91,21 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
             "For the default devel release: create a bug under rust-defaults.",
             "  https://bugs.launchpad.net/ubuntu/+source/rust-defaults/+filebug",
             "",
-            "For non-default releases: create a general Ubuntu bug tagged",
-            "  'needs-packaging' with Wishlist importance.",
+            "For non-default releases: create a general Ubuntu bug tagged 'needs-packaging' with Wishlist importance.",
             "  https://bugs.launchpad.net/ubuntu/+filebug",
             "",
             &format!("  LP bug #{lp_bug} has been provided on the command line."),
         ],
     );
-    prompt_continue("Confirm the bug report exists and matches the provided LP bug number.");
+    if prompt_select(
+        "Confirm the bug report exists and matches the provided LP bug number.",
+        &["Confirmed — continue", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
 
     // ── Phase 2: Set Up Git Branch ───────────────────────────────────────────
     print_phase_header(2, "Set Up Git Branch");
@@ -202,7 +209,7 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
     info!("generating pruned vendor tarball");
     // Finding 6: pass new_ver so the tarball name is derived deterministically.
     let vendor_tarball =
-        vendor::generate_vendor_tarball(repo_dir, &rust_bootstrap_dir, new_ver).await?;
+        vendor::generate_vendor_tarball(repo_dir, &rust_bootstrap_dir, new_ver, "").await?;
     println!("  Vendor tarball: {}", vendor_tarball.display());
 
     // ── Phase 9: Remove Vendored C Libraries ──────────────────────────────────
@@ -262,7 +269,15 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
             "Keep all other commits (patch refreshes, changelog, etc.).",
         ],
     );
-    prompt_continue("Press Enter to start the interactive rebase.");
+    if prompt_select(
+        "Ready to start the interactive rebase?",
+        &["Start rebase", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
     // Finding 4: git rebase -i requires a real TTY — use run_interactive_command
     // so stdin/stdout/stderr are inherited rather than piped.
     crate::shell::run_interactive_command(
@@ -293,7 +308,15 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
             "Confirm rustc-<old> and rustc-<new> appear in Build-Depends.",
         ],
     );
-    prompt_continue("Confirm the diff looks correct, then press Enter to commit.");
+    if prompt_select(
+        "Confirm the diff looks correct.",
+        &["Looks correct — commit", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
 
     git::add_and_commit(
         repo_dir,
@@ -325,7 +348,13 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>(),
         );
-        if !prompt_yes_no("These crates should have been pruned. Continue anyway?") {
+        if prompt_select(
+            "These crates should have been pruned. Continue anyway?",
+            &["Continue anyway", "Abort"],
+            1,
+        ) != 0
+        {
+            println!("Aborted.");
             return Ok(());
         }
     }
@@ -335,7 +364,15 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
         "Verify: empty line after XS-Vendored-Sources-Rust",
         &["Make sure there is still a blank line after the field in debian/control."],
     );
-    prompt_continue("Confirm, then press Enter to commit.");
+    if prompt_select(
+        "Confirm the XS-Vendored-Sources-Rust field looks correct.",
+        &["Confirmed — commit", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
     git::add_and_commit(
         repo_dir,
         &["debian/control"],
@@ -367,7 +404,10 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
 
     // ── Phase 16: Local Build and Bug Fixing ─────────────────────────────────
     print_phase_header(16, "Local Build and Bug Fixing");
-    run_interactive_local_build(repo_dir, &parent_dir, release).await?;
+    if !run_interactive_local_build(repo_dir, &parent_dir, release).await? {
+        println!("Aborted.");
+        return Ok(());
+    }
 
     // ── Phase 17: Lintian Checks ─────────────────────────────────────────────
     print_phase_header(17, "Lintian Checks");
@@ -386,7 +426,7 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
             "  2. Set Ubuntu dependencies to 'Proposed'",
         ],
     );
-    if prompt_yes_no("Create PPA now?") {
+    if prompt_select("Create PPA now?", &["Yes, create PPA", "Skip for now"], 0) == 0 {
         let ppa_url = ppa::create_ppa(&ppa_name).await?;
         if !ppa_url.is_empty() {
             println!("  PPA created: {ppa_url}");
@@ -464,7 +504,15 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
             &format!("  rustc-{new_short}"),
         ],
     );
-    prompt_continue("Complete autopkgtests, then press Enter.");
+    if prompt_select(
+        "Confirm autopkgtest results.",
+        &["All autopkgtests complete — continue", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
 
     // ── Phase 20: Upload the Package ─────────────────────────────────────────
     print_phase_header(20, "Upload the Package");
@@ -549,11 +597,26 @@ async fn run_interactive_patch_refresh(repo_dir: &Path) -> Result<()> {
                 print_info_box("Action required: patch refresh", &line_refs);
 
                 // Finding 3: ask whether the user refreshed or dropped the patch.
-                if prompt_yes_no("Did you refresh the patch (not drop it)?") {
-                    patches::quilt_refresh(repo_dir).await?;
-                    println!("  Patch refreshed.");
-                } else {
-                    println!("  Patch assumed dropped — continuing.");
+                match prompt_select(
+                    "How did you resolve the patch conflict?",
+                    &[
+                        "Refreshed the patch (quilt refresh)",
+                        "Dropped the patch",
+                        "Abort",
+                    ],
+                    0,
+                ) {
+                    0 => {
+                        patches::quilt_refresh(repo_dir).await?;
+                        println!("  Patch refreshed.");
+                    }
+                    1 => {
+                        println!("  Patch assumed dropped — continuing.");
+                    }
+                    _ => {
+                        println!("Aborted.");
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -598,7 +661,12 @@ async fn run_interactive_c_library_removal(
     let control_in_path = repo_dir.join("debian/control.in");
 
     loop {
-        if !prompt_yes_no("Have you identified a bundled C library to remove?") {
+        if prompt_select(
+            "Have you identified a bundled C library to remove?",
+            &["Yes — add exclusion", "No more libraries — continue"],
+            1,
+        ) != 0
+        {
             break;
         }
         // Finding 12: capture the exclusion pattern and build-dep interactively.
@@ -620,7 +688,7 @@ async fn run_interactive_c_library_removal(
             println!("  Added Build-Depends '{build_dep}' to debian/control.");
         }
         // Finding 6: pass version so the tarball name is deterministic.
-        vendor::generate_vendor_tarball(repo_dir, rust_bootstrap_dir, version).await?;
+        vendor::generate_vendor_tarball(repo_dir, rust_bootstrap_dir, version, "").await?;
         println!("  Vendor tarball regenerated.");
     }
     Ok(())
@@ -665,7 +733,15 @@ async fn run_interactive_copyright_update(repo_dir: &Path) -> Result<()> {
                     &stanzas,
                 ],
             );
-            prompt_continue("Add the stanzas, then press Enter to re-run Lintian.");
+            if prompt_select(
+                "Add the stanzas shown above, then continue.",
+                &["Stanzas added — re-run Lintian", "Abort"],
+                0,
+            ) != 0
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
             build::run_dpkg_buildpackage_source(repo_dir).await?;
             continue;
         }
@@ -688,7 +764,12 @@ async fn run_interactive_copyright_update(repo_dir: &Path) -> Result<()> {
                 "  • W: unknown-field Vendored-Sources-Rust",
             ],
         );
-        if !prompt_yes_no("Continue to the next phase (all Lintian issues addressed)?") {
+        if prompt_select(
+            "All Lintian issues addressed?",
+            &["Yes, all fixed — continue", "No, fix more issues"],
+            0,
+        ) != 0
+        {
             continue;
         }
         break;
@@ -697,17 +778,20 @@ async fn run_interactive_copyright_update(repo_dir: &Path) -> Result<()> {
 }
 
 /// Interactive local build loop using sbuild.
+///
+/// Returns `Ok(true)` when the build succeeds, `Ok(false)` when the user
+/// chooses to abort from the retry prompt.
 async fn run_interactive_local_build(
     repo_dir: &Path,
     parent_dir: &Path,
     release: &str,
-) -> Result<()> {
+) -> Result<bool> {
     loop {
         build::clean_build_artifacts(parent_dir, repo_dir).await?;
         match build::run_sbuild(repo_dir, release, &[]).await? {
             build::SbuildResult::Success => {
                 println!("  sbuild succeeded.");
-                break;
+                return Ok(true);
             }
             build::SbuildResult::Failure { log_path } => {
                 let failures = build::extract_test_failures(&log_path).unwrap_or_default();
@@ -726,11 +810,17 @@ async fn run_interactive_local_build(
                 if !failures.is_empty() {
                     println!("  Extracted {} test failure section(s).", failures.len());
                 }
-                prompt_continue("Fix the build failure, then press Enter to retry.");
+                if prompt_select(
+                    "Build failed. What would you like to do?",
+                    &["Fix failure and retry", "Abort"],
+                    0,
+                ) != 0
+                {
+                    return Ok(false);
+                }
             }
         }
     }
-    Ok(())
 }
 
 /// Interactive Lintian check loop.
@@ -754,7 +844,12 @@ async fn run_interactive_lintian(repo_dir: &Path) -> Result<()> {
                 &format!("  Warnings: {}", output.warnings.len()),
             ],
         );
-        if !prompt_yes_no("All Lintian issues addressed (add overrides as needed)?") {
+        if prompt_select(
+            "All Lintian issues addressed (add overrides as needed)?",
+            &["Yes, all addressed — continue", "No, rebuild and re-check"],
+            0,
+        ) != 0
+        {
             build::run_dpkg_buildpackage_source(repo_dir).await?;
             continue;
         }
@@ -768,7 +863,7 @@ async fn run_interactive_lintian(repo_dir: &Path) -> Result<()> {
     );
     let extra_log = repo_dir.join("lintian-extra.log");
     let _ = lintian::run_lintian(repo_dir, &["-i", "-I", "-E", "--pedantic"], &extra_log).await;
-    prompt_continue("Review extra lints if desired, then press Enter.");
+    prompt_select("Review extra lints if desired, then continue.", &["Continue"], 0);
 
     Ok(())
 }

@@ -29,6 +29,15 @@ pub async fn fetch_all(repo_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Returns `true` if a local branch with the given name exists.
+///
+/// Uses `git branch --list <branch>`, which always exits 0 and writes the
+/// branch name to stdout when it exists, or nothing when it does not.
+pub async fn branch_exists(repo_dir: &Path, branch: &str) -> Result<bool> {
+    let output = run_command("git", &["branch", "--list", branch], repo_dir, &[]).await?;
+    Ok(!output.stdout.trim().is_empty())
+}
+
 /// Check out an existing branch.
 pub async fn checkout_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     run_command("git", &["checkout", branch], repo_dir, &[]).await?;

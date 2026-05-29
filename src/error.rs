@@ -40,6 +40,10 @@ pub enum ThermiteError {
     #[error("invalid Launchpad bug number '{0}': must be a non-empty string of digits")]
     InvalidLpBugNumber(String),
 
+    /// Source and target releases for a backport were the same.
+    #[error("invalid backport releases: {0}")]
+    InvalidBackportReleases(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

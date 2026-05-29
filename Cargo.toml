@@ -10,6 +10,9 @@ path = "src/bin/thermite.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+dialoguer = "0.12"
+reqwest = "0.13.4"
+serde_json = "1.0.150"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

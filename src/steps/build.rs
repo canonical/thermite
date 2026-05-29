@@ -108,3 +108,129 @@ fn find_latest_build_log(dir: &Path) -> Option<PathBuf> {
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
         .map(|e| e.path())
 }
+
+/// Run `quilt pop -a` to unapply all quilt patches from the working tree.
+///
+/// This must be called before `clean_build_artifacts` and before
+/// `dpkg-buildpackage -S` so that the source package captures patches as
+/// quilt series rather than as inline diffs against modified files.
+///
+/// Errors are silently ignored: the command exits non-zero when no patches
+/// are applied, which is the common case.
+pub async fn quilt_pop_all(repo_dir: &Path) -> Result<()> {
+    // Ignore errors — `quilt pop -a` exits 1 when no patches are applied.
+    let _ = run_command("quilt", &["pop", "-a"], repo_dir, &[]).await;
+    Ok(())
+}
+
+/// Remove the autopkgtest self-build test block from `debian/tests/control`.
+///
+/// The block to remove is exactly:
+/// ```text
+/// Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+/// Depends: @, @builddeps@
+/// Restrictions: rw-build-tree, allow-stderr
+/// ```
+///
+/// If the block is not present (e.g. already removed), the function succeeds
+/// without modifying the file.
+pub fn disable_self_build_test(repo_dir: &Path) -> Result<()> {
+    let tests_control = repo_dir.join("debian/tests/control");
+    if !tests_control.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&tests_control)?;
+
+    // The self-build block starts with this prefix (may have varying spacing).
+    const SELFBUILD_MARKER: &str = "Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1";
+
+    if !content.contains(SELFBUILD_MARKER) {
+        // Already absent — nothing to do.
+        return Ok(());
+    }
+
+    // Remove the three-line block.  We iterate over lines and skip the
+    // SELFBUILD_MARKER line plus the two lines immediately following it
+    // (Depends and Restrictions).
+    let mut out_lines: Vec<&str> = Vec::new();
+    let mut skip_remaining: u32 = 0;
+    for line in content.lines() {
+        if skip_remaining > 0 {
+            skip_remaining -= 1;
+            continue;
+        }
+        if line.trim_start().starts_with("Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1") {
+            // Skip this line and the next two.
+            skip_remaining = 2;
+            continue;
+        }
+        out_lines.push(line);
+    }
+
+    // Remove any leading blank lines that were left at the top of the file
+    // after the block was removed.
+    while out_lines.first().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        out_lines.remove(0);
+    }
+
+    let new_content = out_lines.join("\n") + "\n";
+    std::fs::write(&tests_control, new_content)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod disable_self_build_tests {
+    use super::*;
+    use std::fs;
+
+    fn write_temp_tests_control_manual(content: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "thermite-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let tests_dir = base.join("debian/tests");
+        fs::create_dir_all(&tests_dir).expect("create dirs");
+        let control = tests_dir.join("control");
+        fs::write(&control, content).expect("write");
+        base
+    }
+
+    #[test]
+    fn removes_self_build_block() {
+        let control_content = "\
+Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+Depends: @, @builddeps@
+Restrictions: rw-build-tree, allow-stderr
+
+Test-Command: cargo test
+Depends: @
+Restrictions: allow-stderr
+";
+        let repo_dir = write_temp_tests_control_manual(control_content);
+        disable_self_build_test(&repo_dir).expect("disable_self_build_test");
+        let result =
+            fs::read_to_string(repo_dir.join("debian/tests/control")).expect("read result");
+        assert!(!result.contains("RUST_TEST_SELFBUILD"));
+        assert!(result.contains("cargo test"));
+        let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn no_op_when_block_absent() {
+        let control_content = "\
+Test-Command: cargo test
+Depends: @
+Restrictions: allow-stderr
+";
+        let repo_dir = write_temp_tests_control_manual(control_content);
+        disable_self_build_test(&repo_dir).expect("no_op");
+        let result =
+            fs::read_to_string(repo_dir.join("debian/tests/control")).expect("read result");
+        assert_eq!(result.trim(), control_content.trim());
+        let _ = fs::remove_dir_all(&repo_dir);
+    }
+}

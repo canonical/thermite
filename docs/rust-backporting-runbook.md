@@ -1,0 +1,1654 @@
+# Rust Backporting Runbook
+
+**Type:** Operational Runbook  
+**Process:** Backporting a versioned `rustc-X.Y` package to older Ubuntu releases  
+**Audience:** Rust toolchain maintainers with access to Launchpad and `sbuild`  
+**Status:** Draft
+
+---
+
+## 0. Preamble
+
+### 0.1 Purpose
+
+This runbook is the authoritative, step-by-step specification for backporting a versioned Rust
+toolchain package (`rustc-X.Y`) to older Ubuntu releases. It covers every decision that must be
+made, every command that must be run, and every observable outcome that must be verified before
+proceeding to the next step.
+
+It is written as a **Design-by-Contract** specification: every step declares what must be true
+before it begins (**Requires**), what must be true after it succeeds (**Ensures**), and what to do
+when it fails (**On failure**).
+
+This runbook is self-contained. It does not require consulting any other document while executing
+a backport, although links to relevant background material are included where helpful.
+
+### 0.2 Scope
+
+This runbook covers:
+
+- Determining the correct scope and order of a multi-release, multi-version backport.
+- Preparing the Git working branch.
+- Generating or downloading source tarballs.
+- Adapting the packaging for an older Ubuntu release (LLVM, libgit2, cmake,
+  pkgconf, dh-cargo, debhelper-compat).
+- Building, testing, and uploading the package to the staging PPA and optionally the Ubuntu Archive.
+
+It does **not** cover:
+
+- Creating a brand-new versioned `rustc` package (see `update-rust.md`).
+- Patching an existing Rust package (see `patch-rust.md`).
+
+### 0.3 Notation
+
+All angle-bracket tokens (`<like_this>`) are placeholders. Replace them with concrete values before
+running any command.
+
+| Token              | Meaning                                                   | Example (`rustc-1.82` → Jammy) |
+| ------------------ | --------------------------------------------------------- | ------------------------------ |
+| `<X.Y>`            | Rust minor version being backported                       | `1.82`                         |
+| `<X.Y.Z>`          | Full upstream Rust version (patch level)                  | `1.82.0`                       |
+| `<X.Y_old>`        | Rust minor version immediately preceding `<X.Y>`          | `1.81`                         |
+| `<X.Y.Z_old>`      | Full upstream version of `<X.Y_old>`                      | `1.81.0`                       |
+| `<release>`        | Ubuntu release being backported **to** (short codename)   | `jammy`                        |
+| `<source_release>` | Ubuntu release being backported **from** (short codename) | `noble`                        |
+| `<release_number>` | Numeric version of the Ubuntu release being backported to | `22.04`                        |
+| `<lpuser>`         | Your Launchpad username                                   | `jdoe`                         |
+| `<lp_bug_number>`  | LP bug number tracking this backport (if applicable)      | `2100492`                      |
+
+### 0.4 Global Invariants
+
+These invariants hold throughout the entire backporting process. Violating them invalidates the work.
+
+**INV-1 — One release at a time.** Never backport directly from the devel series to an older
+stable release, skipping intermediate releases. Always go Questing → Plucky → Noble → Jammy (or
+whichever chain applies). This provides isolated checkpoints: if a step fails, the failure is
+guaranteed to be release-specific, not a cross-release interaction.
+
+**INV-2 — Bootstrapping chain.** Building `rustc-X.Y` requires `rustc-(X.Y-1)` (or
+`cargo-(X.Y-1)`) to already be present in the target release's archive or PPA. Each version in the
+chain must be available in the target before the next higher version can build.
+
+**INV-3 — Monotonically increasing version numbers.** Version numbers uploaded to any PPA or the
+Archive must only ever increase. They are not required to be sequential — gaps caused by failed
+uploads are acceptable.
+
+**INV-4 — Staging PPA is the integration point.** All successfully-built backports are uploaded to
+`ppa:rust-toolchain/staging`. This PPA is the source of truth for backport availability and the
+dependency source for subsequent backports in the chain.
+
+---
+
+## 1. Pre-Flight: Determining the Backport Scope
+
+Before any packaging work begins, the complete ordered work plan must be derived. Executing steps
+out of order or skipping releases will cause build failures and may invalidate uploaded packages.
+
+### 1.1 Classify the Request
+
+**Decision gate:**
+
+| Situation                                                                                           | Action                                                                                                                                                |
+| --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A specific downstream package (Firefox, Chromium, etc.) needs this toolchain version in the Archive | Create a Launchpad bug. Set the bug to target **every** series along the backport chain (not just the final target). This is a **priority backport**. |
+| No specific downstream consumer known yet; preparing the chain for future use                       | No LP bug required. This is a **proactive backport**.                                                                                                 |
+
+> **Requires:** Understanding of why the backport is being requested.  
+> **Ensures:** A Launchpad bug exists (priority) or a deliberate decision not to create one (proactive) is recorded.  
+> **On failure:** If the motivation is unclear, consult the requesting team before starting work.
+
+### 1.2 Determine What Needs to Be Backported
+
+Query the latest `rustc` version present in each supported Ubuntu release:
+
+```
+https://launchpad.net/ubuntu/<release>/+source/rustc
+```
+
+For the staging PPA, check what's already there:
+
+```
+https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/+packages?field.name_filter=rustc
+```
+
+Build a table of the form:
+
+| Ubuntu release   | Current `rustc` in archive/staging | Target `rustc`    |
+| ---------------- | ---------------------------------- | ----------------- |
+| Jammy            | `rustc-1.83`                       | `rustc-1.86`      |
+| Noble            | `rustc-1.83`                       | `rustc-1.86`      |
+| Plucky           | `rustc-1.85`                       | `rustc-1.86`      |
+| Questing (devel) | `rustc-1.86`                       | (already present) |
+
+### 1.3 Derive the Ordered Work Plan
+
+Using the table from § 1.2, derive the complete ordered list of `(X.Y, source_release, release)` triples.
+
+**Algorithm:**
+
+1. For the final target release (e.g. Jammy), list every Rust version between the current version
+   in that release (exclusive) and the desired target version (inclusive). These are all the
+   intermediate versions that must be backported.
+2. For each intermediate version, backport it from the release that was just above it in the chain,
+   working top-down through the release list.
+3. For each `(X.Y, release)` pair, the `source_release` is the next higher Ubuntu release that
+   already has `X.Y` either in its archive or in the staging PPA.
+
+**Example — backporting `rustc-1.86` to Jammy:**
+
+| Step | X.Y    | source_release | release |
+| ---- | ------ | -------------- | ------- |
+| 1    | `1.84` | Plucky         | Noble   |
+| 2    | `1.84` | Noble          | Jammy   |
+| 3    | `1.85` | Plucky         | Noble   |
+| 4    | `1.85` | Noble          | Jammy   |
+| 5    | `1.86` | Questing       | Plucky  |
+| 6    | `1.86` | Plucky         | Noble   |
+| 7    | `1.86` | Noble          | Jammy   |
+
+Execute each row in the order given. Do not start row N+1 until row N's package has successfully
+built and been uploaded to the staging PPA (§ 3.9).
+
+> **Requires:** Archive and staging PPA queried for current rustc versions.  
+> **Ensures:** A complete, ordered work plan of `(X.Y, source_release, release)` triples exists.  
+> **On failure:** If the current archive state is unexpected (e.g. a version is present in Noble but not in Plucky), investigate before proceeding. The chain must be consistent.
+
+---
+
+## 2. One-Time Repository Setup
+
+This section only needs to be performed once per machine. Skip it if the repository is already
+cloned and configured.
+
+### 2.1 Directory Structure
+
+The Debian build tools generate files in the **parent** directory of the source tree. Organise the
+workspace as follows so generated tarballs and build artifacts are contained:
+
+```
+~/rustc/                        ← parent directory
+├── rustc/                      ← cloned git repository (source tree)
+│   ├── debian/
+│   ├── Cargo.toml
+│   └── ...
+├── rustc-<X.Y>_<version>.orig.tar.xz
+└── rustc-<X.Y>_<version>.orig-vendor.tar.xz
+```
+
+Create the parent directory and clone into it:
+
+```shell
+mkdir ~/rustc
+cd ~/rustc
+git clone git+ssh://<lpuser>@git.launchpad.net/~canonical-foundations/ubuntu/+source/rustc
+```
+
+### 2.2 Add Your Personal Remote
+
+Create a personal Git repository on Launchpad (via the web UI), then add it as a remote:
+
+```shell
+cd ~/rustc/rustc
+git remote add <lpuser> git+ssh://<lpuser>@git.launchpad.net/~<lpuser>/ubuntu/+source/rustc
+```
+
+Use your personal repository as a backup during work. Push to the Foundations repository only
+when a branch is complete, since rebases are common during the process.
+
+> **Requires:** Launchpad account with SSH key configured. The Foundations repository is accessible.  
+> **Ensures:** Local clone has two remotes — `origin` (Foundations) and `<lpuser>` (personal backup).  
+> **On failure:** If SSH authentication fails, verify your Launchpad SSH key at `https://launchpad.net/~<lpuser>/+sshkeys`.
+
+---
+
+## 3. Per-Backport Execution
+
+Repeat §§ 3.1–3.13 for **each** `(X.Y, source_release, release)` triple from the work plan
+(§ 1.3), in order. Do not start the next triple until the current one is fully uploaded to the
+staging PPA, its autopkgtests pass, and its branch is pushed to the Foundations repository.
+
+All commands are run from inside `~/rustc/rustc/` unless otherwise specified.
+
+---
+
+### 3.1 Branch Setup
+
+Start from the branch for `<X.Y>` on `<source_release>` — that is, the packaging that already
+works on the newer release — and create a new branch targeting `<release>`.
+
+```shell
+git fetch origin
+git checkout <source_release>-<X.Y>
+git checkout -b <release>-<X.Y>
+```
+
+**Example** — backporting `rustc-1.85` to Jammy from Noble:
+
+```shell
+git checkout noble-1.85
+git checkout -b jammy-1.85
+```
+
+> **Requires:** The `<source_release>-<X.Y>` branch exists on `origin` and is up to date.  
+> **Ensures:** You are on a new local branch `<release>-<X.Y>` whose tip matches `<source_release>-<X.Y>`.  
+> **On failure:** If the source branch does not exist, the `source_release` backport (from § 1.3) has
+> not yet been completed. Complete that step first.
+
+---
+
+### 3.2 Changelog and Version String
+
+#### 3.2.1 Understanding the Version String Format
+
+Backport version strings encode the target release number **twice**: once in the orig-tarball
+component and once in the Ubuntu-revision component. Both occurrences must be updated.
+
+General format for a backport:
+
+```
+<upstream>+dfsg[<repack_N>]~<release_number>-0ubuntu<rev>~<release_number>.<counter>
+```
+
+| Existing version                        | Backporting to | New version                           |
+| --------------------------------------- | -------------- | ------------------------------------- |
+| `1.93.0+dfsg-0ubuntu1`                  | Noble (24.04)  | `1.93.0+dfsg~24.04-0ubuntu1~24.04.1`  |
+| `1.89.0+dfsg2~24.04.1-0ubuntu3~24.04.2` | Jammy (22.04)  | `1.89.0+dfsg2~22.04-0ubuntu3~22.04.1` |
+
+Key rules:
+
+- The `~<release_number>` tilde prefix makes the backport version **sort lower** than the
+  `<source_release>` version, so it will never be mistakenly installed on a newer release.
+- After the existing release-number components, reset the trailing counter to `.1`.
+- If the repack number (`+dfsg2`, etc.) is unchanged, carry it forward as-is.
+
+#### 3.2.2 Creating the Changelog Entry
+
+```shell
+dch
+```
+
+This opens an editor with a new changelog entry. Make the following changes:
+
+1. Change `UNRELEASED` to `<release>` (short codename, e.g. `jammy`).
+2. Update the version string: replace both occurrences of the source-release number with
+   `<release_number>`, and reset the trailing counter to `1`.
+3. Set the changelog description to:
+
+   ```
+   * Backport to <release> (LP: #<lp_bug_number>)
+   ```
+
+   Omit the `(LP: #<lp_bug_number>)` part if this is a proactive backport with no LP bug.
+
+> **Requires:** The branch is at § 3.1 post-state. Version string format is understood.  
+> **Ensures:** `debian/changelog` has a valid new entry targeting `<release>` with a correct version string.  
+> **On failure:** If `dch` is not installed, install `devscripts`. If the version ordering looks wrong,
+> consult the version string rules: a `~` tilde prefix always sorts **lower** than the same string without it.
+
+---
+
+### 3.3 Tarball Generation Decision Gate
+
+The orig tarball (`.orig.tar.xz`) is the filtered upstream Rust source. The vendor tarball
+(`.orig-vendor.tar.xz`) contains the filtered vendored crate dependencies (Rust 1.89+).
+
+**Decision for orig tarball:**
+
+| Condition                                                                                      | Action                                   |
+| ---------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| `Files-Excluded` in `debian/copyright` was changed (e.g. LLVM or libgit2 vendoring, see § 3.4) | Regenerate the tarball — follow § 3.3.1  |
+| First time this `<X.Y>` is being handled and no tarball exists locally                         | Download from Launchpad — follow § 3.3.2 |
+| No `Files-Excluded` change and tarball already exists locally                                  | Use existing tarball — no action         |
+
+**Decision for vendor tarball (Rust 1.89+):**
+
+| Condition                                                           | Action                           |
+| ------------------------------------------------------------------- | -------------------------------- |
+| Vendored crate versions changed (or tarball does not exist locally) | Regenerate — follow § 3.3.3      |
+| No crate changes and tarball already exists                         | Use existing tarball — no action |
+
+#### 3.3.1 Generating the Orig Tarball (uscan)
+
+`uscan` downloads and filters the upstream source according to `Files-Excluded` in
+`debian/copyright`.
+
+From inside the source directory (`~/rustc/rustc/`):
+
+```shell
+uscan --download-version <X.Y.Z> -v 2>&1 | tee ~/uscan-<X.Y>.log
+```
+
+Inspect the log for warnings about excluded files that no longer exist upstream — those
+`Files-Excluded` entries must be removed or updated.
+
+After `uscan` completes, a file ending in `.orig.tar.xz` appears in the parent directory
+(`~/rustc/`). The file is named after the source package and the upstream version without the
+`~<release_number>` backport component. Rename it to include the release component so it matches
+the packaged version number:
+
+```shell
+# Example: rustc-1.89, version 1.89.0+dfsg~22.04
+mv ../rustc-<X.Y>_<X.Y.Z>+dfsg.orig.tar.xz \
+   ../rustc-<X.Y>_<X.Y.Z>+dfsg~<release_number>.orig.tar.xz
+```
+
+This step takes 20–60 minutes. The log file is useful for debugging.
+
+#### 3.3.2 Downloading the Orig Tarball from Launchpad
+
+If no changes to `Files-Excluded` were made, the tarball can be reused from a prior upload.
+Find it under the package files for either the Ubuntu Archive or the staging PPA:
+
+```
+https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/+packages
+```
+
+Download the `.orig.tar.xz` file and place it in `~/rustc/`.
+
+#### 3.3.3 Generating the Vendor Tarball (Rust 1.89+)
+
+The vendor tarball requires `cargo-vendor-filterer` and a local Rust toolchain at version `<X.Y.Z>`.
+
+> **Pre-condition:** The unfiltered upstream source archive `rustc-<X.Y.Z>-src.tar.xz` must exist
+> in `~/rustc/`. `uscan` (§ 3.3.1) produces this file automatically as a side-effect. If § 3.3.2
+> was followed instead (tarball downloaded from Launchpad), obtain the upstream source separately:
+>
+> ```shell
+> wget -P ~/rustc/ https://static.rust-lang.org/dist/rustc-<X.Y.Z>-src.tar.xz
+> ```
+
+Install the toolchain and locate its sysroot:
+
+```shell
+rustup install <X.Y.Z>
+rustup +<X.Y.Z> which rustc   # note the sysroot path that appears
+export RUST_BOOTSTRAP_DIR=<sysroot_path_without_bin/rustc>
+# example: export RUST_BOOTSTRAP_DIR=$HOME/.rustup/toolchains/<X.Y.Z>-x86_64-unknown-linux-gnu
+```
+
+Install `cargo-vendor-filterer` if not already present:
+
+```shell
+cargo install cargo-vendor-filterer
+# ensure ~/.cargo/bin is in PATH
+```
+
+Replace the `vendor/` directory with the unfiltered upstream version:
+
+```shell
+cd ~/rustc
+tar xf rustc-<X.Y.Z>-src.tar.xz
+rm -rf rustc/vendor/
+cp -ra rustc-<X.Y.Z>-src/vendor/ rustc/
+cd rustc
+```
+
+Generate the filtered vendor tarball:
+
+```shell
+debian/rules vendor-tarball
+```
+
+This produces `../rustc-<X.Y>_<version>.orig-vendor.tar.xz`. Replace the working `vendor/`
+directory with the filtered version:
+
+```shell
+rm -rf vendor
+tar xf ../rustc-<X.Y>_<version>.orig-vendor.tar.xz
+```
+
+> **Requires:** § 3.2 post-state. `Files-Excluded` reflects the intended set of vendored dependencies.  
+> **Ensures:** Correct `.orig.tar.xz` and (if applicable) `.orig-vendor.tar.xz` files exist in `~/rustc/`.  
+> **On failure:** If `uscan` reports missing excluded files, update `Files-Excluded` in `debian/copyright` and re-run. If `cargo-vendor-filterer` fails, ensure the `RUST_BOOTSTRAP_DIR` version exactly matches `<X.Y.Z>`.
+
+---
+
+### 3.4 Compatibility Decision Gates
+
+The `<release>` archive may lack build dependencies that the `<source_release>` package assumes.
+Work through each gate below **in the order listed**. Apply all needed changes before attempting
+to build. Each gate is independent: multiple gates may apply to the same backport.
+
+After completing all applicable gate changes, commit them together before proceeding to § 3.5.
+
+---
+
+#### Gate A: LLVM Availability
+
+**Check:** Does the required LLVM version exist in the `<release>` archive?
+
+1. Find the LLVM version used by this `rustc` package:
+
+   ```shell
+   grep LLVM_VERSION debian/rules | head -5
+   # or:
+   grep llvm debian/control | grep -oP 'llvm-\K[0-9]+'  | sort -u
+   ```
+
+2. Check Launchpad:
+
+   ```
+   https://launchpad.net/ubuntu/<release>/+source/llvm-toolchain-<N>
+   ```
+
+   If the page 404s or shows "This source package is not published in Ubuntu <Release>", the LLVM
+   version is **not available** and must be vendored.
+
+**Branch A-YES (LLVM available):** No changes needed. Proceed to Gate B.
+
+**Branch A-NO (vendor LLVM):**
+
+> **Rationale:** When the system LLVM is too old or absent, the upstream LLVM source bundled with
+> rustc must be compiled as part of the build. This significantly increases build time and binary
+> size but is the only option when the archive does not provide the required version.
+
+**A-NO step 1 — Re-include LLVM source in the tarball.**
+
+Remove `src/llvm-project` from `Files-Excluded` in `debian/copyright`:
+
+```diff
+ Files-Excluded:
+  .gitmodules
+  *.min.js
+- src/llvm-project
+ # Pre-generated docs
+```
+
+**A-NO step 2 — Regenerate the orig tarball.**
+
+The tarball must be regenerated so it includes `src/llvm-project`. Follow § 3.3.1.
+
+After regenerating, overlay the LLVM tree on the working directory:
+
+```shell
+cd ~/rustc
+tar -xf rustc-<X.Y>_<X.Y.Z>+dfsg~<release_number>.orig.tar.xz
+cp -ra rustc-<X.Y.Z>-src/src/llvm-project rustc/src/
+cd rustc
+git add src/llvm-project
+```
+
+> **Note on empty directories:** Some empty directories in `src/llvm-project` will not appear in
+> the Git commit. This is a known Git limitation. You will need to re-extract and overlay the
+> `src/llvm-project` directory any time you clone the repo fresh, run `git clean`, or switch to a
+> branch without vendored LLVM.
+
+**A-NO step 3 — Update `debian/copyright`.**
+
+Add the LLVM copyright stanza after the autogenerated vendor block:
+
+```diff
+ # DO NOT EDIT above, AUTOGENERATED
+
++Files: src/llvm-project/*
++Copyright: 2003-2025 University of Illinois at Urbana-Champaign
++License: Apache-2.0 with LLVM exception
++
+ Files: C*.md
+```
+
+**A-NO step 4 — Update `debian/control` and `debian/control.in`.**
+
+Remove system LLVM build dependencies and add LLVM native-build dependencies. Apply both diffs
+to both files (`debian/control` and `debian/control.in`).
+
+Remove from `Build-Depends`:
+
+```diff
+  rustc-<X.Y_old> | rustc-<X.Y> <!pkg.rustc.dlstage0>,
+- llvm-*-dev:native,
+- llvm-*-tools:native,
+- libclang-rt-*-dev (>= *),
+- libclang-common-*-dev (>= *),
+- cmake (>= *) | cmake3,
++ cmake (>= *) | cmake3 (>= *),
+```
+
+Remove from `Build-Depends-Indep`:
+
+```diff
+ Build-Depends-Indep:
+- clang-<N>:native,
+  libssl-dev,
+```
+
+Add to `Build-Depends` (required to compile LLVM from source):
+
+```diff
+  libsqlite3-dev,
++# Required for llvm build
++ autotools-dev,
++ m4,
++ ninja-build,
+```
+
+Remove the LLVM runtime dependency from the `rust-<X.Y>-all` binary package:
+
+```diff
+ Depends: ${misc:Depends}, ${shlibs:Depends},
+- llvm-*,
+  rustc-<X.Y> (>= ${binary:Version}),
+```
+
+Remove the LLVM debugger dependency from the `rust-<X.Y>-lldb` binary package:
+
+```diff
+-Depends: lldb-<N>, ${misc:Depends}, python3-lldb-<N>
++Depends: ${misc:Depends}
+```
+
+**A-NO step 5 — Update `debian/config.toml.in`.**
+
+Remove the `[llvm]` shared-library directive:
+
+```diff
+-)dnl
+-
+-[llvm]
+-link-shared = true
+-
+ [rust]
+```
+
+Remove the per-target LLVM config stanzas that pointed to system LLVM tools. Delete from just
+before `[target.DEB_BUILD_RUST_TYPE]` to just before `[target.wasm32-wasi]`:
+
+```diff
+-[target.DEB_BUILD_RUST_TYPE]
+-llvm-config = "LLVM_DESTDIR/usr/lib/llvm-LLVM_VERSION/bin/llvm-config"
+-linker = "DEB_BUILD_GNU_TYPE-gcc"
+-PROFILER_PATH
+-
+-ifelse(DEB_BUILD_RUST_TYPE,DEB_HOST_RUST_TYPE,,
+-[target.DEB_HOST_RUST_TYPE]
+-llvm-config = "LLVM_DESTDIR/usr/lib/llvm-LLVM_VERSION/bin/llvm-config"
+-linker = "DEB_HOST_GNU_TYPE-gcc"
+-PROFILER_PATH
+-
+-)dnl
+-ifelse(DEB_BUILD_RUST_TYPE,DEB_TARGET_RUST_TYPE,,DEB_HOST_RUST_TYPE,DEB_TARGET_RUST_TYPE,,
+-[target.DEB_TARGET_RUST_TYPE]
+-llvm-config = "LLVM_DESTDIR/usr/lib/llvm-LLVM_VERSION/bin/llvm-config"
+-linker = "DEB_TARGET_GNU_TYPE-gcc"
+-PROFILER_PATH
+-
+-)dnl
+ [target.wasm32-wasi]
+```
+
+**A-NO step 6 — Update `debian/rules`.**
+
+Add debug-symbol suppression at the top (after `export DEB_HOST_RUST_TYPE`):
+
+```diff
++# Let rustbuild control whether LLVM is compiled with debug symbols, rather
++# than compiling with debug symbols unconditionally, which will fail on
++# 32-bit architectures
++CFLAGS := $(shell echo $(CFLAGS) | sed -e 's/\-g//')
++CXXFLAGS := $(shell echo $(CFLAGS) | sed -e 's/\-g//')
++
+ # for dh_install substitution variable
+```
+
+Comment out the `LLVM_VERSION` and profiler-library block (keep the lines as comments for reference):
+
+```diff
+-# Use system LLVM (comment out to use vendored LLVM)
+-LLVM_VERSION = 19
+-OLD_LLVM_VERSION = $(shell echo "$$(($(LLVM_VERSION)-1))")
+-# used by the upstream profiler build script
+-CLANG_RT_TRIPLE := $(shell llvm-config-$(LLVM_VERSION) --host-target)
++# # Use system LLVM (comment out to use vendored LLVM)
++# LLVM_VERSION = 19
++# ...
+```
+
+Remove the `LD_LIBRARY_PATH` block that referenced `LLVM_DESTDIR`, and remove the `LLVM_DESTDIR`
+and `LLVM_VERSION` variables passed to `m4` for `debian/config.toml`:
+
+```diff
+                -DVERBOSITY="$(VERBOSITY)" \
+-               -DLLVM_DESTDIR="$(LLVM_DESTDIR)" \
+-               -DLLVM_VERSION="$(LLVM_VERSION)" \
+                -DRUST_BOOTSTRAP_DIR="$(RUST_BOOTSTRAP_DIR)" \
+```
+
+Remove the `check-no-old-llvm` make target and its reference in the configure stamp rule:
+
+```diff
+-check-no-old-llvm:
+-       # fail the build if we have any instances of OLD_LLVM_VERSION in debian
+-       ! grep ...
+-.PHONY: check-no-old-llvm
+-
+-debian/dh_auto_configure.stamp: debian/config.toml check-no-old-llvm
++debian/dh_auto_configure.stamp: debian/config.toml
+```
+
+Remove the dynamic-link assertion in `override_dh_auto_test-arch`:
+
+```diff
+ override_dh_auto_test-arch:
+-       # ensure that rustc_llvm is actually dynamically linked to libLLVM
+-       set -e; find build/*/stage2/lib/rustlib/* -name '*rustc_llvm*.so' | \
+-       while read x; do \
+-               ...
+-       done
+```
+
+Add an LLVM source cleanup step in `override_dh_install-indep` to save disk space:
+
+```diff
+ override_dh_install-indep:
+        dh_install
+        $(RM) -rf $(SRC_CLEAN:%=debian/rust-$(RUST_VERSION)-src/...)
++       # Get rid of src/llvm-project
++       $(RM) -rf debian/rust-$(RUST_VERSION)-src/usr/src/rustc-$(RUST_LONG_VERSION)/src/llvm-project
+```
+
+> **Requires:** Gate A check confirmed LLVM not available in archive.  
+> **Ensures:** All six LLVM-vendoring changes applied to `debian/copyright`, `debian/control`,
+> `debian/control.in`, `debian/config.toml.in`, `debian/rules`; `src/llvm-project` overlaid on
+> working tree and staged in Git; orig tarball regenerated.  
+> **On failure:** If uscan fails to include `src/llvm-project` even after removing the
+> `Files-Excluded` line, check that the removal was committed before running uscan (uscan reads
+> `debian/copyright` from the working tree, not from Git HEAD).
+
+---
+
+#### Gate B: libgit2 Availability
+
+**Check:** Does the version of `libgit2-dev` in the `<release>` archive meet `rustc`'s minimum
+requirement?
+
+Find the required version:
+
+```shell
+grep libgit2-dev debian/control | head -4
+# example output: libgit2-dev (>= 1.9.0~~),
+```
+
+Find the available version for `<release>`:
+
+```
+https://launchpad.net/ubuntu/<release>/+source/libgit2
+```
+
+**Branch B-OK (version meets requirement):** No changes needed. Proceed to Gate C.
+
+**Branch B-CLOSE (available version is within one major series, e.g. 1.7.x when 1.9.x required):**
+Downgrade the requirement. Follow § Gate B-Downgrade.
+
+**Branch B-OLD (available version is drastically older, e.g. 1.5.x when 1.9.x required):**
+Vendor `libgit2`. Follow § Gate B-Vendor.
+
+##### Gate B-Downgrade: Downgrading `libgit2-dev`
+
+> **Note:** This path is an optimisation that avoids regenerating the orig tarball. It works only
+> when the older `libgit2` version is API-compatible with what the Rust crate expects. If the
+> local build (§ 3.6) fails with `libgit2` link errors or API mismatches after applying these
+> changes, revert all B-Downgrade changes and follow Gate B-Vendor instead.
+
+In `debian/control` **and** `debian/control.in`, lower the minimum version to the archive version
+and cap the maximum at the next major series:
+
+```diff
+- libgit2-dev (>= 1.9.0~~),
+- libgit2-dev (<< 1.10~~),
++ libgit2-dev (>= <archive_version>~~),
++ libgit2-dev (<< <next_major>~~),
+```
+
+Find the `libgit2-sys` crate version used by this Rust package:
+
+```shell
+ls vendor/ | grep libgit2-sys
+# example: libgit2-sys-0.17.0+1.9.0
+```
+
+Create a quilt patch adjusting the version probe in the crate's `build.rs`:
+
+```shell
+quilt push -a
+quilt new ubuntu/ubuntu-libgit2-downgrade.patch
+quilt add vendor/libgit2-sys-<crate_version>/build.rs
+```
+
+Edit `vendor/libgit2-sys-<crate_version>/build.rs` — in `try_system_libgit2()`, change the
+version range to match the archive version:
+
+```diff
+-    match cfg.range_version("1.9.0".."1.10.0").probe("libgit2") {
++    match cfg.range_version("<archive_version>".."<next_major>.0").probe("libgit2") {
+```
+
+```shell
+quilt refresh
+quilt pop -a
+```
+
+If a subsequent local build (§ 3.6) still fails due to libgit2 API incompatibilities, revert
+all Gate B-Downgrade changes and proceed with Gate B-Vendor instead.
+
+##### Gate B-Vendor: Vendoring `libgit2`
+
+When the archive `libgit2` version is too old to even attempt downgrading, the upstream C library
+bundled within the `libgit2-sys` crate must be compiled as part of the build.
+
+**B-Vendor step 1 — Re-include `libgit2` in the tarball.**
+
+In `debian/copyright`, comment out the `libgit2` exclusion line:
+
+```diff
+  vendor/libdbus-sys-*/vendor
+- vendor/libgit2-sys-*/libgit2
++# vendor/libgit2-sys-*/libgit2
+  vendor/libssh2-sys-*/libssh2
+```
+
+**B-Vendor step 2 — Regenerate the orig tarball** (§ 3.3.1) and overlay the libgit2 source:
+
+```shell
+cd ~/rustc
+tar -xf rustc-<X.Y>_<X.Y.Z>+dfsg~<release_number>.orig.tar.xz
+cp -ra rustc-<X.Y.Z>-src/vendor/libgit2-sys-<crate_version>/libgit2 \
+       rustc/vendor/libgit2-sys-<crate_version>/
+cd rustc
+git add vendor/libgit2-sys-<crate_version>/libgit2
+```
+
+> **Note on empty directories:** Some empty directories within the vendored libgit2 source will
+> not be tracked by Git. Re-extract and overlay whenever the working tree is re-created.
+
+**B-Vendor step 3 — Remove `libgit2-dev` and `libhttp-parser-dev` from `Build-Depends`.**
+
+In both `debian/control` and `debian/control.in`:
+
+```diff
+- libgit2-dev (>= <version>~~),
+- libgit2-dev (<< <next>~~),
+- libhttp-parser-dev,
++# libgit2-dev (>= <version>~~),
++# libgit2-dev (<< <next>~~),
++# libhttp-parser-dev,
+```
+
+(`libhttp-parser-dev` is excluded because it too is bundled within the vendored `libgit2` source.)
+
+**B-Vendor step 4 — Re-enable `vendored-libgit2` in Cargo.toml.**
+
+Apply the patch `prune/d-0010-cargo-remove-vendored-c-crates.patch` and edit
+`src/tools/cargo/Cargo.toml` to restore the `vendored-libgit2` feature line:
+
+```shell
+quilt push prune/d-0010-cargo-remove-vendored-c-crates.patch
+```
+
+In `src/tools/cargo/Cargo.toml`:
+
+```diff
+ [features]
++vendored-libgit2 = ["libgit2-sys/vendored"]
+```
+
+```shell
+quilt refresh
+quilt pop -a
+```
+
+The refreshed patch diff should show that `vendored-libgit2` is no longer removed.
+
+> **Requires:** Gate B check confirmed archive libgit2 is too old.  
+> **Ensures:** All Gate B-Vendor changes applied; vendored libgit2 source overlaid on working tree and staged in Git; orig tarball regenerated.  
+> **On failure:** If the build still fails after vendoring, check whether the upstream `libgit2` bundled in the crate is itself too new for the C toolchain on the target release. This is rare and requires sourcing a compatible `libgit2` snapshot.
+
+---
+
+#### Gate C: `dh-cargo` Availability
+
+**Check:** Is `dh-cargo (>= 28ubuntu1~)` available in the `<release>` archive?
+
+```
+https://launchpad.net/ubuntu/<release>/+source/dh-cargo
+```
+
+**Branch C-YES:** No changes needed. Proceed to Gate D.
+
+**Branch C-NO:**
+
+In both `debian/control` and `debian/control.in`, comment out `dh-cargo`:
+
+```diff
+ Build-Depends:
+  debhelper (>= 9),
+  debhelper-compat (= 13),
+- dh-cargo (>= 28ubuntu1~),
++# dh-cargo (>= 28ubuntu1~),
+  dpkg-dev (>= 1.17.14),
+```
+
+In `debian/rules`, remove the `dh-cargo-vendored-sources` validation step:
+
+```diff
+ debian/dh_auto_configure.stamp: debian/config.toml
+-       # fail the build if the vendored sources info is out-of-date
+-       CARGO_VENDOR_DIR=$(CURDIR)/vendor /usr/share/cargo/bin/dh-cargo-vendored-sources
+        # fail the build if we accidentally vendored openssl
+```
+
+> **Requires:** Gate C check confirmed `dh-cargo` is absent.  
+> **Ensures:** `dh-cargo` removed from `Build-Depends` in both control files; vendored-sources check removed from `debian/rules`.  
+> **On failure:** If the build later fails with a `dh-cargo` related error, verify both `debian/control` and `debian/control.in` were updated.
+
+---
+
+#### Gate D: `pkgconf` Availability
+
+**Check:** Is `pkgconf` available in the `<release>` archive?
+
+```
+https://launchpad.net/ubuntu/<release>/+source/pkgconf
+```
+
+**Branch D-YES:** No changes needed. Proceed to Gate E.
+
+**Branch D-NO:**
+
+In both `debian/control` and `debian/control.in`, replace `pkgconf` with `pkg-config`:
+
+```diff
+ # needed by some vendor crates
+- pkgconf,
++ pkg-config,
+```
+
+In `debian/rules`, export `PKG_CONFIG` immediately after the Cargo flags block:
+
+```diff
+ # Cargo-specific flags
+ export LIBSSH2_SYS_USE_PKG_CONFIG=1
++export PKG_CONFIG=pkg-config
+```
+
+> **Requires:** Gate D check confirmed `pkgconf` is absent.  
+> **Ensures:** `pkg-config` used in place of `pkgconf` in both control files and `debian/rules`.  
+> **On failure:** If the build fails with "the pkg-config command could not be found", confirm that the `PKG_CONFIG` export appears in `debian/rules` **before** the first invocation of `cargo`.
+
+---
+
+#### Gate E: `cmake` Version
+
+**Check:** Is the `cmake` version in the `<release>` archive ≥ 3.0?
+
+```
+https://launchpad.net/ubuntu/<release>/+source/cmake
+```
+
+**Branch E-YES:** No changes needed. Proceed to Gate F.
+
+**Branch E-NO:**
+
+In both `debian/control` and `debian/control.in`, add `cmake-mozilla` as an alternative:
+
+```diff
+- cmake (>= 3.0) | cmake3,
++ cmake (>= 3.0) | cmake3 | cmake-mozilla (>= 3.0),
+```
+
+> **Note:** `cmake-mozilla` is maintained specifically for backports and is separate from the
+> system `cmake`. Do not upgrade the system `cmake` for this purpose — that would affect all other
+> packages in the archive.
+
+> **Requires:** Gate E check confirmed cmake is too old.  
+> **Ensures:** `cmake-mozilla` added as fallback cmake provider in both control files.  
+> **On failure:** If `cmake-mozilla` is also not in the archive for this release, escalate — a new `cmake-mozilla` upload may be required.
+
+---
+
+#### Gate F: `debhelper-compat` Level
+
+**Check:** What `debhelper-compat` level does the `<release>` archive support?
+
+```
+https://launchpad.net/ubuntu/<release>/+source/debhelper
+```
+
+**Branch F-OK (required compat level available):** No changes needed. Proceed to § 3.5.
+
+**Branch F-OLD (required level not available — e.g. compat 13 required but only 12 available):**
+
+Downgrade the `debhelper-compat` level in `debian/control` and `debian/control.in`:
+
+```diff
+- debhelper-compat (= 13),
++ debhelper-compat (= 12),
+```
+
+Downgrading the compat level requires additional packaging changes. The most significant is
+that compat 12 uses `@VARIABLE@`-style substitution in `.install.in` files instead of the
+compat 13 `${env:VARIABLE}` style:
+
+```diff
+-usr/lib/rust-${env:RUST_VERSION}/lib/rustlib/${env:DEB_HOST_RUST_TYPE}/lib/
++usr/lib/rust-@RUST_VERSION@/lib/rustlib/@DEB_HOST_RUST_TYPE@/lib/
+```
+
+A known-good cherry-pick covering the 13→12 downgrade is available on the Foundations
+repository. Apply it and resolve any merge conflicts:
+
+```shell
+git cherry-pick 20ce525927c2e9176dd3c7209968038b09a49a25
+```
+
+> **Requires:** Gate F check confirmed required debhelper-compat level is absent.  
+> **Ensures:** Compat level downgraded and all `.install.in` substitution variables updated to
+> match the lower compat level.  
+> **On failure:** If the cherry-pick has conflicts, resolve them manually. Conflicts typically
+> appear in `.install.in` files that have changed since the cherry-pick was authored.
+
+---
+
+### 3.5 Disable the Autopkgtest Self-Build Test
+
+The `autopkgtest` suite for `rustc` includes a test that rebuilds the compiler using the just-
+packaged toolchain. This test validates that the packaged compiler can bootstrap future Rust
+versions. However, for backports — especially those that vendor LLVM — this test is resource-
+intensive and frequently times out on the `autopkgtest` infrastructure.
+
+Remove the self-build test stanza from `debian/tests/control`:
+
+```diff
+-Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+-Depends: @, @builddeps@
+-Restrictions: rw-build-tree, allow-stderr
+```
+
+> **Note:** The build process still performs internal bootstrapping: the previous-version compiler
+> builds a stage1 compiler, which then builds the stage2 compiler that gets packaged. This is
+> sufficient validation for backports. If you need to verify that the newly-packaged compiler can
+> build the **next** Rust version before that version is packaged, see § 3.10.3 (Optional
+> self-build).
+
+> **Requires:** All applicable Gate changes (§ 3.4) applied and committed.  
+> **Ensures:** `debian/tests/control` does not contain the `RUST_TEST_SELFBUILD=1` stanza.  
+> **On failure:** This step cannot fail. If the stanza is already absent from
+> `debian/tests/control`, it was removed in a prior step or upstream — no action needed.
+
+---
+
+### 3.6 Local Build
+
+A local build validates the packaging on the host architecture before spending time on a full
+multi-arch PPA build.
+
+#### 3.6.1 Clean Previous Artifacts
+
+Remove stale build artifacts to ensure a clean source state:
+
+```shell
+rm -vf ../*.{debian.tar.xz,dsc,buildinfo,changes,ppa.upload}
+rm -vf debian/files
+rm -rf .pc
+```
+
+#### 3.6.2 Run the Build
+
+Ensure quilt patches are not applied before starting the build — `sbuild` applies them from
+scratch and will fail if it finds them already in place:
+
+```shell
+quilt pop -a 2>/dev/null || true
+```
+
+Then run the build:
+
+```shell
+sbuild -Ad <release>
+```
+
+A full build takes approximately 1–3 hours on a fast machine. For LLVM-vendoring backports,
+expect significantly longer (3–6 hours).
+
+**If the bootstrap compiler is not in the `<release>` archive** (i.e. `rustc-<X.Y_old>` has not
+yet been uploaded to the Archive and is only in a PPA), provide the PPA as an extra repository:
+
+```shell
+sbuild -Ad <release> \
+    --extra-repository="deb [trusted=yes] http://ppa.launchpad.net/rust-toolchain/staging/ubuntu/ <release> main"
+```
+
+Or use a personal PPA if uploading there first:
+
+```shell
+sbuild -Ad <release> \
+    --extra-repository="deb [trusted=yes] http://ppa.launchpad.net/<lpuser>/<ppa_name>/ubuntu/ <release> main"
+```
+
+#### 3.6.3 Diagnosing Build Failures
+
+If the build fails:
+
+1. **Find test failures in the build log.** `sbuild` saves logs to your home directory. Search the
+   log for the string `stdout ----` to jump to the stdout of each failing test.
+
+2. **Re-run individual tests without rebuilding.** When `sbuild` leaves you in an interactive
+   shell after failure, you can run individual test suites directly:
+
+   ```shell
+   # Re-run all bootstrap tests
+   debian/rules override_dh_auto_test-arch RUSTBUILD_TEST_FLAGS="src/bootstrap/"
+
+   # Re-run a specific test by name
+   debian/rules override_dh_auto_test-arch \
+       RUSTBUILD_TEST_FLAGS="src/bootstrap/ --test-args <test_name>"
+   ```
+
+3. **Failing `rustdoc-ui` tests.** These tests compare `stderr` byte-for-byte. On older Ubuntu
+   releases (typically those with `make < 4.4`), jobserver warnings injected by `make` cause
+   spurious failures. This is a known `jobserver-rs` issue. Try building in a PPA (§ 3.8) — the
+   Launchpad build infrastructure typically does not trigger these warnings.
+
+4. **Missing `libssl-dev`.** If you see a panic from `openssl-sys` stating it cannot find OpenSSL:
+
+   ```
+   The system library `openssl` required by crate `openssl-sys` was not found.
+   ```
+
+   Add `libssl-dev` to `Build-Depends` in both `debian/control` and `debian/control.in`:
+
+   ```diff
+    libsqlite3-dev,
+   + libssl-dev,
+   ```
+
+5. **Finding and applying patches.** Before writing a new patch:
+   - Check [Debian Salsa](https://salsa.debian.org/rust-team/rust/-/tree/debian/experimental)
+     for an equivalent patch. If found, use it directly.
+   - If modifying a Debian patch, add `Origin: backport, <Debian Salsa patch URL>` to the patch header.
+   - For new patches, generate a DEP-3 header template:
+
+     ```shell
+     quilt header -e --dep3 <path/to/patch>
+     ```
+
+     Delete the boilerplate `This patch header follows DEP-3 [...]` line that `quilt` inserts.
+     For backport-specific bugs, add a `Bug-Ubuntu: https://bugs.launchpad.net/bugs/<lp_bug_number>`
+     line.
+
+6. **After fixing bugs**, re-run the full local build from step 3.6.1.
+
+> **Requires:** § 3.5 post-state. All packaging changes committed (or at least applied).  
+> **Ensures:** The package builds successfully with `sbuild` on the host architecture.  
+> **On failure:** Address the failure using the diagnostics above. If the failure is architecture-
+> specific and cannot be reproduced locally, proceed to the Lintian check (§ 3.7) and PPA build
+> (§ 3.8) and diagnose from the PPA build logs.
+
+---
+
+### 3.7 Lintian Checks
+
+Before uploading to a PPA, verify the package passes Lintian. Running this check now — after the
+local build but before the multi-architecture PPA build — catches packaging metadata issues early
+and avoids wasting build time on fixable errors.
+
+Build the source package:
+
+```shell
+rm -vf ../*.{debian.tar.xz,dsc,buildinfo,changes,ppa.upload}
+rm -vf debian/files
+rm -rf .pc
+dpkg-buildpackage -S -I -i -nc -d -sa
+```
+
+Run Lintian on warnings and errors:
+
+```shell
+lintian -i --tag-display-limit 0 2>&1 | tee ~/lintian-<X.Y>-<release>.log
+```
+
+The following Lintian tags are **expected and can be ignored**:
+
+| Tag                                                                                          | Why ignored                                                                                          |
+| -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `E: rustc-<X.Y> source: field-too-long Vendored-Sources-Rust`                                | The field length is unavoidable; a fix requires upstream `dh-cargo` changes.                        |
+| `E: rustc-<X.Y> source: unknown-file-in-debian-source [debian/source/lintian-overrides.in]`  | This file is intentional; it generates per-version Lintian overrides.                               |
+| `E: rustc-<X.Y> source: version-substvar-for-external-package Depends ${binary:Version} ...` | This is a deliberate fallback, not an error.                                                         |
+| `W: rustc-<X.Y> source: unknown-field Vendored-Sources-Rust`                                 | Custom field; not a typo.                                                                            |
+| Various warnings in `src/llvm-project/` (binaries, embedded libs) — **Gate A only**          | Test-suite binaries that are part of upstream LLVM source; expected when LLVM is vendored. |
+
+All other errors and warnings must either be fixed or explicitly overridden in
+`debian/source/lintian-overrides{,.in}` with a justifying comment.
+
+> **Requires:** § 3.6 post-state (local build succeeds).  
+> **Ensures:** Lintian produces no unexpected errors or warnings.  
+> **On failure:** Fix or override each unexpected Lintian warning/error. Consult existing
+> `lintian-overrides` for precedent before adding new overrides. After fixing, re-run the local
+> build (§ 3.6) if source files were changed, then re-run Lintian.
+
+---
+
+### 3.8 PPA Build (Multi-Architecture Validation)
+
+The local build only validates the host architecture. A PPA build exercises all supported
+architectures, including `riscv64`.
+
+> **Tribal knowledge — riscv64:** The `riscv64` architecture on Launchpad currently runs under
+> emulation. Expect builds to take 5–10× longer than on native architectures. This is normal.
+> Do not assume a long-running riscv64 build has failed.
+
+> **Tribal knowledge — early PPA build failure:** If a PPA build on any architecture fails in
+> under approximately 15 minutes with **no build log produced**, this is a Launchpad
+> infrastructure issue (not a packaging problem). Simply retry the build from the Launchpad web
+> UI. No source changes are needed.
+
+#### 3.8.1 Create a Personal PPA
+
+Create a personal PPA for this backport:
+
+```shell
+ppa create rustc-<X.Y>-<release>
+```
+
+> **Note on naming:** Using the release codename (e.g. `rustc-1.86-jammy`) rather than a generic
+> `rustc-1.86-release` name prevents collisions when backporting the same `X.Y` to multiple target
+> releases simultaneously.
+
+The command returns a URL. Visit that URL and configure the PPA:
+
+1. **Change Details → Processors:** Enable **all** architectures, including `riscv64`.
+2. **Edit PPA Dependencies → Ubuntu dependencies:** set to **"Security"** (because backports
+   target the security pocket of the archive).
+3. If bootstrapping from the staging PPA, add `ppa:rust-toolchain/staging` as an explicit
+   PPA dependency.
+
+#### 3.8.2 Add a Temporary PPA Version Suffix
+
+Add a temporary changelog entry with a `~ppa<N>` suffix so this PPA upload never competes with
+a real archive version:
+
+```shell
+dch -bv "<current_version>~ppa1" --distribution "<release>" "PPA upload"
+```
+
+Increment `~ppa<N>` (e.g. `~ppa2`, `~ppa3`) for each re-upload to the same PPA.
+
+#### 3.8.3 Upload to PPA
+
+Clean build artifacts, then build the source package:
+
+```shell
+rm -vf ../*.{debian.tar.xz,dsc,buildinfo,changes,ppa.upload}
+rm -vf debian/files
+rm -rf .pc
+dpkg-buildpackage -S -I -i -nc -d -sa
+```
+
+Upload:
+
+```shell
+dput ppa:<lpuser>/rustc-<X.Y>-<release> ../<package>_<version>~ppa1_source.changes
+```
+
+#### 3.8.4 RISC-V Extension Sub-Gate (LLVM-vendoring backports only)
+
+If Gate A (§ 3.4) was triggered (LLVM is vendored), check RISC-V build logs. Older versions of
+`binutils` in earlier Ubuntu releases do not understand newer RISC-V ISA extensions that the
+vendored LLVM emits.
+
+**Symptom:** RISC-V build fails with errors about unrecognised instruction mnemonics or
+extended RISC-V `Z` extensions.
+
+**Pre-check:** These patches may already be present if the `<source_release>` branch was itself
+a backport that applied them. Check before cherry-picking:
+
+```shell
+git log --oneline | grep -i zicsr
+git log --oneline | grep -i zmmul
+```
+
+If the commit is already present in the log, skip the corresponding cherry-pick.
+
+Apply the relevant cherry-picks for any that are absent:
+
+| Extension        | LLVM version | Cherry-pick commit                         |
+| ---------------- | ------------ | ------------------------------------------ |
+| `zicsr`          | LLVM 18+     | `e7285a65b8ae134c7bd506e23beef4a3f088eab5` |
+| `zicsr` (update) | LLVM 19+     | `eea627ceb5ec7ab312a10aafaa191c602efd561a` |
+| `zmmul`          | LLVM 19+     | `9b5dda44b0de0a3e1e9dfd552e6097c08aed298f` |
+
+Apply both `zicsr` commits before applying `zmmul` if LLVM 19+ is in use.
+
+```shell
+git cherry-pick <commit>
+```
+
+Re-upload to the PPA with an incremented `~ppa<N>` suffix.
+
+#### 3.8.5 Disk Space Sub-Gate (LLVM or libgit2 vendoring backports only)
+
+If Gate A or Gate B-Vendor was triggered, PPA builders may run out of disk space. Detection:
+
+**Symptom:** PPA build fails with `No space left on device` in the build log.
+
+1. Locate the point in `debian/rules` at which the failure occurs.
+2. Add diagnostic output immediately before that point:
+
+   ```makefile
+   	@echo "------- disk usage -------"
+   	-df -h /
+   	@echo "------- inode usage -------"
+   	-df -ih /
+   	@echo "------- top space hogs in cwd -------"
+   	-du -xh $(CURDIR) | sort -h | tail -n 20
+   ```
+
+3. After confirming that the `stage0`, `stage1`, and `test` build directories are no longer
+   needed at the failing point, delete them earlier in the build:
+
+   ```makefile
+   	$(RM) -rf $(CURDIR)/build/$(DEB_BUILD_RUST_TYPE)/test
+   	$(RM) -rf $(CURDIR)/build/$(DEB_BUILD_RUST_TYPE)/stage0-rustc
+   	$(RM) -rf $(CURDIR)/build/$(DEB_BUILD_RUST_TYPE)/stage1-rustc
+   ```
+
+4. Remove the diagnostic output and re-upload with an incremented `~ppa<N>` suffix.
+
+> **Requires:** § 3.7 post-state (Lintian clean).  
+> **Ensures:** All architecture-specific PPA builds succeed (green status on Launchpad).  
+> **On failure:** See § 3.8.4 for RISC-V extensions, § 3.8.5 for disk space. For other failures,
+> read the architecture-specific build log; failures are always packaging or compatibility issues,
+> not Launchpad infrastructure.
+
+---
+
+### 3.9 Staging PPA Upload
+
+Once the package builds successfully on all architectures and passes Lintian, upload to the
+central staging PPA.
+
+#### 3.9.1 Prepare the Final Version Number
+
+The most recent changelog entry is the `~ppa<N>` entry added in § 3.8.2. It must be promoted to
+the final version number before uploading to staging. Do **not** create a new entry with
+`dch -bv` — that would produce a second entry at the same base version as the § 3.2 entry, which
+`dpkg` rejects as a duplicate. Instead, edit the version in-place and then use `dch -r` to
+refresh the timestamp and maintainer fields:
+
+1. Manually edit `debian/changelog` — in the top entry, remove the `~ppa<N>` suffix from the
+   version string, and replace the placeholder description with a complete list of every change
+   made during this backport (see the example below).
+
+2. Run `dch -r` to update the date and maintainer stamp on the top entry:
+
+   ```shell
+   dch -r --distribution "<release>"
+   ```
+
+The final entry should look like this (adapt to the actual changes made):
+
+```
+rustc-<X.Y> (<X.Y.Z>+dfsg~<release_number>-0ubuntu1~<release_number>.1) <release>; urgency=medium
+
+  * Backport Rust <X.Y> to <Release Name>
+    - <summary of Gate A changes, if applied, e.g. "Replace system LLVM with vendored version">
+    - <summary of Gate B changes, if applied, e.g. "Downgrade libgit2 to 1.7.2">
+    - <summary of any other changes made>
+
+ -- Your Name <your.email@canonical.com>  Day, DD Mon YYYY HH:MM:SS +0000
+```
+
+The description must enumerate all backporting changes. A description of "Upload to staging PPA"
+or "Backport to `<release>`" alone is not sufficient; reviewers and future maintainers rely on this
+entry to understand what was changed and why.
+
+> **Note on version monotonicity:** If a `~ppa<N>` upload was already made to the staging PPA
+> (e.g. by skipping the personal PPA step), that version string is now consumed. You must increment
+> the trailing counter (e.g. `~22.04.1` → `~22.04.2`) before re-uploading. Gaps in the version
+> sequence are acceptable — only monotonic increase is required.
+
+#### 3.9.2 Upload
+
+Clean, build the source package, and upload:
+
+```shell
+rm -vf ../*.{debian.tar.xz,dsc,buildinfo,changes,ppa.upload}
+rm -vf debian/files
+rm -rf .pc
+dpkg-buildpackage -S -I -i -nc -d -sa
+dput ppa:rust-toolchain/staging ../<package>_<final_version>_source.changes
+```
+
+#### 3.9.3 Skipping the Personal PPA (acceptable trade-off)
+
+It is permissible to upload directly to the staging PPA without first uploading to a personal PPA.
+This saves one full multi-architecture build cycle (significant when riscv64 is emulated). The
+trade-off is that if the staging PPA build fails, the version number is consumed and must be
+incremented before the next attempt. Only do this when confident in the packaging, e.g. when the
+same changes have already been validated in a previous personal PPA build.
+
+> **Requires:** § 3.8 post-state (all PPA arch builds green); Lintian clean (§ 3.7).  
+> **Ensures:** Package is published in `ppa:rust-toolchain/staging` at the final version number;
+> all architecture builds succeed in the staging PPA.  
+> **On failure:** If the staging PPA build fails on an architecture that passed the personal PPA,
+> it is likely a dependency difference. Check that the staging PPA's dependencies are set to
+> "Security" (not "Proposed"). If the build log shows a missing dependency, it may be a
+> bootstrapping issue — ensure the previous `(X.Y-1, release)` pair was uploaded to staging before
+> this one.
+
+---
+
+### 3.10 Autopkgtests
+
+After the staging PPA build succeeds, every `autopkgtest` in the suite (except the self-build test
+removed in § 3.5) must pass before the package is considered ready.
+
+#### 3.10.1 Trigger the Tests
+
+```shell
+ppa tests ppa:rust-toolchain/staging -p rustc-<X.Y> --release <release> --show-url
+```
+
+For example, for `rustc-1.89` on Noble:
+
+```shell
+ppa tests ppa:rust-toolchain/staging -p rustc-1.89 --release noble --show-url
+```
+
+This outputs one URL per architecture. Visit each URL (or click each link) to trigger the
+`autopkgtest` run on the remote infrastructure.
+
+#### 3.10.2 Monitor Results
+
+Re-run the same command after a few minutes to see updated status. If any tests fail, the output
+includes a link to the test logs.
+
+#### 3.10.3 (Optional) Self-Build Validation
+
+If you need to verify that the newly-packaged `rustc-<X.Y>` can build itself — for example, when
+the next Rust version is not yet available to bootstrap from — you can perform an optional
+Launchpad self-build.
+
+Create a new personal PPA and modify `debian/control` **temporarily** to require only the same
+version (not the previous version) as the bootstrap compiler:
+
+```diff
+- cargo-<X.Y_old> | cargo-<X.Y> <!pkg.rustc.dlstage0>,
+- rustc-<X.Y_old> | rustc-<X.Y> <!pkg.rustc.dlstage0>,
++ cargo-<X.Y> <!pkg.rustc.dlstage0>,
++ rustc-<X.Y> <!pkg.rustc.dlstage0>,
+```
+
+Set this PPA to depend on the staging PPA. Upload and build. Launchpad builders have more
+resources than `autopkgtest` infrastructure and are less likely to time out.
+
+**Do not commit or upload this change to the staging PPA.** It is for validation only.
+
+> **Requires:** § 3.9 post-state (staging PPA build green).  
+> **Ensures:** All enabled autopkgtests pass for all architectures.  
+> **On failure:** Fix the failing test and re-upload to the staging PPA (increment version), then
+> re-trigger autopkgtests. Do not request Archive upload until all tests pass.
+
+---
+
+### 3.11 Push Branch to Foundations Repository
+
+Once autopkgtests pass, push the completed branch to the canonical Foundations repository. This
+is the authoritative record of what was done and is required before the branch is referenced in
+any Archive upload request.
+
+```shell
+git push origin <release>-<X.Y>
+```
+
+> **Requires:** § 3.10 post-state (all autopkgtests pass).  
+> **Ensures:** Branch `<release>-<X.Y>` is present on the `origin` remote
+> (`git.launchpad.net/~canonical-foundations/ubuntu/+source/rustc`).  
+> **On failure:** If the push is rejected due to branch protection, do not force-push. Contact the
+> Foundations team to arrange the push. The branch must not be force-pushed once it has been
+> referenced by an uploaded package.
+
+---
+
+### 3.12 (Optional) Archive Upload
+
+This step is only applicable for **priority backports** (§ 1.1) — cases where a specific
+downstream package needs the toolchain in the Ubuntu Archive, not just the staging PPA.
+
+After § 3.10 is green, contact the Ubuntu Security team to request upload:
+
+- **Email / Matrix:** Include the following in your request:
+  1. Link to the Launchpad bug report.
+  2. Link to the staging PPA package page.
+  3. Package name and version number (e.g. `rustc-1.86 1.86.0+dfsg~22.04-0ubuntu1~22.04.1`).
+
+Monitor progress in the Security Proposed PPA:
+
+```
+https://launchpad.net/~ubuntu-security-proposed/+archive/ubuntu/ppa/+packages?field.name_filter=rustc
+```
+
+The Security team may upload to the Security Proposed PPA first (if changes are needed during
+sponsorship) or copy directly to the Ubuntu Archive. Both paths result in the package eventually
+appearing in the Ubuntu Archive under the security pocket.
+
+> **Requires:** § 3.11 post-state (branch pushed to Foundations; all autopkgtests pass); LP bug exists with all series targeted.  
+> **Ensures:** Package is accepted into the Ubuntu Archive (security pocket) for `<release>`.  
+> **On failure:** If the Security team requests changes, apply them to the branch, re-upload to
+> staging (§ 3.9), re-run autopkgtests (§ 3.10), and re-notify the Security team.
+
+---
+
+### 3.13 Advance to the Next Triple
+
+After completing §§ 3.1–3.11 (and optionally 3.12) for the current `(X.Y, source_release,
+release)` triple:
+
+1. Verify the package is present in the staging PPA for `<release>` and the branch is pushed
+   to the Foundations repository.
+2. Advance to the next triple in the work plan (§ 1.3) and repeat from § 3.1.
+
+The invariant to check before starting the next triple:
+
+```
+staging PPA contains rustc-<X.Y> for <release>
+    AND all architecture builds are green (including riscv64)
+    AND all autopkgtests pass on all architectures
+    AND branch <release>-<X.Y> is pushed to the Foundations repository
+```
+
+If this invariant does not hold, do not start the next triple.
+
+---
+
+## 4. Runbook Completion Checklist
+
+Use this checklist to confirm the entire backporting scope from § 1.3 is complete.
+
+For each `(X.Y, release)` pair in the work plan, verify:
+
+- [ ] Branch `<release>-<X.Y>` exists and is pushed to the Foundations repository
+- [ ] Package `rustc-<X.Y>` is present in `ppa:rust-toolchain/staging` for `<release>` at the correct version
+- [ ] All PPA builds (all architectures) are green
+- [ ] All autopkgtests pass (self-build test deliberately disabled)
+- [ ] If priority backport: LP bug targets this series and is marked as the correct status
+- [ ] If Archive upload requested: package is visible in the Ubuntu Archive for `<release>`
+
+After all pairs are complete, update the
+[Rust Toolchain Availability page](https://documentation.ubuntu.com/ubuntu-for-developers/reference/availability/rust/)
+with the newly backported versions.
+
+---
+
+## Appendix A: Version String Quick Reference
+
+| Situation                                      | Version string                            |
+| ---------------------------------------------- | ----------------------------------------- |
+| New toolchain in devel series (first upload)   | `1.93.0+dfsg-0ubuntu1`                    |
+| Devel → Noble backport                         | `1.93.0+dfsg~24.04-0ubuntu1~24.04.1`      |
+| Noble → Jammy backport                         | `1.93.0+dfsg~22.04-0ubuntu1~22.04.1`      |
+| Noble package updated (second Ubuntu revision) | `1.93.0+dfsg~24.04-0ubuntu2~24.04.2`      |
+| Tarball repacked after initial upload          | `1.93.0+dfsg1~24.04-0ubuntu1~24.04.1`     |
+| PPA test upload (first attempt)                | `1.93.0+dfsg~24.04-0ubuntu1~24.04.1~ppa1` |
+
+**Ordering guarantee:** `<base_version>~ppa1` < `<base_version>` because `~` sorts before any
+character. This means a PPA upload with a `~ppa<N>` suffix will always be superseded by the final
+archive version.
+
+---
+
+## Appendix B: Compatibility Gate Summary
+
+| Gate                 | What to check             | Where to check                                    | Trigger condition            |
+| -------------------- | ------------------------- | ------------------------------------------------- | ---------------------------- |
+| A — LLVM             | LLVM version N in archive | LP: `ubuntu/<release>/+source/llvm-toolchain-<N>` | 404 or "not published"       |
+| B — libgit2          | libgit2-dev version       | LP: `ubuntu/<release>/+source/libgit2`            | Archive version < required   |
+| C — dh-cargo         | dh-cargo >= 28ubuntu1~    | LP: `ubuntu/<release>/+source/dh-cargo`           | Too old or absent            |
+| D — pkgconf          | pkgconf in archive        | LP: `ubuntu/<release>/+source/pkgconf`            | Absent                       |
+| E — cmake            | cmake >= 3.0              | LP: `ubuntu/<release>/+source/cmake`              | Archive version < 3.0        |
+| F — debhelper-compat | debhelper compat level    | LP: `ubuntu/<release>/+source/debhelper`          | Required compat level absent |
+
+---
+
+## Appendix D: Using an Upstream Stage0 Bootstrap Toolchain
+
+This appendix covers the case where **INV-2** (§ 0.4) cannot be satisfied: there is no packaged
+Rust compiler in the target release that can bootstrap the next version. This happens when:
+
+- A new Ubuntu architecture is introduced and no previously-packaged Rust toolchain runs on it.
+- The bootstrapping chain has a gap (e.g. a release's `rustc-<X.Y_old>` was never uploaded).
+
+The upstream Rust project provides pre-built binary "stage0" compilers for every release, which
+can be used to bootstrap the packaged version from source. Because the final package must not
+contain pre-built binaries (the Ubuntu Archive does not permit that), this procedure performs
+**two PPA builds**: one with the stage0 binaries bundled, and one that uses the first build as its
+bootstrapping compiler.
+
+### D.1 Version String Convention
+
+Include `~stage0` in the version string immediately before the hyphen:
+
+```
+<X.Y.Z>+dfsg~<release_number>~stage0-0ubuntu1~<release_number>.<N>
+```
+
+Example: `1.92.0+dfsg~24.04~stage0-0ubuntu1~24.04.3`
+
+### D.2 Generate the Stage0 Tarball
+
+The `source_orig-stage0` rule in `debian/rules` downloads pre-built binaries for all
+Ubuntu-supported architectures and bundles them into a component tarball.
+
+First, install the matching Rust toolchain locally so the rule can use its `rustfmt` and `cargo`:
+
+```shell
+rustup install <X.Y.Z>
+export RUST_BOOTSTRAP_DIR="$(rustup +<X.Y.Z> which rustc | sed 's|/bin/rustc||')"
+```
+
+Then generate the stage0 tarball from inside the source directory:
+
+```shell
+debian/rules source_orig-stage0
+```
+
+This produces `../rustc_<...>.orig-stage0.tar.xz`. Rename it to match the packaging filename
+convention (the same format as other orig tarballs):
+
+```shell
+mv ../rustc_<...>.orig-stage0.tar.xz \
+   ../rustc-<X.Y>_<X.Y.Z>+dfsg~<release_number>~stage0.orig-stage0.tar.xz
+```
+
+> **Pre-condition:** `RUST_BOOTSTRAP_DIR` must point to a local toolchain at version `<X.Y.Z>`.  
+> **On failure:** If the rule cannot download binaries, check network access and that the
+> upstream release exists at `https://static.rust-lang.org/dist/`.
+
+### D.3 Modify `debian/control`
+
+Remove the bootstrapping compiler and `dh-cargo` from `Build-Depends`, because no packaged
+compiler is available and `dh-cargo` validation cannot run without it:
+
+```diff
+- dh-cargo (>= 28ubuntu1~),
++# dh-cargo (>= 28ubuntu1~),
+  dpkg-dev (>= 1.17.14),
+  python3:native,
+- cargo-<X.Y_old> | cargo-<X.Y> <!pkg.rustc.dlstage0>,
+- rustc-<X.Y_old> | rustc-<X.Y> <!pkg.rustc.dlstage0>,
++# cargo-<X.Y_old> | cargo-<X.Y> <!pkg.rustc.dlstage0>,
++# rustc-<X.Y_old> | rustc-<X.Y> <!pkg.rustc.dlstage0>,
+```
+
+> **Architecture-restricted stage0:** If stage0 is only needed for specific architectures (e.g.
+> `armhf` and `i386`), do not remove the dependencies entirely. Instead, add architecture
+> exclusions so the dependencies are only removed for the affected architectures:
+>
+> ```diff
+> - cargo-<X.Y_old> | cargo-<X.Y> <!pkg.rustc.dlstage0>,
+> + cargo-<X.Y_old> | cargo-<X.Y> [!armhf !i386] <!pkg.rustc.dlstage0>,
+> - rustc-<X.Y_old> | rustc-<X.Y> <!pkg.rustc.dlstage0>,
+> + rustc-<X.Y_old> | rustc-<X.Y> [!armhf !i386] <!pkg.rustc.dlstage0>,
+> ```
+>
+> In this case, trim the stage0 tarball to include only the binaries for the affected
+> architectures before uploading.
+
+### D.4 Modify `debian/rules`
+
+Comment out the two lines that would otherwise abort the build when no packaged compiler is found:
+
+1. The "No suitable Rust toolchain found" error:
+
+   ```diff
+   -$(error No suitable Rust toolchain found to bootstrap Rust $(RUST_VERSION))
+   +#$(error No suitable Rust toolchain found to bootstrap Rust $(RUST_VERSION))
+   ```
+
+2. The `dh-cargo-vendored-sources` validation call (also removed in Gate C):
+
+   ```diff
+   -CARGO_BIN="$(RUST_BOOTSTRAP_DIR)/bin/cargo" CARGO_VENDOR_DIR=$(CURDIR)/vendor debian/dh-cargo-vendored-sources
+   +#CARGO_BIN="$(RUST_BOOTSTRAP_DIR)/bin/cargo" CARGO_VENDOR_DIR=$(CURDIR)/vendor debian/dh-cargo-vendored-sources
+   ```
+
+### D.5 First PPA Build (with Stage0 Binaries)
+
+Upload to a personal PPA following § 3.8 (adding `~stage0` to the version suffix as per § D.1).
+The stage0 tarball is large; expect upload and build times to be significantly longer than normal.
+
+> **Ensures:** The package builds successfully using the pre-built stage0 binaries. The resulting
+> binary package is the bootstrapping compiler for the second build.
+
+### D.6 Revert Stage0 Changes and Perform the Final Build
+
+After the first PPA build succeeds:
+
+1. Delete (or move aside) the stage0 tarball: `rm ../rustc-<X.Y>_*~stage0.orig-stage0.tar.xz`
+2. Remove `~stage0` from the version string in `debian/changelog`.
+3. Revert the changes to `debian/rules` from § D.4 (uncomment the two lines).
+4. Revert the changes to `debian/control` from § D.3 (re-enable bootstrapping dependencies).
+5. Remove the `stage0/` directory from the source tree: `rm -rf stage0/`
+6. Create a second personal PPA and configure it to depend on the first PPA (which holds the
+   stage0 build). Upload the reverted package to the second PPA.
+
+The second build uses the first PPA's package as its bootstrapping compiler, producing a final
+package that contains no pre-built binaries and is suitable for uploading to the staging PPA and
+the Archive.
+
+> **Ensures:** The final package is built from source using a packaged (not pre-built) compiler
+> and contains no stage0 binaries.  
+> **On failure:** If the second build cannot find the bootstrapping compiler from the first PPA,
+> verify that the second PPA's dependencies are correctly set to include the first PPA.
+
+---
+
+## Appendix C: Key URLs
+
+| Resource                                        | URL                                                                                                     |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Foundations Rust git repository                 | `https://git.launchpad.net/~canonical-foundations/ubuntu/+source/rustc`                                 |
+| Rust Toolchain Staging PPA                      | `https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/`                                        |
+| Security Proposed PPA (monitor Archive uploads) | `https://launchpad.net/~ubuntu-security-proposed/+archive/ubuntu/ppa/+packages?field.name_filter=rustc` |
+| Rust Toolchain Availability page                | `https://documentation.ubuntu.com/ubuntu-for-developers/reference/availability/rust/`                   |
+| Debian Rust packaging (patch reference)         | `https://salsa.debian.org/rust-team/rust/-/tree/debian/experimental`                                    |
+| Rust upstream issue tracker                     | `https://github.com/rust-lang/rust/issues`                                                              |

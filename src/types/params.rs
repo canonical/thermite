@@ -1,6 +1,166 @@
 use crate::error::{Result, ThermiteError};
 use crate::types::{ubuntu::UbuntuRelease, versions::RustVersion};
 
+/// Parameters for the `thermite backport` command.
+///
+/// All values are validated on construction.
+#[derive(Debug, Clone)]
+pub struct BackportParams {
+    /// Full Rust version being backported, e.g. `"1.85.0"`.
+    pub rust_version: RustVersion,
+    /// Ubuntu release being backported **from**, e.g. `"noble"`.
+    pub source_release: UbuntuRelease,
+    /// Ubuntu release being backported **to**, e.g. `"jammy"`.
+    pub release: UbuntuRelease,
+    /// Launchpad username; also used as the personal Git remote name.
+    pub lpuser: String,
+    /// Local Git remote name for the Foundations rustc repository.
+    /// Defaults to `"foundations"`.
+    pub git_remote: String,
+    /// Launchpad bug ID number for this work (digits only).
+    /// `None` for proactive backports that do not have an associated bug.
+    pub lp_bug_number: Option<String>,
+    /// When `true`, skip all hard-to-revert operations (remote git push, PPA
+    /// creation, dput uploads) and print what each would have done instead.
+    pub dry_run: bool,
+}
+
+impl BackportParams {
+    /// Construct and validate a new [`BackportParams`].
+    ///
+    /// `lp_bug_number` is `None` for proactive backports.  When `Some`, it
+    /// must be a non-empty string of ASCII digits.
+    ///
+    /// `dry_run` — when `true`, all hard-to-revert operations (remote git
+    /// push, PPA creation, dput uploads) are printed but not executed.
+    pub fn new(
+        rust_version: &str,
+        source_release: &str,
+        release: &str,
+        lpuser: &str,
+        git_remote: &str,
+        lp_bug_number: Option<&str>,
+        dry_run: bool,
+    ) -> Result<Self> {
+        if lpuser.is_empty() {
+            return Err(ThermiteError::InvalidLpUser(
+                "lpuser must not be empty".to_owned(),
+            ));
+        }
+        if let Some(bug) = lp_bug_number {
+            if bug.is_empty() || !bug.chars().all(|c| c.is_ascii_digit()) {
+                return Err(ThermiteError::InvalidLpBugNumber(format!(
+                    "'{bug}' must be a non-empty string of digits"
+                )));
+            }
+        }
+        let source = UbuntuRelease::parse(source_release)?;
+        let target = UbuntuRelease::parse(release)?;
+        if source == target {
+            return Err(ThermiteError::InvalidBackportReleases(format!(
+                "source release and target release must differ (both are '{source_release}')"
+            )));
+        }
+        Ok(Self {
+            rust_version: RustVersion::parse(rust_version)?,
+            source_release: source,
+            release: target,
+            lpuser: lpuser.to_owned(),
+            git_remote: git_remote.to_owned(),
+            lp_bug_number: lp_bug_number.map(|s| s.to_owned()),
+            dry_run,
+        })
+    }
+}
+
+#[cfg(test)]
+mod backport_params_tests {
+    use super::*;
+    use crate::error::ThermiteError;
+
+    fn valid_backport() -> BackportParams {
+        BackportParams::new("1.85.0", "noble", "jammy", "jdoe", "foundations", None, false)
+            .unwrap()
+    }
+
+    #[test]
+    fn valid_backport_params_constructs_successfully() {
+        let p = valid_backport();
+        assert_eq!(p.lpuser, "jdoe");
+        assert_eq!(p.lp_bug_number, None);
+    }
+
+    #[test]
+    fn backport_with_bug_number_accepted() {
+        let p = BackportParams::new(
+            "1.85.0",
+            "noble",
+            "jammy",
+            "jdoe",
+            "foundations",
+            Some("99999"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(p.lp_bug_number, Some("99999".to_owned()));
+    }
+
+    #[test]
+    fn non_digit_bug_number_returns_error() {
+        let result = BackportParams::new(
+            "1.85.0", "noble", "jammy", "jdoe", "foundations", Some("abc"), false,
+        );
+        assert!(
+            matches!(result, Err(ThermiteError::InvalidLpBugNumber(_))),
+            "expected InvalidLpBugNumber, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn empty_bug_number_returns_error() {
+        let result = BackportParams::new(
+            "1.85.0", "noble", "jammy", "jdoe", "foundations", Some(""), false,
+        );
+        assert!(
+            matches!(result, Err(ThermiteError::InvalidLpBugNumber(_))),
+            "expected InvalidLpBugNumber, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn same_source_and_target_release_returns_error() {
+        let result =
+            BackportParams::new("1.85.0", "noble", "noble", "jdoe", "foundations", None, false);
+        assert!(
+            matches!(result, Err(ThermiteError::InvalidBackportReleases(_))),
+            "expected InvalidBackportReleases, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn empty_lpuser_returns_invalid_lp_user_error() {
+        let result =
+            BackportParams::new("1.85.0", "noble", "jammy", "", "foundations", None, false);
+        assert!(
+            matches!(result, Err(ThermiteError::InvalidLpUser(_))),
+            "expected InvalidLpUser, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn dry_run_flag_is_stored() {
+        let p =
+            BackportParams::new("1.85.0", "noble", "jammy", "jdoe", "foundations", None, true)
+                .unwrap();
+        assert!(p.dry_run, "dry_run should be stored as true");
+
+        let p2 =
+            BackportParams::new("1.85.0", "noble", "jammy", "jdoe", "foundations", None, false)
+                .unwrap();
+        assert!(!p2.dry_run, "dry_run should be stored as false");
+    }
+}
+
 /// Parameters for the `thermite update` command.
 ///
 /// All values are validated on construction. The short version fields are
