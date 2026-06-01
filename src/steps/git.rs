@@ -85,13 +85,26 @@ pub async fn cherry_pick(repo_dir: &Path, commit: &str) -> Result<()> {
 }
 
 /// Restore a file to its committed state using `git restore`.
+///
+/// `file` may be an absolute path or a path relative to the process CWD that
+/// points inside `repo_dir`.  `git restore` must receive a path relative to
+/// the repository root (i.e. relative to `repo_dir`), because git resolves
+/// path arguments relative to its own working directory.  Passing an absolute
+/// or process-CWD-relative path when the git cwd is `repo_dir` causes git to
+/// report "is outside repository".
+///
+/// We strip the `repo_dir` prefix from `file` when possible; if `file` is
+/// already relative to `repo_dir` (e.g. `debian/changelog`), `strip_prefix`
+/// returns `Err` and `file` is used as-is.
 pub async fn restore_file(repo_dir: &Path, file: &Path) -> Result<()> {
+    // Strip the repo_dir prefix so git sees a repo-root-relative path.
+    let relative = file.strip_prefix(repo_dir).unwrap_or(file);
     // Finding 11: replace panic! with a recoverable IO error so that
     // non-UTF-8 paths (however unlikely on Linux) produce a structured error.
-    let path_str = file.to_str().ok_or_else(|| {
+    let path_str = relative.to_str().ok_or_else(|| {
         crate::error::ThermiteError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("non-UTF-8 file path: {file:?}"),
+            format!("non-UTF-8 file path: {relative:?}"),
         ))
     })?;
     run_command("git", &["restore", path_str], repo_dir, &[]).await?;
@@ -153,5 +166,21 @@ mod tests {
         let result = restore_file(&repo, &nonexistent).await;
         // We expect an error (git not in a repo, or file not found).
         assert!(result.is_err(), "expected an error, not panic");
+    }
+
+    /// Regression: when `file` is constructed as `repo_dir.join(relative)` and
+    /// `repo_dir` is itself a relative path (e.g. `../some/repo`), `git restore`
+    /// must receive only the repo-root-relative portion (`relative`), not the
+    /// full path which git would interpret relative to its cwd and reject as
+    /// "outside repository".
+    ///
+    /// We can't run real git here, so we just assert that `strip_prefix` on the
+    /// constructed path yields the expected relative component.
+    #[test]
+    fn restore_file_strips_repo_dir_prefix_from_relative_path() {
+        let repo_dir = PathBuf::from("../testing-1.92.0/rustc");
+        let file = repo_dir.join("debian/changelog");
+        let relative = file.strip_prefix(&repo_dir).unwrap();
+        assert_eq!(relative, std::path::Path::new("debian/changelog"));
     }
 }
