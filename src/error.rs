@@ -26,6 +26,9 @@ pub enum ThermiteError {
     #[error("command '{0}' was not found on PATH")]
     CommandNotFound(String),
 
+    #[error("command '{0}' output could not be interpreted as a string")]
+    CommandOutputParseError(String),
+
     #[error("patch refresh required manual intervention: {0}")]
     PatchRefreshRequired(String),
 

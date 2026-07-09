@@ -7,7 +7,8 @@ use crate::shell;
 use crate::steps::{build, changelog, git, lintian, ppa, uscan, vendor};
 use crate::types::params::BackportParams;
 use crate::ui::{
-    confirm_sink, print_info_box, print_phase_header, prompt_input, prompt_select,
+    confirm_sink, print_info_box, print_phase_header, print_tool_checks, prompt_input,
+    prompt_select,
 };
 
 /// Required external tools for the backport workflow.
@@ -222,8 +223,7 @@ async fn generate_vendor_tarball_for_backport(
     parent_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
     let short = version.short();
-    let expected_name =
-        format!("rustc-{short}_{version}+dfsg~{target_series}.orig-vendor.tar.xz");
+    let expected_name = format!("rustc-{short}_{version}+dfsg~{target_series}.orig-vendor.tar.xz");
     let expected_path = parent_dir.join(&expected_name);
 
     // Scan for tarballs that share the same version prefix but have a
@@ -267,6 +267,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     let rust_ver = &params.rust_version;
     let rust_short = rust_ver.short();
     let source_release = params.source_release.as_str();
+    let source_series = params.source_release.series_number();
     let release = params.release.as_str();
     let target_series = params.release.series_number();
     let lpuser = &params.lpuser;
@@ -290,15 +291,20 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_phase_explanation(0);
 
     // Verify required tools are on PATH.
-    let missing_tools: Vec<&str> = REQUIRED_TOOLS
+    let tool_checks: Vec<(&str, bool)> = REQUIRED_TOOLS
         .iter()
-        .copied()
-        .filter(|t| shell::which(t).is_err())
+        .map(|t| (*t, shell::which(t).is_ok()))
+        .collect();
+    print_tool_checks(&tool_checks);
+    let missing_tools: Vec<&str> = tool_checks
+        .iter()
+        .filter(|(_, found)| !found)
+        .map(|(name, _)| *name)
         .collect();
     if !missing_tools.is_empty() {
         eprintln!("The following required tools were not found on PATH:");
         for t in &missing_tools {
-            eprintln!("  - {t}");
+            eprintln!("  \u{2717} {t}");
         }
         return Err(ThermiteError::CommandNotFound(missing_tools.join(", ")));
     }
@@ -316,7 +322,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         "Backport Parameters",
         &[
             &format!("  Rust version     : {rust_ver} (rustc-{rust_short})"),
-            &format!("  Source release   : {source_release}"),
+            &format!("  Source release   : {source_release} (series {source_series})"),
             &format!("  Target release   : {release} (series {target_series})"),
             &format!("  Launchpad user   : {lpuser}"),
             &format!("  Git remote       : {git_remote}"),
@@ -417,9 +423,8 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     // For backports we create the branch locally; it will be pushed to the
     // remote only once autopkgtests pass (Phase 13).
     if git::branch_exists(repo_dir, &target_branch).await? {
-        let fresh_start_hint = format!(
-            "To start fresh instead, exit and run: git branch -D {target_branch}"
-        );
+        let fresh_start_hint =
+            format!("To start fresh instead, exit and run: git branch -D {target_branch}");
         print_info_box(
             &format!("Branch '{target_branch}' already exists"),
             &[
@@ -444,13 +449,8 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         git::checkout_branch(repo_dir, &target_branch).await?;
         println!("  Switched to existing branch '{target_branch}'.");
     } else {
-        crate::shell::run_command(
-            "git",
-            &["checkout", "-b", &target_branch],
-            repo_dir,
-            &[],
-        )
-        .await?;
+        crate::shell::run_command("git", &["checkout", "-b", &target_branch], repo_dir, &[])
+            .await?;
         println!("  Branch '{target_branch}' created from '{source_branch}'.");
     }
 
@@ -1213,7 +1213,11 @@ async fn run_interactive_local_build(
                 }
                 match prompt_select(
                     "Build failed. What would you like to do?",
-                    &["Fix failure and retry", "Skip — proceed despite failure", "Abort"],
+                    &[
+                        "Fix failure and retry",
+                        "Skip — proceed despite failure",
+                        "Abort",
+                    ],
                     0,
                 ) {
                     0 => { /* retry — loop continues */ }

@@ -211,18 +211,20 @@ pub async fn run_interactive_command(
 
 /// Check that `program` is available on `PATH`, returning
 /// [`ThermiteError::CommandNotFound`] if it is not.
-pub fn which(program: &str) -> Result<()> {
-    let found = std::process::Command::new("which")
+pub fn which(program: &str) -> Result<String> {
+    let output = std::process::Command::new("which")
         .arg(program)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .map_err(|_e| ThermiteError::CommandNotFound(program.to_owned()))?;
 
-    if found {
-        Ok(())
-    } else {
-        Err(ThermiteError::CommandNotFound(program.to_owned()))
+    if !output.status.success() {
+        return Err(ThermiteError::CommandNotFound(program.to_owned()));
     }
+
+    let output = String::from_utf8(output.stdout)
+        .map_err(|_e| ThermiteError::CommandOutputParseError(program.to_owned()))?;
+
+    Ok(output)
 }
 
 #[cfg(test)]

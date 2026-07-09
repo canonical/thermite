@@ -7,7 +7,7 @@ use crate::types::versions::RustVersion;
 /// Ensure `rustup` is installed (available on PATH).
 ///
 /// Returns an error with installation guidance if it is not found.
-pub async fn ensure_rustup_installed() -> Result<()> {
+pub async fn ensure_rustup_installed() -> Result<String> {
     which("rustup").map_err(|_| {
         ThermiteError::CommandNotFound(
             "rustup (install it with: snap install rustup --classic)".to_owned(),

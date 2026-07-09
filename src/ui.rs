@@ -29,6 +29,32 @@ pub fn print_phase_header(phase: u32, title: &str) {
     }
 }
 
+/// Print a tool-check list with a `✔`/`✗` indicator for each entry.
+///
+/// `checks` is a slice of `(tool_name, found)` pairs. Found tools get a `✔`
+/// prefix; missing tools get a `✗` prefix. The section is formatted to match
+/// the visual style of [`print_info_box`] so it reads as a natural peer of
+/// "About this phase" without needing box-drawing characters.
+///
+/// Call this after [`print_phase_explanation`] and before the parameters box
+/// so the user sees every check result before being asked to confirm.
+pub fn print_tool_checks(checks: &[(&str, bool)]) {
+    if is_tty() {
+        println!("\x1b[1m  Required tools\x1b[0m");
+    } else {
+        println!("  Required tools");
+    }
+    println!();
+    for (name, found) in checks {
+        if *found {
+            println!("    \u{2714} {name}");
+        } else {
+            println!("    \u{2717} {name}");
+        }
+    }
+    println!();
+}
+
 /// Print a formatted info box with a title and body lines.
 ///
 /// On a TTY the title is rendered in bold, and the body lines are indented
