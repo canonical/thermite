@@ -666,38 +666,44 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_phase_header(6, "Compatibility Gates A\u{2013}F");
     print_phase_explanation(6);
 
+    // Build the gate list with the target release adjective interpolated
+    // into the Launchpad URLs (e.g. focal, jammy). The LLVM toolchain
+    // number <N> stays as a placeholder — the user greps debian/rules
+    // for LLVM_VERSION per runbook §3.4 step 1.
+    let gate_lines: Vec<String> = vec![
+        "Check each gate in order. Apply ALL changes before proceeding.".to_owned(),
+        "After completing all applicable gates, commit them together.".to_owned(),
+        String::new(),
+        "Gate A — LLVM availability".to_owned(),
+        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/llvm-toolchain-<N>"),
+        "  If 404 / not published: vendor LLVM (remove src/llvm-project from Files-Excluded, regenerate tarball, update control/config.toml.in/rules).".to_owned(),
+        String::new(),
+        "Gate B — libgit2 availability".to_owned(),
+        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/libgit2"),
+        "  If archive version < required: downgrade version constraint, or vendor libgit2 (comment out exclusion, regenerate tarball, update control).".to_owned(),
+        String::new(),
+        "Gate C — dh-cargo (>= 28ubuntu1~) availability".to_owned(),
+        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/dh-cargo"),
+        "  If absent: comment out dh-cargo from Build-Depends; remove dh-cargo-vendored-sources check from debian/rules.".to_owned(),
+        String::new(),
+        "Gate D — pkgconf availability".to_owned(),
+        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/pkgconf"),
+        "  If absent: replace pkgconf with pkg-config in control files; add 'export PKG_CONFIG=pkg-config' to debian/rules.".to_owned(),
+        String::new(),
+        "Gate E — cmake version (>= 3.0)".to_owned(),
+        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/cmake"),
+        "  If too old: add cmake-mozilla (>= 3.0) as fallback in control files.".to_owned(),
+        String::new(),
+        "Gate F — debhelper-compat level".to_owned(),
+        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/debhelper"),
+        "  If required compat level absent: downgrade debhelper-compat in control files and update .install.in substitution variables.".to_owned(),
+        String::new(),
+        "Full gate documentation: runbook §3.4 (Gates A–F).".to_owned(),
+    ];
+    let gate_lines: Vec<&str> = gate_lines.iter().map(String::as_str).collect();
     print_info_box(
         "Work through each gate before building (runbook §3.4)",
-        &[
-            "Check each gate in order. Apply ALL changes before proceeding.",
-            "After completing all applicable gates, commit them together.",
-            "",
-            "Gate A — LLVM availability",
-            "  Check: https://launchpad.net/ubuntu/<release>/+source/llvm-toolchain-<N>",
-            "  If 404 / not published: vendor LLVM (remove src/llvm-project from Files-Excluded, regenerate tarball, update control/config.toml.in/rules).",
-            "",
-            "Gate B — libgit2 availability",
-            "  Check: https://launchpad.net/ubuntu/<release>/+source/libgit2",
-            "  If archive version < required: downgrade version constraint, or vendor libgit2 (comment out exclusion, regenerate tarball, update control).",
-            "",
-            "Gate C — dh-cargo (>= 28ubuntu1~) availability",
-            "  Check: https://launchpad.net/ubuntu/<release>/+source/dh-cargo",
-            "  If absent: comment out dh-cargo from Build-Depends; remove dh-cargo-vendored-sources check from debian/rules.",
-            "",
-            "Gate D — pkgconf availability",
-            "  Check: https://launchpad.net/ubuntu/<release>/+source/pkgconf",
-            "  If absent: replace pkgconf with pkg-config in control files; add 'export PKG_CONFIG=pkg-config' to debian/rules.",
-            "",
-            "Gate E — cmake version (>= 3.0)",
-            "  Check: https://launchpad.net/ubuntu/<release>/+source/cmake",
-            "  If too old: add cmake-mozilla (>= 3.0) as fallback in control files.",
-            "",
-            "Gate F — debhelper-compat level",
-            "  Check: https://launchpad.net/ubuntu/<release>/+source/debhelper",
-            "  If required compat level absent: downgrade debhelper-compat in control files and update .install.in substitution variables.",
-            "",
-            "Full gate documentation: runbook §3.4 (Gates A–F).",
-        ],
+        &gate_lines,
     );
     if prompt_select(
         "All applicable gates worked through and changes committed?",
