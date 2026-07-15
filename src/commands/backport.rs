@@ -464,19 +464,26 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     let current_version = changelog::read_current_version(&changelog_path)?;
     println!("  Current version  : {current_version}");
 
-    let new_version = changelog::compute_backport_version(&current_version, target_series);
-    println!("  Computed version : {new_version}");
+    let computed_version = changelog::compute_backport_version(&current_version, target_series);
+    println!("  Computed version : {computed_version}");
+
+    if computed_version == current_version {
+        println!(
+            "  Note: changelog already at the computed version — selecting it will keep \
+             the existing entry (no new dch entry created)."
+        );
+    }
 
     let new_version = match prompt_select(
         "How would you like to set the changelog version?",
         &[
-            &format!("Use computed version ({new_version})"),
+            &format!("Use computed version ({computed_version})"),
             "Enter a custom version",
             "Abort",
         ],
         0,
     ) {
-        0 => new_version,
+        0 => computed_version,
         1 => {
             let input = prompt_input("Enter the desired version:");
             if input.is_empty() {
@@ -499,8 +506,20 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         }
     };
 
-    info!("running dch with version {new_version}");
-    changelog::run_dch(repo_dir, &new_version).await?;
+    // Only create a new changelog entry when the chosen version actually
+    // differs from the current top-of-changelog version.  On re-runs (where
+    // Phase 3 already wrote the backport version) the computed version is
+    // idempotent, so skipping dch prevents creating a duplicate entry.
+    // `update_backport_changelog_entry` below still runs unconditionally to
+    // fix up the distribution and bullet text on the top entry.
+    if new_version != current_version {
+        info!("running dch with version {new_version}");
+        changelog::run_dch(repo_dir, &new_version).await?;
+    } else {
+        println!(
+            "  Changelog already at version {new_version} — no new entry created."
+        );
+    }
 
     info!("updating changelog entry distribution and description");
     changelog::update_backport_changelog_entry(&changelog_path, release, lp_bug.as_deref())?;

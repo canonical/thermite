@@ -259,6 +259,21 @@ mod backport_changelog_tests {
     }
 
     #[test]
+    fn compute_backport_version_idempotent_for_same_series() {
+        // When the input already targets the same series, the computed version
+        // must equal the input.  backport.rs Phase 3 relies on this invariant
+        // to decide whether to skip `dch -v` and avoid creating a duplicate
+        // changelog entry on re-runs.
+        let v = "1.94.1+dfsg~24.04-0ubuntu1~24.04.1";
+        assert_eq!(compute_backport_version(v, "24.04"), v);
+
+        // Also idempotent across different version shapes targeting the same
+        // series (e.g. a multi-segment debian revision).
+        let v2 = "1.89.0+dfsg2~22.04-0ubuntu3~22.04.1";
+        assert_eq!(compute_backport_version(v2, "22.04"), v2);
+    }
+
+    #[test]
     fn strip_series_suffix_with_sub_revision() {
         assert_eq!(strip_series_suffix("0ubuntu3~24.04.2"), "0ubuntu3");
         assert_eq!(strip_series_suffix("1.89.0+dfsg2~24.04.1"), "1.89.0+dfsg2");
