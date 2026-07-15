@@ -413,15 +413,14 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_phase_header(2, "Set Up Git Branch");
     print_phase_explanation(2);
 
-    info!("fetching all remotes");
-    git::fetch_all(repo_dir).await?;
-
-    info!("checking out {source_branch}");
-    git::checkout_branch(repo_dir, &source_branch).await?;
-
-    info!("creating branch {target_branch}");
     // For backports we create the branch locally; it will be pushed to the
-    // remote only once autopkgtests pass (Phase 13).
+    // remote only once autopkgtests pass (Phase 14).
+    //
+    // When the target branch already exists (a previous run was aborted after
+    // the branch was created), `git fetch --all` and the source-branch checkout
+    // add no value — the branch is already local and we just need to switch to
+    // it to resume. The fetch can be slow on poor connections, so it is
+    // skipped in this case.
     if git::branch_exists(repo_dir, &target_branch).await? {
         let fresh_start_hint =
             format!("To start fresh instead, exit and run: git branch -D {target_branch}");
@@ -431,6 +430,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
                 "A previous run may have been interrupted after this branch was created.",
                 "",
                 &format!("Switching to '{target_branch}' and continuing from where it left off."),
+                "Skipping 'git fetch --all' since the branch is already local.",
                 &fresh_start_hint,
             ],
         );
@@ -446,9 +446,19 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             );
             return Ok(());
         }
+        info!("switching to existing branch {target_branch}");
         git::checkout_branch(repo_dir, &target_branch).await?;
         println!("  Switched to existing branch '{target_branch}'.");
     } else {
+        // Target branch does not exist — fetch the latest state and create it
+        // from the source branch.
+        info!("fetching all remotes");
+        git::fetch_all(repo_dir).await?;
+
+        info!("checking out {source_branch}");
+        git::checkout_branch(repo_dir, &source_branch).await?;
+
+        info!("creating branch {target_branch}");
         crate::shell::run_command("git", &["checkout", "-b", &target_branch], repo_dir, &[])
             .await?;
         println!("  Branch '{target_branch}' created from '{source_branch}'.");
