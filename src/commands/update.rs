@@ -793,12 +793,29 @@ async fn run_interactive_local_build(
                 println!("  sbuild succeeded.");
                 return Ok(true);
             }
-            build::SbuildResult::Failure { log_path } => {
-                let failures = build::extract_test_failures(&log_path).unwrap_or_default();
+            build::SbuildResult::Failure { log_path, stdout, stderr } => {
+                let failures = log_path
+                    .as_ref()
+                    .and_then(|p| build::extract_test_failures(p).ok())
+                    .unwrap_or_default();
+
+                let log_line = match log_path.as_ref().and_then(|p| std::fs::canonicalize(p).ok()) {
+                    Some(abs) => format!("Build log: {}", abs.display()),
+                    None => {
+                        let snippet = if !stderr.trim().is_empty() {
+                            stderr.trim()
+                        } else {
+                            stdout.trim()
+                        };
+                        let snippet: String = snippet.chars().take(400).collect();
+                        format!("sbuild failed before producing a build log. Captured output:\n{snippet}")
+                    }
+                };
+
                 print_info_box(
                     "Build failed",
                     &[
-                        &format!("Build log: {}", log_path.display()),
+                        &log_line,
                         "",
                         "Search for 'stdout ----' in the log to find test failure output.",
                         "Check https://github.com/rust-lang/rust/issues for upstream issues.",

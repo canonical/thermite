@@ -46,7 +46,15 @@ pub async fn clean_build_artifacts(parent_dir: &Path, repo_dir: &Path) -> Result
 #[derive(Debug)]
 pub enum SbuildResult {
     Success,
-    Failure { log_path: PathBuf },
+    Failure {
+        /// Path to the build log produced by sbuild, or `None` when sbuild
+        /// failed before it could create one (e.g. during source packaging).
+        log_path: Option<PathBuf>,
+        /// Captured sbuild stdout — always present, even on early failure.
+        stdout: String,
+        /// Captured sbuild stderr — always present, even on early failure.
+        stderr: String,
+    },
 }
 
 /// Run `sbuild -Ad <release>` to build the package in a clean chroot.
@@ -65,12 +73,50 @@ pub async fn run_sbuild(
 
     match run_command("sbuild", &args, repo_dir, &[]).await {
         Ok(_) => Ok(SbuildResult::Success),
-        Err(crate::error::ThermiteError::CommandFailed { .. }) => {
-            // Find the most recent .build log in the parent directory.
+        Err(crate::error::ThermiteError::CommandFailed {
+            stdout,
+            stderr,
+            ..
+        }) => {
+            // Find the most recent .build log sbuild may have produced.
             let parent = repo_dir.parent().unwrap_or(repo_dir);
             let log_path = find_latest_build_log(parent);
+
+            // When sbuild fails before opening its build log (e.g. during
+            // `dpkg-source` packaging), there is no `.build` file anywhere.
+            // Persist the captured stdout/stderr to a real file so the user
+            // always has something to inspect instead of a fictional path.
+            let log_path = log_path.or_else(|| {
+                let fallback = parent.join("sbuild-failure.log");
+                let mut content = String::new();
+                if !stdout.is_empty() {
+                    content.push_str("=== sbuild stdout ===\n");
+                    content.push_str(&stdout);
+                    if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                }
+                if !stderr.is_empty() {
+                    content.push_str("=== sbuild stderr ===\n");
+                    content.push_str(&stderr);
+                    if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                }
+                if content.is_empty() {
+                    content.push_str("(sbuild produced no output)\n");
+                }
+                // Best-effort write: if it fails, we still return the
+                // captured text via the Failure variant so callers can
+                // surface it.
+                let _ = std::fs::write(&fallback, &content);
+                Some(fallback)
+            });
+
             Ok(SbuildResult::Failure {
-                log_path: log_path.unwrap_or_else(|| parent.join("build.log")),
+                log_path,
+                stdout,
+                stderr,
             })
         }
         Err(e) => Err(e),
