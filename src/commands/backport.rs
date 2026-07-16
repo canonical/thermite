@@ -788,7 +788,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             "Consult the backporting guide for detailed diagnostics:",
             "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
             "",
-            "If the bootstrap compiler is not yet in the archive, sbuild will be retried with ppa:rust-toolchain/staging as an extra repository.",
+            "sbuild will use ppa:rust-toolchain/staging as an extra repository so the bootstrap compiler is available.",
         ],
     );
     match prompt_select(
@@ -1201,6 +1201,20 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
 
 // ── interactive helper loops ──────────────────────────────────────────────────
 
+/// Build the `--extra-repository` argument for `ppa:rust-toolchain/staging`.
+///
+/// The staging PPA provides the bootstrap compiler (`rustc-X.Y_old`,
+/// `cargo-X.Y_old`) when it has not yet landed in the target release's
+/// archive.  It is always passed to sbuild during a backport build so the
+/// resolver can find the bootstrap compiler without manual intervention.
+///
+/// Format matches the runbook (rust-backporting-runbook.md §3.6.2).
+fn staging_ppa_extra_repository(release: &str) -> String {
+    format!(
+        "--extra-repository=deb [trusted=yes] http://ppa.launchpad.net/rust-toolchain/staging/ubuntu/ {release} main"
+    )
+}
+
 /// Interactive local build loop using sbuild.
 ///
 /// Returns `Ok(true)` when the build succeeds, `Ok(false)` when the user
@@ -1210,12 +1224,16 @@ async fn run_interactive_local_build(
     parent_dir: &Path,
     release: &str,
 ) -> Result<bool> {
+    // Always include the staging PPA so sbuild can resolve the bootstrap
+    // compiler (rustc-X.Y_old / cargo-X.Y_old) when it is not yet in the
+    // target release's archive (runbook §3.6.2).
+    let extra_args = vec![staging_ppa_extra_repository(release)];
     loop {
         // M3: quilt pop -a before cleaning to avoid leaving modified source
         // files without quilt tracking them (runbook §3.6.2).
         build::quilt_pop_all(repo_dir).await?;
         build::clean_build_artifacts(parent_dir, repo_dir).await?;
-        match build::run_sbuild(repo_dir, release, &[]).await? {
+        match build::run_sbuild(repo_dir, release, &extra_args).await? {
             build::SbuildResult::Success => {
                 println!("  sbuild succeeded.");
                 return Ok(true);
@@ -1262,7 +1280,7 @@ async fn run_interactive_local_build(
                         "",
                         "For rustdoc-ui test failures (make < 4.4 jobserver warnings), proceed to PPA build — Launchpad builders do not trigger them.",
                         "",
-                        "For 'bootstrap compiler not in archive', sbuild needs --extra-repository. Edit the source and re-run, or add the staging PPA manually.",
+                        "The staging PPA is already included via --extra-repository. If the bootstrap compiler is still not found, verify that rustc-X.Y exists in ppa:rust-toolchain/staging for this release.",
                     ],
                 );
                 if !failures.is_empty() {
@@ -1370,5 +1388,23 @@ mod tests {
             "should pick the newest .changes file"
         );
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn staging_ppa_extra_repository_format() {
+        let arg = staging_ppa_extra_repository("noble");
+        assert_eq!(
+            arg,
+            "--extra-repository=deb [trusted=yes] http://ppa.launchpad.net/rust-toolchain/staging/ubuntu/ noble main"
+        );
+    }
+
+    #[test]
+    fn staging_ppa_extra_repository_includes_release_name() {
+        let arg = staging_ppa_extra_repository("jammy");
+        assert!(
+            arg.contains("jammy main"),
+            "expected release name in extra-repository arg, got: {arg}"
+        );
     }
 }
