@@ -83,8 +83,8 @@ const PHASE_DOCS: &[PhaseDoc] = &[
     PhaseDoc {
         explanation: "uscan downloads and filters the upstream Rust source according to \
             'Files-Excluded' in debian/copyright. If LLVM or libgit2 vendoring is needed \
-            (Compatibility Gates A or B), 'Files-Excluded' must be edited first and the \
-            tarball regenerated before running this phase. The tarball is renamed to include \
+            (see the compatibility checks in Phase 6), 'Files-Excluded' must be edited first \
+            and the tarball regenerated before running this phase. The tarball is renamed to include \
             '~<series>' so its filename matches the backport version string.",
         anchor: "#generating-the-orig-tarball",
     },
@@ -96,14 +96,14 @@ const PHASE_DOCS: &[PhaseDoc] = &[
             earlier versions bundle vendored crates directly in the orig tarball.",
         anchor: "#generating-the-orig-vendor-tarball",
     },
-    // Phase 6 — Compatibility Gates A–F
+    // Phase 6 — Compatibility Checks
     PhaseDoc {
         explanation: "The target release's archive may have older versions of build \
             dependencies than the source release's packaging assumes. Six compatibility \
-            gates must be checked in order before attempting to build: \
-            (A) LLVM version, (B) libgit2 version, (C) dh-cargo availability, \
-            (D) pkgconf availability, (E) cmake version, (F) debhelper-compat level. \
-            Each gate is independent and multiple may apply to the same backport.",
+            checks must be performed in order before attempting to build: \
+            (1) LLVM version, (2) libgit2 version, (3) dh-cargo availability, \
+            (4) pkgconf availability, (5) cmake version, (6) debhelper-compat level. \
+            Each check is independent and multiple may apply to the same backport.",
         anchor: "#common-backporting-changes",
     },
     // Phase 7 — Disable Self-Build Test
@@ -121,7 +121,7 @@ const PHASE_DOCS: &[PhaseDoc] = &[
             validating the packaging before a slow multi-architecture PPA build. \
             'quilt pop -a' is run first to ensure patches are not pre-applied — sbuild \
             applies them from scratch in the chroot and will fail if it finds them already \
-            in place. Most compatibility gate failures surface here and can be fixed \
+            in place. Most compatibility failures surface here and can be fixed \
             iteratively.",
         anchor: "#local-build-and-bugfixing",
     },
@@ -552,11 +552,11 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     let expected_tarball = parent_dir.join(&expected_tarball_name);
 
     print_info_box(
-        "Tarball decision (runbook §3.3)",
+        "Tarball decision",
         &[
             "Choose how to provide the orig tarball for this backport:",
             "",
-            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring from Gate A/B). uscan will run now; takes 20–60 minutes.",
+            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 6). uscan will run now; takes 20–60 minutes.",
             "",
             "  DOWNLOAD   — No Files-Excluded change; tarball not yet local. Download from the staging PPA, name the file exactly:",
             &format!("               {expected_tarball_name}"),
@@ -691,51 +691,51 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     };
     println!("  Vendor tarball: {}", vendor_tarball.display());
 
-    // ── Phase 6: Compatibility Gates A–F ─────────────────────────────────────
-    print_phase_header(6, "Compatibility Gates A\u{2013}F");
+    // ── Phase 6: Compatibility Checks ────────────────────────────────────────
+    print_phase_header(6, "Compatibility Checks");
     print_phase_explanation(6);
 
-    // Build the gate list with the target release adjective interpolated
+    // Build the check list with the target release adjective interpolated
     // into the Launchpad URLs (e.g. focal, jammy). The LLVM toolchain
-    // number <N> stays as a placeholder — the user greps debian/rules
-    // for LLVM_VERSION per runbook §3.4 step 1.
-    let gate_lines: Vec<String> = vec![
-        "Check each gate in order. Apply ALL changes before proceeding.".to_owned(),
-        "After completing all applicable gates, commit them together.".to_owned(),
+    // number <N> stays as a placeholder — the user greps debian/rules for
+    // the LLVM_VERSION assignment.
+    let check_lines: Vec<String> = vec![
+        "Check each item in order. Apply ALL changes before proceeding.".to_owned(),
+        "After completing all applicable changes, commit them together.".to_owned(),
         String::new(),
-        "Gate A — LLVM availability".to_owned(),
+        "LLVM availability".to_owned(),
         format!("  Check: https://launchpad.net/ubuntu/{release}/+source/llvm-toolchain-<N>"),
         "  If 404 / not published: vendor LLVM (remove src/llvm-project from Files-Excluded, regenerate tarball, update control/config.toml.in/rules).".to_owned(),
         String::new(),
-        "Gate B — libgit2 availability".to_owned(),
+        "libgit2 availability".to_owned(),
         format!("  Check: https://launchpad.net/ubuntu/{release}/+source/libgit2"),
         "  If archive version < required: downgrade version constraint, or vendor libgit2 (comment out exclusion, regenerate tarball, update control).".to_owned(),
         String::new(),
-        "Gate C — dh-cargo (>= 28ubuntu1~) availability".to_owned(),
+        "dh-cargo (>= 28ubuntu1~) availability".to_owned(),
         format!("  Check: https://launchpad.net/ubuntu/{release}/+source/dh-cargo"),
         "  If absent: comment out dh-cargo from Build-Depends; remove dh-cargo-vendored-sources check from debian/rules.".to_owned(),
         String::new(),
-        "Gate D — pkgconf availability".to_owned(),
+        "pkgconf availability".to_owned(),
         format!("  Check: https://launchpad.net/ubuntu/{release}/+source/pkgconf"),
         "  If absent: replace pkgconf with pkg-config in control files; add 'export PKG_CONFIG=pkg-config' to debian/rules.".to_owned(),
         String::new(),
-        "Gate E — cmake version (>= 3.0)".to_owned(),
+        "cmake version (>= 3.0)".to_owned(),
         format!("  Check: https://launchpad.net/ubuntu/{release}/+source/cmake"),
         "  If too old: add cmake-mozilla (>= 3.0) as fallback in control files.".to_owned(),
         String::new(),
-        "Gate F — debhelper-compat level".to_owned(),
+        "debhelper-compat level".to_owned(),
         format!("  Check: https://launchpad.net/ubuntu/{release}/+source/debhelper"),
         "  If required compat level absent: downgrade debhelper-compat in control files and update .install.in substitution variables.".to_owned(),
         String::new(),
-        "Full gate documentation: runbook §3.4 (Gates A–F).".to_owned(),
+        "Full documentation: see the official backport-rust guide.".to_owned(),
     ];
-    let gate_lines: Vec<&str> = gate_lines.iter().map(String::as_str).collect();
+    let check_lines: Vec<&str> = check_lines.iter().map(String::as_str).collect();
     print_info_box(
-        "Work through each gate before building (runbook §3.4)",
-        &gate_lines,
+        "Work through each compatibility check before building",
+        &check_lines,
     );
     if prompt_select(
-        "All applicable gates worked through and changes committed?",
+        "All applicable compatibility changes worked through and committed?",
         &["Continue", "Abort"],
         0,
     ) != 0
@@ -745,7 +745,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     }
 
     // ── Phase 7: Disable Autopkgtest Self-Build Test ─────────────────────────
-    // H2 fix: this phase is now before the local build (runbook §3.5 before §3.6).
+    // H2 fix: this phase is now before the local build.
     print_phase_header(7, "Disable Autopkgtest Self-Build Test");
     print_phase_explanation(7);
 
@@ -781,9 +781,9 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_phase_explanation(8);
 
     print_info_box(
-        "About to run sbuild (runbook §3.6)",
+        "About to run sbuild",
         &[
-            "The local build may fail if the target Ubuntu release has older versions of certain dependencies. Use the gate hints from Phase 6 to diagnose failures.",
+            "The local build may fail if the target Ubuntu release has older versions of certain dependencies. Use the Phase 6 compatibility guidance to diagnose failures.",
             "",
             "Consult the backporting guide for detailed diagnostics:",
             "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
@@ -922,7 +922,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
                 "     (deliberate fallback, not an error)",
                 "  W: unknown-field Vendored-Sources-Rust",
                 "     (custom field, not a typo)",
-                "  Various warnings in src/llvm-project/ (Gate A only)",
+                "  Various warnings in src/llvm-project/ (only when LLVM is vendored)",
                 "     (test-suite binaries in upstream LLVM source)",
                 "",
                 "All other errors and warnings must be fixed or overridden with a justifying comment in debian/source/lintian-overrides{,.in}.",
@@ -949,7 +949,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_phase_explanation(11);
 
     print_info_box(
-        "Personal PPA build (runbook §3.8)",
+        "Personal PPA build",
         &[
             "Before uploading to the staging PPA, build in a personal PPA first to confirm the package builds cleanly in the Launchpad build environment.",
             "",
@@ -1015,9 +1015,9 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             "",
             "Wait for the build to succeed on all architectures before proceeding.",
             "",
-            "If the riscv64 build fails with unrecognised RISC-V ISA extensions (Gate A only), see runbook §3.8.4 for cherry-pick commits.",
+            "If the riscv64 build fails with unrecognised RISC-V ISA extensions (only when LLVM is vendored), cherry-pick commits for the zicsr/zmmul extensions are listed in the official backport-rust guide.",
             "",
-            "If a build fails with 'No space left on device' (Gate A or B-Vendor), see runbook §3.8.5 for disk-space reduction steps.",
+            "If a build fails with 'No space left on device' (LLVM or libgit2 vendoring), disk-space reduction steps are described in the official backport-rust guide.",
         ],
     );
     if prompt_select(
@@ -1035,7 +1035,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_phase_explanation(12);
 
     print_info_box(
-        "Prepare the final changelog entry (runbook §3.9.1)",
+        "Prepare the final changelog entry",
         &[
             "Edit the top changelog entry to:",
             "  1. Remove the ~ppa<N> suffix from the version string (already done by the git restore above — verify the version looks correct).",
@@ -1064,7 +1064,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     // Open dch -r with the user's configured editor (TTY-inherited).
     crate::shell::run_interactive_command("dch", &["-r", "--no-auto-nmu"], repo_dir, &[]).await?;
 
-    // M6: clean before staging dpkg-buildpackage -S (runbook §3.9.2).
+    // M6: clean before staging dpkg-buildpackage -S.
     info!("cleaning build artifacts before staging source build");
     build::quilt_pop_all(repo_dir).await?;
     build::clean_build_artifacts(&parent_dir, repo_dir).await?;
@@ -1146,7 +1146,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     }
 
     // ── Phase 14: Push Branch to Foundations Repository ──────────────────────
-    // H3 fix: branch is pushed only after autopkgtests pass (runbook §3.11).
+    // H3 fix: branch is pushed only after autopkgtests pass.
     print_phase_header(14, "Push Branch to Foundations Repository");
     print_phase_explanation(14);
 
@@ -1208,7 +1208,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
 /// archive.  It is always passed to sbuild during a backport build so the
 /// resolver can find the bootstrap compiler without manual intervention.
 ///
-/// Format matches the runbook (rust-backporting-runbook.md §3.6.2).
+/// Format matches the official backport-rust documentation.
 fn staging_ppa_extra_repository(release: &str) -> String {
     format!(
         "--extra-repository=deb [trusted=yes] http://ppa.launchpad.net/rust-toolchain/staging/ubuntu/ {release} main"
@@ -1226,11 +1226,11 @@ async fn run_interactive_local_build(
 ) -> Result<bool> {
     // Always include the staging PPA so sbuild can resolve the bootstrap
     // compiler (rustc-X.Y_old / cargo-X.Y_old) when it is not yet in the
-    // target release's archive (runbook §3.6.2).
+    // target release's archive.
     let extra_args = vec![staging_ppa_extra_repository(release)];
     loop {
         // M3: quilt pop -a before cleaning to avoid leaving modified source
-        // files without quilt tracking them (runbook §3.6.2).
+        // files without quilt tracking them.
         build::quilt_pop_all(repo_dir).await?;
         build::clean_build_artifacts(parent_dir, repo_dir).await?;
         match build::run_sbuild(repo_dir, release, &extra_args).await? {
@@ -1270,13 +1270,13 @@ async fn run_interactive_local_build(
                         "Consult the backporting guide for common fixes:",
                         "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
                         "",
-                        "Quick reference (see Phase 6 gate guidance for details):",
-                        "  LLVM too old       → Gate A: vendor LLVM from src/llvm-project",
-                        "  libgit2 too old    → Gate B: downgrade or vendor libgit2",
-                        "  dh-cargo missing   → Gate C: comment out from Build-Depends",
-                        "  pkgconf missing    → Gate D: replace with pkg-config",
-                        "  cmake too old      → Gate E: add cmake-mozilla fallback",
-                        "  debhelper-compat   → Gate F: downgrade compat level",
+                        "Quick reference (see Phase 6 compatibility guidance for details):",
+                        "  LLVM too old       → vendor LLVM from src/llvm-project",
+                        "  libgit2 too old    → downgrade or vendor libgit2",
+                        "  dh-cargo missing   → comment out from Build-Depends",
+                        "  pkgconf missing    → replace with pkg-config",
+                        "  cmake too old      → add cmake-mozilla fallback",
+                        "  debhelper-compat   → downgrade compat level",
                         "",
                         "For rustdoc-ui test failures (make < 4.4 jobserver warnings), proceed to PPA build — Launchpad builders do not trigger them.",
                         "",

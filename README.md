@@ -14,9 +14,9 @@ workflows used by Ubuntu Foundations toolchain maintainers:
   Long-Term Support (LTS) release.
 
 Reference workflows:
-- Update: <https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/update-rust/>
-- Backport (runbook): `docs/rust-backporting-runbook.md` — authoritative step-by-step specification
-- Backport (upstream guide): <https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/>
+- Update (official docs): <https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/update-rust/>
+- Backport (official docs): <https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/>
+- Backport (runbook): `docs/rust-backporting-runbook.md` — an AI-generated, Design-by-Contract formalisation of the official backport docs; subordinate to them and kept in sync.
 
 ---
 
@@ -215,7 +215,7 @@ thermite -vv backport \
 ```
 
 Pass `-vv` to display a concise explanation of what each phase does and why,
-together with a link to the relevant section of the official backport guide.
+together with a link to the relevant section of the official docs.
 Pass `-v` (single) to print each external command without the explanations.
 
 ---
@@ -268,7 +268,7 @@ start of each phase.
 | 3 | Compute and apply backport version string; update `debian/changelog` | Automated |
 | 4 | Generate orig tarball with `uscan`; rename to include `~<series>` suffix | Automated |
 | 5 | Generate orig-vendor tarball with `debian/rules vendor-tarball` | Automated |
-| 6 | Compatibility Gates A–F — check and apply changes for LLVM, libgit2, dh-cargo, pkgconf, cmake, debhelper-compat | Interactive |
+| 6 | Compatibility Checks — check and apply changes for LLVM, libgit2, dh-cargo, pkgconf, cmake, debhelper-compat | Interactive |
 | 7 | Disable autopkgtest self-build test in `debian/tests/control` | Automated |
 | 8 | Local build and bug fixing with `sbuild` (skippable) | Interactive |
 | 9 | Build source package with `dpkg-buildpackage -S` (skippable if `.dsc` exists) | Automated |
@@ -323,7 +323,7 @@ src/
 LLM assistance was used throughout the development of thermite, including:
 
 - **Planning** — the implementation plans in `/plans/` were drafted with LLM assistance
-  based on the upstream Ubuntu Rust packaging documentation.
+  based on the official Ubuntu Rust packaging docs.
 - **Code generation** — the majority of the Rust source code was generated or substantially
   revised through LLM-assisted sessions in VS Code.
 - **Bug fixing** — several correctness issues (error handling, version substitution in
@@ -334,7 +334,7 @@ LLM assistance was used throughout the development of thermite, including:
 All generated code and documentation has been reviewed by human maintainers, but users
 should be aware that LLM-generated code can contain subtle errors.  Before running
 thermite against a real Ubuntu package repository, review the workflow phases carefully
-and verify that the tool's actions match the upstream documentation linked above.
+and verify that the tool's actions match the official docs linked above.
 
 If you find a bug or an incorrect workflow step, please open an issue.
 

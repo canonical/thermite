@@ -3,8 +3,11 @@
 ## Overview
 
 The `thermite backport` command automates the Ubuntu Rust toolchain backporting workflow
-specified in `thermite/docs/rust-backporting-runbook.md` (authoritative) and described
-upstream at https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/.
+described in the official Ubuntu docs at
+https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/.
+A structured, AI-generated formalisation of those docs lives in
+`thermite/docs/rust-backporting-runbook.md`; it is kept in sync with the official docs and
+is subordinate to them.
 
 It adapts an existing versioned `rustc-<X.Y>` Ubuntu source package for an older Ubuntu
 release, starting from the package branch for the source release in the Foundations
@@ -23,11 +26,12 @@ but it documents the common fixes inline and links to the reference documentatio
 
 ## Reference Documentation
 
-- **Backport runbook** (authoritative): `thermite/docs/rust-backporting-runbook.md`
-- Backport workflow (upstream, secondary): https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/
+- **Backport workflow (official docs, primary):** https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/
+- **Backport runbook** (AI-generated formalisation, subordinate to the official docs): `thermite/docs/rust-backporting-runbook.md`
 - Rust version strings: https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/rust-version-strings/
 
-When the runbook and the upstream docs disagree, follow the runbook.
+When the runbook and the official docs disagree, follow the official docs; the runbook
+should be corrected to match.
 
 ---
 
