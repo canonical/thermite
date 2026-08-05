@@ -47,12 +47,12 @@ impl BackportParams {
                 "lpuser must not be empty".to_owned(),
             ));
         }
-        if let Some(bug) = lp_bug_number {
-            if bug.is_empty() || !bug.chars().all(|c| c.is_ascii_digit()) {
-                return Err(ThermiteError::InvalidLpBugNumber(format!(
-                    "'{bug}' must be a non-empty string of digits"
-                )));
-            }
+        if let Some(bug) = lp_bug_number
+            && (bug.is_empty() || !bug.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Err(ThermiteError::InvalidLpBugNumber(format!(
+                "'{bug}' must be a non-empty string of digits"
+            )));
         }
         let source = UbuntuRelease::parse(source_release)?;
         let target = UbuntuRelease::parse(release)?;

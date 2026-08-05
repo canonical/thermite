@@ -422,8 +422,6 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     // it to resume. The fetch can be slow on poor connections, so it is
     // skipped in this case.
     if git::branch_exists(repo_dir, &target_branch).await? {
-        let fresh_start_hint =
-            format!("To start fresh instead, exit and run: git branch -D {target_branch}");
         print_info_box(
             &format!("Branch '{target_branch}' already exists"),
             &[
@@ -431,7 +429,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
                 "",
                 &format!("Switching to '{target_branch}' and continuing from where it left off."),
                 "Skipping 'git fetch --all' since the branch is already local.",
-                &fresh_start_hint,
+                &format!("To start fresh instead, exit and run: git branch -D {target_branch}"),
             ],
         );
         if prompt_select(
@@ -526,9 +524,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         info!("running dch with version {new_version}");
         changelog::run_dch(repo_dir, &new_version).await?;
     } else {
-        println!(
-            "  Changelog already at version {new_version} — no new entry created."
-        );
+        println!("  Changelog already at version {new_version} — no new entry created.");
     }
 
     info!("updating changelog entry distribution and description");
@@ -540,6 +536,29 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         .map(|l| format!("    {l}\n"))
         .collect();
     println!("  Changelog updated. First entry now:\n{first_lines}");
+
+    // Commit the backport changelog entry so later phases (Phase 11) can use
+    // `git restore debian/changelog` to revert only the temporary ~ppa<N>
+    // entry without discarding this Phase 3 entry.  Skip the commit when the
+    // working tree already matches HEAD (re-run after a prior successful run).
+    let changelog_status = crate::shell::run_command(
+        "git",
+        &["status", "--porcelain", "debian/changelog"],
+        repo_dir,
+        &[],
+    )
+    .await?;
+    if !changelog_status.stdout.trim().is_empty() {
+        git::add_and_commit(
+            repo_dir,
+            &["debian/changelog"],
+            "Add backport changelog entry",
+        )
+        .await?;
+        println!("  Backport changelog entry committed.");
+    } else {
+        println!("  Backport changelog entry already committed — nothing to commit.");
+    }
 
     // ── Phase 4: Generate Orig Tarball ───────────────────────────────────────
     print_phase_header(4, "Generate Orig Tarball");
@@ -699,40 +718,38 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     // into the Launchpad URLs (e.g. focal, jammy). The LLVM toolchain
     // number <N> stays as a placeholder — the user greps debian/rules for
     // the LLVM_VERSION assignment.
-    let check_lines: Vec<String> = vec![
-        "Check each item in order. Apply ALL changes before proceeding.".to_owned(),
-        "After completing all applicable changes, commit them together.".to_owned(),
-        String::new(),
-        "LLVM availability".to_owned(),
-        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/llvm-toolchain-<N>"),
-        "  If 404 / not published: vendor LLVM (remove src/llvm-project from Files-Excluded, regenerate tarball, update control/config.toml.in/rules).".to_owned(),
-        String::new(),
-        "libgit2 availability".to_owned(),
-        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/libgit2"),
-        "  If archive version < required: downgrade version constraint, or vendor libgit2 (comment out exclusion, regenerate tarball, update control).".to_owned(),
-        String::new(),
-        "dh-cargo (>= 28ubuntu1~) availability".to_owned(),
-        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/dh-cargo"),
-        "  If absent: comment out dh-cargo from Build-Depends; remove dh-cargo-vendored-sources check from debian/rules.".to_owned(),
-        String::new(),
-        "pkgconf availability".to_owned(),
-        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/pkgconf"),
-        "  If absent: replace pkgconf with pkg-config in control files; add 'export PKG_CONFIG=pkg-config' to debian/rules.".to_owned(),
-        String::new(),
-        "cmake version (>= 3.0)".to_owned(),
-        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/cmake"),
-        "  If too old: add cmake-mozilla (>= 3.0) as fallback in control files.".to_owned(),
-        String::new(),
-        "debhelper-compat level".to_owned(),
-        format!("  Check: https://launchpad.net/ubuntu/{release}/+source/debhelper"),
-        "  If required compat level absent: downgrade debhelper-compat in control files and update .install.in substitution variables.".to_owned(),
-        String::new(),
-        "Full documentation: see the official backport-rust guide.".to_owned(),
-    ];
-    let check_lines: Vec<&str> = check_lines.iter().map(String::as_str).collect();
     print_info_box(
         "Work through each compatibility check before building",
-        &check_lines,
+        &[
+            "Check each item in order. Apply ALL changes before proceeding.",
+            "After completing all applicable changes, commit them together.",
+            "",
+            "LLVM availability",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/llvm-toolchain-<N>"),
+            "  If 404 / not published: vendor LLVM (remove src/llvm-project from Files-Excluded, regenerate tarball, update control/config.toml.in/rules).",
+            "",
+            "libgit2 availability",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/libgit2"),
+            "  If archive version < required: downgrade version constraint, or vendor libgit2 (comment out exclusion, regenerate tarball, update control).",
+            "",
+            "dh-cargo (>= 28ubuntu1~) availability",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/dh-cargo"),
+            "  If absent: comment out dh-cargo from Build-Depends; remove dh-cargo-vendored-sources check from debian/rules.",
+            "",
+            "pkgconf availability",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/pkgconf"),
+            "  If absent: replace pkgconf with pkg-config in control files; add 'export PKG_CONFIG=pkg-config' to debian/rules.",
+            "",
+            "cmake version (>= 3.0)",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/cmake"),
+            "  If too old: add cmake-mozilla (>= 3.0) as fallback in control files.",
+            "",
+            "debhelper-compat level",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/debhelper"),
+            "  If required compat level absent: downgrade debhelper-compat in control files and update .install.in substitution variables.",
+            "",
+            "Full documentation: see the official backport-rust guide.",
+        ],
     );
     if prompt_select(
         "All applicable compatibility changes worked through and committed?",
@@ -1238,7 +1255,11 @@ async fn run_interactive_local_build(
                 println!("  sbuild succeeded.");
                 return Ok(true);
             }
-            build::SbuildResult::Failure { log_path, stdout, stderr } => {
+            build::SbuildResult::Failure {
+                log_path,
+                stdout,
+                stderr,
+            } => {
                 let failures = log_path
                     .as_ref()
                     .and_then(|p| build::extract_test_failures(p).ok())
@@ -1247,7 +1268,10 @@ async fn run_interactive_local_build(
                 // Resolve an absolute path for display, and pick the right
                 // message depending on whether sbuild produced a real build
                 // log or we fell back to capturing its output.
-                let log_line = match log_path.as_ref().and_then(|p| std::fs::canonicalize(p).ok()) {
+                let log_line = match log_path
+                    .as_ref()
+                    .and_then(|p| std::fs::canonicalize(p).ok())
+                {
                     Some(abs) => format!("Build log: {}", abs.display()),
                     None => {
                         // No file at all (even our fallback write failed).
@@ -1258,7 +1282,9 @@ async fn run_interactive_local_build(
                             stdout.trim()
                         };
                         let snippet: String = snippet.chars().take(400).collect();
-                        format!("sbuild failed before producing a build log. Captured output:\n{snippet}")
+                        format!(
+                            "sbuild failed before producing a build log. Captured output:\n{snippet}"
+                        )
                     }
                 };
 
