@@ -1,20 +1,24 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use thermite::commands::update;
+use thermite::commands::{backport, update};
 use thermite::error::Result;
 use thermite::shell;
-use thermite::types::params::UpdateParams;
+use thermite::types::params::{BackportParams, UpdateParams};
 
 /// thermite — Ubuntu Rust toolchain packaging tool.
 #[derive(Debug, Parser)]
 #[command(name = "thermite", version, about)]
 struct Cli {
-    /// Print each external command before it is executed.
-    #[arg(short = 'v', long, global = true)]
-    verbose: bool,
+    /// Increase output verbosity.
+    ///
+    /// Pass once (-v) to print each external command before it runs.
+    /// Pass twice (-vv) to also show a concise explanation with documentation
+    /// links at the start of every phase.
+    #[arg(short = 'v', long, action = ArgAction::Count, global = true)]
+    verbose: u8,
 
     #[command(subcommand)]
     command: Commands,
@@ -53,6 +57,46 @@ enum Commands {
         #[arg(short = 'd', long)]
         repo_dir: Option<PathBuf>,
     },
+
+    /// Backport an existing Rust toolchain package to an older Ubuntu release.
+    Backport {
+        /// Full Rust version to backport, in X.Y.Z format (e.g. 1.85.0).
+        #[arg(short = 'u', long)]
+        rust_version: String,
+
+        /// Ubuntu release to backport FROM (e.g. noble).
+        #[arg(short = 's', long)]
+        source_release: String,
+
+        /// Ubuntu release to backport TO (e.g. jammy).
+        #[arg(short = 'r', long)]
+        release: String,
+
+        /// Launchpad username (also used as personal Git remote name).
+        #[arg(short = 'l', long)]
+        lpuser: String,
+
+        /// Launchpad bug ID number for this backport (digits only).
+        /// Omit for proactive backports that have no associated bug.
+        #[arg(short = 'b', long)]
+        lp_bug_number: Option<String>,
+
+        /// Local Git remote name for the Foundations rustc repository.
+        #[arg(short = 'g', long, default_value = "foundations")]
+        git_remote: String,
+
+        /// Path to the root of the Debian source package (defaults to the
+        /// current working directory).
+        #[arg(short = 'd', long)]
+        repo_dir: Option<PathBuf>,
+
+        /// Perform a dry run: skip all hard-to-revert operations (remote git
+        /// push, PPA creation, dput uploads) and print what each would have
+        /// done instead. All local operations (sbuild, lintian, etc.) still
+        /// run normally.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -72,7 +116,7 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    shell::set_verbose(cli.verbose);
+    shell::set_verbosity(cli.verbose);
 
     match cli.command {
         Commands::Update {
@@ -101,7 +145,36 @@ async fn run() -> Result<()> {
 
             update::run(&params, &repo_path).await?;
         }
+
+        Commands::Backport {
+            rust_version,
+            source_release,
+            release,
+            lpuser,
+            lp_bug_number,
+            git_remote,
+            repo_dir,
+            dry_run,
+        } => {
+            let params = BackportParams::new(
+                &rust_version,
+                &source_release,
+                &release,
+                &lpuser,
+                &git_remote,
+                lp_bug_number.as_deref(),
+                dry_run,
+            )?;
+
+            let repo_path = match repo_dir {
+                Some(p) => p,
+                None => std::env::current_dir().map_err(thermite::error::ThermiteError::Io)?,
+            };
+
+            backport::run(&params, &repo_path).await?;
+        }
     }
 
     Ok(())
 }
+

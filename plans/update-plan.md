@@ -16,7 +16,7 @@ resumption points for phases that require manual intervention.
 
 ## Reference Documentation
 
-- Upstream workflow: https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/update-rust/
+- Update workflow (official docs): https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/update-rust/
 - Rust version strings: https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/rust-version-strings/
 
 ---

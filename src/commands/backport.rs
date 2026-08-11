@@ -1,0 +1,1436 @@
+use std::path::{Path, PathBuf};
+
+use tracing::info;
+
+use crate::error::{Result, ThermiteError};
+use crate::shell;
+use crate::steps::{build, changelog, git, lintian, ppa, uscan, vendor};
+use crate::types::params::BackportParams;
+use crate::ui::{
+    confirm_sink, print_info_box, print_phase_header, print_tool_checks, prompt_input,
+    prompt_select,
+};
+
+/// Required external tools for the backport workflow.
+const REQUIRED_TOOLS: &[&str] = &[
+    "git",
+    "dch",
+    "uscan",
+    "quilt",
+    "dpkg-buildpackage",
+    "lintian",
+    "sbuild",
+    "cargo",
+    "rustup",
+    "dput",
+    "ppa",
+];
+
+// ── Per-phase documentation ───────────────────────────────────────────────────
+
+/// Base URL for the official backport-rust documentation page.
+const DOCS_BASE: &str = "https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/";
+
+/// A concise explanation and documentation anchor for a single workflow phase.
+///
+/// Shown when the user passes `-vv` (`verbosity >= 2`).
+struct PhaseDoc {
+    /// One-to-three sentence plain-English explanation of what this phase does
+    /// and why it exists.
+    explanation: &'static str,
+    /// Fragment anchor on [`DOCS_BASE`] that points to the relevant section.
+    anchor: &'static str,
+}
+
+/// Per-phase documentation, indexed by phase number.
+const PHASE_DOCS: &[PhaseDoc] = &[
+    // Phase 0 — Preflight
+    PhaseDoc {
+        explanation: "Verifies that every required tool is on PATH and that the working \
+            directory is the root of a Debian source package (contains debian/changelog \
+            and debian/watch). Failing fast here prevents partial state from being written \
+            to the repository.",
+        anchor: "#backport-process",
+    },
+    // Phase 1 — Bug Report
+    PhaseDoc {
+        explanation: "Backports are either 'priority' (a downstream package such as Firefox \
+            or Chromium needs this Rust version in the Ubuntu Archive) or 'proactive' \
+            (pre-building the bootstrapping chain for future use). Priority backports \
+            require a Launchpad bug targeting every series in the chain so that each \
+            intermediate backport can be tracked independently.",
+        anchor: "#launchpad-bug-report",
+    },
+    // Phase 2 — Git Branch
+    PhaseDoc {
+        explanation: "Creates a local branch '<release>-X.Y' from '<source_release>-X.Y'. \
+            Backports must go one release at a time (e.g. Noble→Jammy, never \
+            Questing→Jammy directly) to isolate release-specific failures and provide \
+            stable checkpoints. The branch is not pushed to the Foundations repository \
+            until Phase 14, after autopkgtests pass.",
+        anchor: "#setup",
+    },
+    // Phase 3 — Changelog
+    PhaseDoc {
+        explanation: "The backport version encodes the target release number twice: once in \
+            the upstream component (e.g. '+dfsg~22.04') and once in the Debian revision \
+            (e.g. '~22.04.1'). This ensures the backport version sorts strictly lower than \
+            the same package on any newer Ubuntu release, preventing accidental upgrades \
+            across series.",
+        anchor: "#changelog-version",
+    },
+    // Phase 4 — Orig Tarball
+    PhaseDoc {
+        explanation: "uscan downloads and filters the upstream Rust source according to \
+            'Files-Excluded' in debian/copyright. If LLVM or libgit2 vendoring is needed \
+            (see the compatibility checks in Phase 6), 'Files-Excluded' must be edited first \
+            and the tarball regenerated before running this phase. The tarball is renamed to include \
+            '~<series>' so its filename matches the backport version string.",
+        anchor: "#generating-the-orig-tarball",
+    },
+    // Phase 5 — Vendor Tarball
+    PhaseDoc {
+        explanation: "Generates the orig-vendor tarball containing filtered Cargo crate \
+            dependencies. This requires a local Rust toolchain at the exact patch version \
+            being packaged (installed via rustup). Only applies to Rust 1.89 and later; \
+            earlier versions bundle vendored crates directly in the orig tarball.",
+        anchor: "#generating-the-orig-vendor-tarball",
+    },
+    // Phase 6 — Compatibility Checks
+    PhaseDoc {
+        explanation: "The target release's archive may have older versions of build \
+            dependencies than the source release's packaging assumes. Six compatibility \
+            checks must be performed in order before attempting to build: \
+            (1) LLVM version, (2) libgit2 version, (3) dh-cargo availability, \
+            (4) pkgconf availability, (5) cmake version, (6) debhelper-compat level. \
+            Each check is independent and multiple may apply to the same backport.",
+        anchor: "#common-backporting-changes",
+    },
+    // Phase 7 — Disable Self-Build Test
+    PhaseDoc {
+        explanation: "The 'RUST_TEST_SELFBUILD=1' autopkgtest rebuilds the compiler using \
+            the just-packaged toolchain. For backports — especially those that vendor LLVM \
+            — this test is resource-intensive and routinely times out on the autopkgtest \
+            infrastructure. The internal stage1→stage2 bootstrap that happens during the \
+            regular build is sufficient validation for backports.",
+        anchor: "#disabling-autopkgtest-self-build-test",
+    },
+    // Phase 8 — Local Build
+    PhaseDoc {
+        explanation: "sbuild builds the package in a clean chroot on the host architecture, \
+            validating the packaging before a slow multi-architecture PPA build. \
+            'quilt pop -a' is run first to ensure patches are not pre-applied — sbuild \
+            applies them from scratch in the chroot and will fail if it finds them already \
+            in place. Most compatibility failures surface here and can be fixed \
+            iteratively.",
+        anchor: "#local-build-and-bugfixing",
+    },
+    // Phase 9 — Build Source Package
+    PhaseDoc {
+        explanation: "Prepares the installable source package (.dsc + tarballs) in the \
+            parent directory by resetting quilt state, cleaning prior build artifacts, \
+            and running 'dpkg-buildpackage -S'. The resulting .dsc is the input for \
+            Phase 10 (lintian) and all subsequent upload steps.",
+        anchor: "#local-build-and-bugfixing",
+    },
+    // Phase 10 — Lintian
+    PhaseDoc {
+        explanation: "Lintian checks the source package for Debian policy compliance \
+            before spending build time on a full multi-architecture PPA build. Several tags \
+            are expected for versioned rustc packages (e.g. 'field-too-long \
+            Vendored-Sources-Rust') and can be safely ignored; all others must be fixed \
+            or overridden with a justifying comment.",
+        anchor: "#lintian",
+    },
+    // Phase 11 — PPA Build
+    PhaseDoc {
+        explanation: "A personal Launchpad PPA validates all supported architectures, \
+            including riscv64 which runs under emulation (expect 5–10× slower builds than \
+            on native architectures). PPA Ubuntu-dependencies must be set to 'Security' \
+            (not 'Proposed') because backports target the security pocket. If the bootstrap \
+            compiler is only in the staging PPA, add ppa:rust-toolchain/staging as an \
+            explicit PPA dependency.",
+        anchor: "#ppa-build",
+    },
+    // Phase 12 — Staging PPA Upload
+    PhaseDoc {
+        explanation: "ppa:rust-toolchain/staging is the integration point for the entire \
+            bootstrapping chain — every subsequent backport in the chain depends on what is \
+            published here. The ~ppa<N> suffix is removed and the changelog entry must \
+            enumerate every change made during the backport; a description of \
+            'Backport to <release>' alone is not sufficient for reviewers.",
+        anchor: "#uploading-the-backport-to-the-staging-ppa",
+    },
+    // Phase 13 — Autopkgtests
+    PhaseDoc {
+        explanation: "Triggers autopkgtest runs for all architectures against the staging \
+            PPA using the 'ppa tests' command. Every test except the disabled self-build \
+            test must pass on every architecture before proceeding. Do not push the branch \
+            or request an archive upload until this phase is green.",
+        anchor: "#autopkgtests",
+    },
+    // Phase 14 — Push Branch
+    PhaseDoc {
+        explanation: "The completed branch is pushed to the Foundations repository only \
+            after autopkgtests pass. This ordering guarantees that the branch on 'origin' \
+            always represents a verified, shippable state. The branch is the authoritative \
+            record of what was done and must be referenced in any Archive upload request.",
+        anchor: "#backport-process",
+    },
+    // Phase 15 — Archive Upload
+    PhaseDoc {
+        explanation: "Archive upload is only required for priority backports where a \
+            downstream package (Firefox, Chromium, etc.) needs this Rust version in the \
+            Ubuntu Archive. For proactive backports that are simply pre-building the \
+            bootstrapping chain, publishing to the staging PPA is sufficient. Contact the \
+            Ubuntu Security team with the bug link, staging PPA link, and package version.",
+        anchor: "#uploading-the-backport-to-the-archive-optional",
+    },
+];
+
+/// Print per-phase documentation when verbosity is >= 2 (`-vv`).
+///
+/// Called immediately after [`print_phase_header`] for every phase.
+fn print_phase_explanation(phase: usize) {
+    if crate::shell::verbosity() < 2 {
+        return;
+    }
+    let Some(doc) = PHASE_DOCS.get(phase) else {
+        return;
+    };
+    print_info_box(
+        "About this phase",
+        &[
+            doc.explanation,
+            "",
+            &format!("Documentation: {DOCS_BASE}{}", doc.anchor),
+        ],
+    );
+}
+
+/// Remove any stale orig-vendor tarballs for `version` in `parent_dir` that
+/// would cause `debian/rules vendor-tarball-quick-check` to abort, then run
+/// `debian/rules vendor-tarball` and return the generated tarball path.
+///
+/// Stale tarballs arise when the same package was previously built for a
+/// different Ubuntu series (e.g. a `~22.04` tarball left over from a jammy
+/// build when we are now targeting focal `~20.04`).
+async fn generate_vendor_tarball_for_backport(
+    repo_dir: &std::path::Path,
+    rust_bootstrap_dir: &std::path::Path,
+    version: &crate::types::versions::RustVersion,
+    target_series: &str,
+    parent_dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let short = version.short();
+    let expected_name = format!("rustc-{short}_{version}+dfsg~{target_series}.orig-vendor.tar.xz");
+    let expected_path = parent_dir.join(&expected_name);
+
+    // Scan for tarballs that share the same version prefix but have a
+    // different series suffix — these will cause the quick-check to fail.
+    let stale: Vec<_> = std::fs::read_dir(parent_dir)
+        .map_err(crate::error::ThermiteError::Io)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| {
+                    n.starts_with(&format!("rustc-{short}_{version}+dfsg"))
+                        && n.ends_with(".orig-vendor.tar.xz")
+                        && *p != expected_path
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if !stale.is_empty() {
+        println!("  Removing stale vendor tarballs from previous series builds:");
+        for path in &stale {
+            println!("    {}", path.display());
+            std::fs::remove_file(path).map_err(crate::error::ThermiteError::Io)?;
+        }
+    }
+
+    info!("generating vendor tarball");
+    vendor::generate_vendor_tarball(
+        repo_dir,
+        rust_bootstrap_dir,
+        version,
+        &format!("~{target_series}"),
+    )
+    .await
+}
+
+/// Run the full `thermite backport` workflow.
+pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
+    let rust_ver = &params.rust_version;
+    let rust_short = rust_ver.short();
+    let source_release = params.source_release.as_str();
+    let source_series = params.source_release.series_number();
+    let release = params.release.as_str();
+    let target_series = params.release.series_number();
+    let lpuser = &params.lpuser;
+    let git_remote = &params.git_remote;
+    let mut lp_bug: Option<String> = params.lp_bug_number.clone();
+
+    // Derived names used throughout.
+    let pkg_name = format!("rustc-{rust_short}");
+    let source_branch = format!("{source_release}-{rust_short}");
+    let target_branch = format!("{release}-{rust_short}");
+    let ppa_name = format!("rustc-{rust_short}-{release}");
+    let parent_dir = repo_dir.parent().unwrap_or(repo_dir).to_path_buf();
+
+    let bug_display = lp_bug
+        .as_deref()
+        .map(|b| format!("#{b}"))
+        .unwrap_or_else(|| "(none — proactive backport)".to_owned());
+
+    // ── Phase 0: Preflight Checks ─────────────────────────────────────────
+    print_phase_header(0, "Preflight Checks");
+    print_phase_explanation(0);
+
+    // Verify required tools are on PATH.
+    let tool_checks: Vec<(&str, bool)> = REQUIRED_TOOLS
+        .iter()
+        .map(|t| (*t, shell::which(t).is_ok()))
+        .collect();
+    print_tool_checks(&tool_checks);
+    let missing_tools: Vec<&str> = tool_checks
+        .iter()
+        .filter(|(_, found)| !found)
+        .map(|(name, _)| *name)
+        .collect();
+    if !missing_tools.is_empty() {
+        eprintln!("The following required tools were not found on PATH:");
+        for t in &missing_tools {
+            eprintln!("  \u{2717} {t}");
+        }
+        return Err(ThermiteError::CommandNotFound(missing_tools.join(", ")));
+    }
+
+    // Verify the working directory is a Debian package root.
+    if !repo_dir.join("debian/changelog").exists() || !repo_dir.join("debian/watch").exists() {
+        return Err(ThermiteError::NotADebianPackageRoot(
+            repo_dir.display().to_string(),
+        ));
+    }
+
+    println!();
+
+    print_info_box(
+        "Backport Parameters",
+        &[
+            &format!("  Rust version     : {rust_ver} (rustc-{rust_short})"),
+            &format!("  Source release   : {source_release} (series {source_series})"),
+            &format!("  Target release   : {release} (series {target_series})"),
+            &format!("  Launchpad user   : {lpuser}"),
+            &format!("  Git remote       : {git_remote}"),
+            &format!("  LP bug number    : {bug_display}"),
+            &format!("  Repo dir         : {}", repo_dir.display()),
+        ],
+    );
+    if prompt_select("Proceed with these parameters?", &["Proceed", "Abort"], 0) != 0 {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // ── Phase 1: Create a Bug Report ─────────────────────────────────────────
+    print_phase_header(1, "Create a Bug Report");
+    print_phase_explanation(1);
+
+    match lp_bug.as_deref() {
+        Some(bug) => {
+            print_info_box(
+                "Launchpad bug",
+                &[
+                    &format!("LP bug #{bug} has been provided on the command line."),
+                    "",
+                    "If this is a new backport and no bug exists yet, you can file one at:",
+                    "  https://bugs.launchpad.net/ubuntu/+filebug",
+                    "",
+                    "If backporting across multiple releases, target the bug to all affected series so each intermediate backport can be tracked.",
+                ],
+            );
+            if prompt_select(
+                "Confirm bug status, then continue.",
+                &["Continue", "Abort"],
+                0,
+            ) != 0
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+        None => {
+            print_info_box(
+                "Proactive backport — bug report optional",
+                &[
+                    "No LP bug number was provided. This is fine for proactive backports.",
+                    "",
+                    "If this backport is for a specific reason (e.g. a package that needs a newer Rust to build), create a Launchpad bug first:",
+                    "  https://bugs.launchpad.net/ubuntu/+filebug",
+                    "",
+                    "All backports (with or without a bug) are uploaded to the staging PPA:",
+                    "  https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/",
+                ],
+            );
+            match prompt_select(
+                "How would you like to proceed with bug tracking?",
+                &[
+                    "Continue without a bug report (proactive backport)",
+                    "Enter a Launchpad bug number",
+                    "Abort",
+                ],
+                0,
+            ) {
+                0 => { /* continue with lp_bug = None */ }
+                1 => loop {
+                    let input = prompt_input("LP bug number (digits only):");
+                    if input.is_empty() {
+                        println!("  Bug number cannot be empty. Please try again.");
+                        continue;
+                    }
+                    if !input.chars().all(|c| c.is_ascii_digit()) {
+                        println!("  Bug number must contain only digits. Please try again.");
+                        continue;
+                    }
+                    println!(
+                        "  LP bug: https://bugs.launchpad.net/ubuntu/+source/rustc/+bug/{input}"
+                    );
+                    lp_bug = Some(input);
+                    break;
+                },
+                _ => {
+                    println!("\n  Aborted.");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // ── Phase 2: Set Up Git Branch ───────────────────────────────────────────
+    print_phase_header(2, "Set Up Git Branch");
+    print_phase_explanation(2);
+
+    // For backports we create the branch locally; it will be pushed to the
+    // remote only once autopkgtests pass (Phase 14).
+    //
+    // When the target branch already exists (a previous run was aborted after
+    // the branch was created), `git fetch --all` and the source-branch checkout
+    // add no value — the branch is already local and we just need to switch to
+    // it to resume. The fetch can be slow on poor connections, so it is
+    // skipped in this case.
+    if git::branch_exists(repo_dir, &target_branch).await? {
+        print_info_box(
+            &format!("Branch '{target_branch}' already exists"),
+            &[
+                "A previous run may have been interrupted after this branch was created.",
+                "",
+                &format!("Switching to '{target_branch}' and continuing from where it left off."),
+                "Skipping 'git fetch --all' since the branch is already local.",
+                &format!("To start fresh instead, exit and run: git branch -D {target_branch}"),
+            ],
+        );
+        if prompt_select(
+            &format!("Switch to '{target_branch}' and continue?"),
+            &["Switch and continue", "Abort"],
+            0,
+        ) != 0
+        {
+            println!(
+                "\n  Aborted. Delete the branch with \
+                 'git branch -D {target_branch}' then rerun."
+            );
+            return Ok(());
+        }
+        info!("switching to existing branch {target_branch}");
+        git::checkout_branch(repo_dir, &target_branch).await?;
+        println!("  Switched to existing branch '{target_branch}'.");
+    } else {
+        // Target branch does not exist — fetch the latest state and create it
+        // from the source branch.
+        info!("fetching all remotes");
+        git::fetch_all(repo_dir).await?;
+
+        info!("checking out {source_branch}");
+        git::checkout_branch(repo_dir, &source_branch).await?;
+
+        info!("creating branch {target_branch}");
+        crate::shell::run_command("git", &["checkout", "-b", &target_branch], repo_dir, &[])
+            .await?;
+        println!("  Branch '{target_branch}' created from '{source_branch}'.");
+    }
+
+    // ── Phase 3: Update Changelog ────────────────────────────────────────────
+    print_phase_header(3, "Update Changelog");
+    print_phase_explanation(3);
+
+    let changelog_path = repo_dir.join("debian/changelog");
+
+    info!("reading current version from debian/changelog");
+    let current_version = changelog::read_current_version(&changelog_path)?;
+    println!("  Current version  : {current_version}");
+
+    let computed_version = changelog::compute_backport_version(&current_version, target_series);
+    println!("  Computed version : {computed_version}");
+
+    if computed_version == current_version {
+        println!(
+            "  Note: changelog already at the computed version — selecting it will keep \
+             the existing entry (no new dch entry created)."
+        );
+    }
+
+    let new_version = match prompt_select(
+        "How would you like to set the changelog version?",
+        &[
+            &format!("Use computed version ({computed_version})"),
+            "Enter a custom version",
+            "Abort",
+        ],
+        0,
+    ) {
+        0 => computed_version,
+        1 => {
+            let input = prompt_input("Enter the desired version:");
+            if input.is_empty() {
+                println!(concat!(
+                    "\n  Aborted. Update debian/changelog manually with",
+                    " 'dch -v <version>' to set the correct version,",
+                    " then rerun thermite backport."
+                ));
+                return Ok(());
+            }
+            input
+        }
+        _ => {
+            println!(concat!(
+                "\n  Aborted. Update debian/changelog manually with",
+                " 'dch -v <version>' to set the correct version,",
+                " then rerun thermite backport."
+            ));
+            return Ok(());
+        }
+    };
+
+    // Only create a new changelog entry when the chosen version actually
+    // differs from the current top-of-changelog version.  On re-runs (where
+    // Phase 3 already wrote the backport version) the computed version is
+    // idempotent, so skipping dch prevents creating a duplicate entry.
+    // `update_backport_changelog_entry` below still runs unconditionally to
+    // fix up the distribution and bullet text on the top entry.
+    if new_version != current_version {
+        info!("running dch with version {new_version}");
+        changelog::run_dch(repo_dir, &new_version).await?;
+    } else {
+        println!("  Changelog already at version {new_version} — no new entry created.");
+    }
+
+    info!("updating changelog entry distribution and description");
+    changelog::update_backport_changelog_entry(&changelog_path, release, lp_bug.as_deref())?;
+
+    let first_lines: String = std::fs::read_to_string(&changelog_path)?
+        .lines()
+        .take(6)
+        .map(|l| format!("    {l}\n"))
+        .collect();
+    println!("  Changelog updated. First entry now:\n{first_lines}");
+
+    // Commit the backport changelog entry so later phases (Phase 11) can use
+    // `git restore debian/changelog` to revert only the temporary ~ppa<N>
+    // entry without discarding this Phase 3 entry.  Skip the commit when the
+    // working tree already matches HEAD (re-run after a prior successful run).
+    let changelog_status = crate::shell::run_command(
+        "git",
+        &["status", "--porcelain", "debian/changelog"],
+        repo_dir,
+        &[],
+    )
+    .await?;
+    if !changelog_status.stdout.trim().is_empty() {
+        git::add_and_commit(
+            repo_dir,
+            &["debian/changelog"],
+            "Add backport changelog entry",
+        )
+        .await?;
+        println!("  Backport changelog entry committed.");
+    } else {
+        println!("  Backport changelog entry already committed — nothing to commit.");
+    }
+
+    // ── Phase 4: Generate Orig Tarball ───────────────────────────────────────
+    print_phase_header(4, "Generate Orig Tarball");
+    print_phase_explanation(4);
+
+    // The expected final tarball name encodes the target series suffix so that
+    // the filename matches the backport version string (e.g. ~20.04).
+    let expected_tarball_name =
+        format!("rustc-{rust_short}_{rust_ver}+dfsg~{target_series}.orig.tar.xz");
+    let expected_tarball = parent_dir.join(&expected_tarball_name);
+
+    print_info_box(
+        "Tarball decision",
+        &[
+            "Choose how to provide the orig tarball for this backport:",
+            "",
+            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 6). uscan will run now; takes 20–60 minutes.",
+            "",
+            "  DOWNLOAD   — No Files-Excluded change; tarball not yet local. Download from the staging PPA, name the file exactly:",
+            &format!("               {expected_tarball_name}"),
+            &format!("               and place it in: {}", parent_dir.display()),
+            "",
+            "  REUSE      — No Files-Excluded change; tarball already exists at:",
+            &format!("               {}", expected_tarball.display()),
+        ],
+    );
+
+    let tarball = match prompt_select(
+        "How would you like to provide the orig tarball?",
+        &[
+            "Regenerate — run uscan now (20–60 min; required if Files-Excluded changed)",
+            "Download   — I will place the correctly-named tarball in the parent directory",
+            "Reuse      — tarball already exists in the parent directory",
+            "Abort",
+        ],
+        0,
+    ) {
+        0 => {
+            // Regenerate: run uscan and rename to include the series suffix.
+            let uscan_log = parent_dir.join(format!("uscan-{rust_ver}-backport.log"));
+            info!("running uscan --download-version {rust_ver}");
+            let t = uscan::run_uscan(repo_dir, rust_ver, &uscan_log).await?;
+            uscan::rename_tarball_with_suffix(&t, &format!("~{target_series}"))?
+        }
+        1 => {
+            // Download: pause for the user to place the file, then verify it exists.
+            if prompt_select(
+                "Place the tarball at the path shown above, then continue.",
+                &["I've placed the tarball — continue", "Abort"],
+                0,
+            ) != 0
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+            if !expected_tarball.exists() {
+                return Err(crate::error::ThermiteError::CommandFailed {
+                    cmd: "download orig tarball".to_owned(),
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "tarball not found: {}\n\
+                         Ensure the file is named exactly '{}' and placed in '{}'.",
+                        expected_tarball.display(),
+                        expected_tarball_name,
+                        parent_dir.display(),
+                    ),
+                });
+            }
+            expected_tarball
+        }
+        2 => {
+            // Reuse: verify the tarball is present locally.
+            if !expected_tarball.exists() {
+                return Err(crate::error::ThermiteError::CommandFailed {
+                    cmd: "reuse orig tarball".to_owned(),
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "tarball not found: {}\n\
+                         Select 'Download' or 'Regenerate' to obtain it first.",
+                        expected_tarball.display(),
+                    ),
+                });
+            }
+            expected_tarball
+        }
+        _ => {
+            // Abort
+            println!("\n  Aborted at Phase 4. Re-run when ready to provide the orig tarball.");
+            return Ok(());
+        }
+    };
+    println!("  Orig tarball: {}", tarball.display());
+
+    // ── Phase 5: Generate Orig-Vendor Tarball ────────────────────────────────
+    print_phase_header(5, "Generate Orig-Vendor Tarball");
+    print_phase_explanation(5);
+
+    info!("installing Rust toolchain {rust_ver}");
+    let rust_bootstrap_dir = vendor::rustup_install_toolchain(rust_ver).await?;
+
+    // The vendor tarball name encodes the same series suffix as the orig
+    // tarball so it matches the backport changelog version.
+    let vendor_tarball_name =
+        format!("rustc-{rust_short}_{rust_ver}+dfsg~{target_series}.orig-vendor.tar.xz");
+    let expected_vendor_tarball = parent_dir.join(&vendor_tarball_name);
+
+    let vendor_tarball = if expected_vendor_tarball.exists() {
+        match prompt_select(
+            "Orig-vendor tarball already exists. What would you like to do?",
+            &[
+                "Reuse      — use the existing vendor tarball",
+                "Regenerate — delete it and rebuild from scratch",
+                "Abort",
+            ],
+            0,
+        ) {
+            0 => {
+                println!("  Reusing existing vendor tarball.");
+                expected_vendor_tarball
+            }
+            1 => {
+                std::fs::remove_file(&expected_vendor_tarball)
+                    .map_err(crate::error::ThermiteError::Io)?;
+                generate_vendor_tarball_for_backport(
+                    repo_dir,
+                    &rust_bootstrap_dir,
+                    rust_ver,
+                    target_series,
+                    &parent_dir,
+                )
+                .await?
+            }
+            _ => {
+                println!("\n  Aborted at Phase 5.");
+                return Ok(());
+            }
+        }
+    } else {
+        generate_vendor_tarball_for_backport(
+            repo_dir,
+            &rust_bootstrap_dir,
+            rust_ver,
+            target_series,
+            &parent_dir,
+        )
+        .await?
+    };
+    println!("  Vendor tarball: {}", vendor_tarball.display());
+
+    // ── Phase 6: Compatibility Checks ────────────────────────────────────────
+    print_phase_header(6, "Compatibility Checks");
+    print_phase_explanation(6);
+
+    // Build the check list with the target release adjective interpolated
+    // into the Launchpad URLs (e.g. focal, jammy). The LLVM toolchain
+    // number <N> stays as a placeholder — the user greps debian/rules for
+    // the LLVM_VERSION assignment.
+    print_info_box(
+        "Work through each compatibility check before building",
+        &[
+            "Check each item in order. Apply ALL changes before proceeding.",
+            "After completing all applicable changes, commit them together.",
+            "",
+            "LLVM availability",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/llvm-toolchain-<N>"),
+            "  If 404 / not published: vendor LLVM (remove src/llvm-project from Files-Excluded, regenerate tarball, update control/config.toml.in/rules).",
+            "",
+            "libgit2 availability",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/libgit2"),
+            "  If archive version < required: downgrade version constraint, or vendor libgit2 (comment out exclusion, regenerate tarball, update control).",
+            "",
+            "dh-cargo (>= 28ubuntu1~) availability",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/dh-cargo"),
+            "  If absent: comment out dh-cargo from Build-Depends; remove dh-cargo-vendored-sources check from debian/rules.",
+            "",
+            "pkgconf availability",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/pkgconf"),
+            "  If absent: replace pkgconf with pkg-config in control files; add 'export PKG_CONFIG=pkg-config' to debian/rules.",
+            "",
+            "cmake version (>= 3.0)",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/cmake"),
+            "  If too old: add cmake-mozilla (>= 3.0) as fallback in control files.",
+            "",
+            "debhelper-compat level",
+            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/debhelper"),
+            "  If required compat level absent: downgrade debhelper-compat in control files and update .install.in substitution variables.",
+            "",
+            "Full documentation: see the official backport-rust guide.",
+        ],
+    );
+    if prompt_select(
+        "All applicable compatibility changes worked through and committed?",
+        &["Continue", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // ── Phase 7: Disable Autopkgtest Self-Build Test ─────────────────────────
+    // H2 fix: this phase is now before the local build.
+    print_phase_header(7, "Disable Autopkgtest Self-Build Test");
+    print_phase_explanation(7);
+
+    info!("removing self-build test from debian/tests/control");
+    build::disable_self_build_test(repo_dir)?;
+
+    let tests_control = repo_dir.join("debian/tests/control");
+    if tests_control.exists() {
+        let status_output = crate::shell::run_command(
+            "git",
+            &["status", "--porcelain", "debian/tests/control"],
+            repo_dir,
+            &[],
+        )
+        .await?;
+        if !status_output.stdout.trim().is_empty() {
+            git::add_and_commit(
+                repo_dir,
+                &["debian/tests/control"],
+                "Disable autopkgtest self-build test for backport",
+            )
+            .await?;
+            println!("  Self-build test block removed and committed.");
+        } else {
+            println!("  Self-build test block was already absent — nothing to commit.");
+        }
+    } else {
+        println!("  debian/tests/control not found — skipping.");
+    }
+
+    // ── Phase 8: Local Build and Bug Fixing ──────────────────────────────────
+    print_phase_header(8, "Local Build and Bug Fixing");
+    print_phase_explanation(8);
+
+    print_info_box(
+        "About to run sbuild",
+        &[
+            "The local build may fail if the target Ubuntu release has older versions of certain dependencies. Use the Phase 6 compatibility guidance to diagnose failures.",
+            "",
+            "Consult the backporting guide for detailed diagnostics:",
+            "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
+            "",
+            "sbuild will use ppa:rust-toolchain/staging as an extra repository so the bootstrap compiler is available.",
+        ],
+    );
+    match prompt_select(
+        "Ready to start the local build?",
+        &["Start build", "Skip — already built locally", "Abort"],
+        0,
+    ) {
+        0 => {
+            if !run_interactive_local_build(repo_dir, &parent_dir, release).await? {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+        1 => {
+            println!("  Local build skipped.");
+        }
+        _ => {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // ── Phase 9: Build Source Package ────────────────────────────────────────
+    print_phase_header(9, "Build Source Package");
+    print_phase_explanation(9);
+
+    // The expected .dsc path is deterministic from the package name and version.
+    let dsc_path = parent_dir.join(format!("{pkg_name}_{new_version}.dsc"));
+
+    let build_source = match prompt_select(
+        "Build the source package now?",
+        &[
+            "Build source package",
+            "Skip — .dsc already exists in parent directory",
+            "Abort",
+        ],
+        0,
+    ) {
+        0 => true,
+        1 => {
+            if dsc_path.exists() {
+                println!("  Found: {}", dsc_path.display());
+                false
+            } else {
+                print_info_box(
+                    "Source package not found",
+                    &[
+                        &format!("Expected: {}", dsc_path.display()),
+                        "",
+                        "Phase 10 (lintian) requires this file. If you also intend to skip lintian, you may continue without it.",
+                    ],
+                );
+                match prompt_select(
+                    "How would you like to proceed?",
+                    &[
+                        "Build source package now",
+                        "Continue without it (only safe if also skipping Phase 10)",
+                        "Abort",
+                    ],
+                    0,
+                ) {
+                    0 => true,
+                    1 => false,
+                    _ => {
+                        println!("Aborted.");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        _ => {
+            println!("Aborted.");
+            return Ok(());
+        }
+    };
+
+    if build_source {
+        info!("cleaning build artifacts before source package build");
+        build::quilt_pop_all(repo_dir).await?;
+        build::clean_build_artifacts(&parent_dir, repo_dir).await?;
+
+        info!("building source package");
+        build::run_dpkg_buildpackage_source(repo_dir).await?;
+        println!("  Source package: {}", dsc_path.display());
+    }
+
+    // ── Phase 10: Lintian Checks ──────────────────────────────────────────────
+    print_phase_header(10, "Lintian Checks");
+    print_phase_explanation(10);
+
+    'lintian: {
+        match prompt_select(
+            "Run lintian checks for this backport?",
+            &["Run lintian checks", "Skip lintian", "Abort"],
+            0,
+        ) {
+            1 => {
+                println!("  Lintian skipped.");
+                break 'lintian;
+            }
+            2 => {
+                println!("Aborted.");
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let lintian_log = parent_dir.join(format!("lintian-{rust_short}-{release}.log"));
+        info!("running lintian");
+        let lintian_output =
+            lintian::run_lintian(repo_dir, &["-i", "--tag-display-limit", "0"], &lintian_log)
+                .await?;
+
+        println!("  Lintian log: {}", lintian_log.display());
+        println!(
+            "  Errors: {}  Warnings: {}",
+            lintian_output.errors.len(),
+            lintian_output.warnings.len()
+        );
+
+        print_info_box(
+            "Expected (ignorable) Lintian tags for rustc backports",
+            &[
+                "The following tags are expected and can be ignored:",
+                "",
+                "  E: field-too-long Vendored-Sources-Rust",
+                "     (field length is unavoidable; upstream dh-cargo fix needed)",
+                "  E: unknown-file-in-debian-source [lintian-overrides.in]",
+                "     (intentional — generates per-version overrides)",
+                "  E: version-substvar-for-external-package Depends ${binary:Version}",
+                "     (deliberate fallback, not an error)",
+                "  W: unknown-field Vendored-Sources-Rust",
+                "     (custom field, not a typo)",
+                "  Various warnings in src/llvm-project/ (only when LLVM is vendored)",
+                "     (test-suite binaries in upstream LLVM source)",
+                "",
+                "All other errors and warnings must be fixed or overridden with a justifying comment in debian/source/lintian-overrides{,.in}.",
+            ],
+        );
+
+        if !lintian_output.errors.is_empty() || !lintian_output.warnings.is_empty() {
+            if prompt_select(
+                "Review lintian output, then continue.",
+                &["Issues fixed or overridden — continue", "Abort"],
+                0,
+            ) != 0
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+        } else {
+            println!("  Lintian clean.");
+        }
+    } // end 'lintian
+
+    // ── Phase 11: PPA Build ──────────────────────────────────────────────────
+    print_phase_header(11, "PPA Build");
+    print_phase_explanation(11);
+
+    print_info_box(
+        "Personal PPA build",
+        &[
+            "Before uploading to the staging PPA, build in a personal PPA first to confirm the package builds cleanly in the Launchpad build environment.",
+            "",
+            &format!("Suggested PPA name: {ppa_name}"),
+            "",
+            "After PPA creation, configure it:",
+            "  1. Change Details → Processors: enable ALL architectures (incl. riscv64).",
+            "  2. Edit PPA Dependencies → Ubuntu dependencies: set to 'Security'.",
+            "     (Backports target the security pocket, not proposed.)",
+            "  3. If bootstrapping from staging PPA, add ppa:rust-toolchain/staging as an explicit PPA dependency.",
+        ],
+    );
+
+    if confirm_sink(
+        params.dry_run,
+        "Create Launchpad PPA",
+        &[&format!(" PPA: {lpuser}/{ppa_name}")],
+    ) {
+        let ppa_url = ppa::create_ppa(&ppa_name).await?;
+        if !ppa_url.is_empty() {
+            println!("  PPA created: {ppa_url}");
+        }
+    }
+
+    // M5: prompt for ~ppa<N> number (default 1) instead of hardcoding.
+    let ppa_n_str = prompt_input("PPA upload number? [1]");
+    let ppa_n: u32 = ppa_n_str.parse().unwrap_or(1);
+    println!("  Using ~ppa{ppa_n} suffix.");
+
+    // M3: quilt pop -a before dpkg-buildpackage -S.
+    info!("cleaning build artifacts before PPA source build");
+    build::quilt_pop_all(repo_dir).await?;
+    build::clean_build_artifacts(&parent_dir, repo_dir).await?;
+
+    ppa::add_ppa_changelog_entry(repo_dir, &new_version, release, ppa_n).await?;
+    build::run_dpkg_buildpackage_source(repo_dir).await?;
+
+    let changes_file = find_changes_file(&parent_dir)?;
+    let ppa_ref = format!("{lpuser}/{ppa_name}");
+    let changes_name = changes_file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if confirm_sink(
+        params.dry_run,
+        "Upload source package to personal PPA",
+        &[
+            &format!("  PPA    : {ppa_ref}"),
+            &format!("  Package: {changes_name}"),
+        ],
+    ) {
+        ppa::dput_to_ppa(&ppa_ref, &changes_file).await?;
+    }
+
+    // Revert the temporary ~ppa<N> changelog entry.
+    git::restore_file(repo_dir, &changelog_path).await?;
+    println!("  Temporary PPA changelog entry reverted.");
+
+    print_info_box(
+        "Monitor your personal PPA build",
+        &[
+            &format!("  https://launchpad.net/~{lpuser}/+archive/ubuntu/{ppa_name}/+builds"),
+            "",
+            "Wait for the build to succeed on all architectures before proceeding.",
+            "",
+            "If the riscv64 build fails with unrecognised RISC-V ISA extensions (only when LLVM is vendored), cherry-pick commits for the zicsr/zmmul extensions are listed in the official backport-rust guide.",
+            "",
+            "If a build fails with 'No space left on device' (LLVM or libgit2 vendoring), disk-space reduction steps are described in the official backport-rust guide.",
+        ],
+    );
+    if prompt_select(
+        "Confirm personal PPA build status.",
+        &["Build complete on all architectures — continue", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // ── Phase 12: Staging PPA Upload ─────────────────────────────────────────
+    print_phase_header(12, "Staging PPA Upload");
+    print_phase_explanation(12);
+
+    print_info_box(
+        "Prepare the final changelog entry",
+        &[
+            "Edit the top changelog entry to:",
+            "  1. Remove the ~ppa<N> suffix from the version string (already done by the git restore above — verify the version looks correct).",
+            "  2. Replace the placeholder description with a complete list of every change made during this backport, for example:",
+            "",
+            "       * Backport Rust X.Y to <release>",
+            "         - Replace system LLVM dependencies with vendored version",
+            "         - Downgrade libgit2 to <version>",
+            "         - Replace pkgconf with pkg-config",
+            "",
+            "An editor will open via 'dch -r'. Save and close to proceed.",
+            "After saving, the source package will be built and uploaded to:",
+            "  ppa:rust-toolchain/staging",
+        ],
+    );
+    if prompt_select(
+        "Ready to open the changelog editor?",
+        &["Open changelog editor", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // Open dch -r with the user's configured editor (TTY-inherited).
+    crate::shell::run_interactive_command("dch", &["-r", "--no-auto-nmu"], repo_dir, &[]).await?;
+
+    // M6: clean before staging dpkg-buildpackage -S.
+    info!("cleaning build artifacts before staging source build");
+    build::quilt_pop_all(repo_dir).await?;
+    build::clean_build_artifacts(&parent_dir, repo_dir).await?;
+
+    build::run_dpkg_buildpackage_source(repo_dir).await?;
+
+    let staging_changes = find_changes_file(&parent_dir)?;
+    let staging_name = staging_changes
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if confirm_sink(
+        params.dry_run,
+        "Upload to SHARED TEAM staging PPA",
+        &[
+            "  PPA    : rust-toolchain/staging",
+            "  This is a shared PPA \u{2014} uploads affect the entire bootstrapping chain.",
+            &format!("  Package: {staging_name}"),
+        ],
+    ) {
+        ppa::dput_to_ppa("rust-toolchain/staging", &staging_changes).await?;
+        println!("  Uploaded to ppa:rust-toolchain/staging.");
+    }
+
+    print_info_box(
+        "Monitor staging PPA build",
+        &[
+            "  https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/+builds",
+            "",
+            "Wait for the build to succeed on all architectures before running autopkgtests.",
+        ],
+    );
+    if prompt_select(
+        "Confirm staging PPA build status.",
+        &["Build complete on all architectures — continue", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // ── Phase 13: Autopkgtests ────────────────────────────────────────────────
+    print_phase_header(13, "Autopkgtests");
+    print_phase_explanation(13);
+
+    let test_urls = ppa::get_staging_ppa_test_urls(&pkg_name, release).await?;
+    if test_urls.is_empty() {
+        print_info_box(
+            "Trigger autopkgtests manually",
+            &[
+                "No URLs were returned by 'ppa tests'. Trigger tests manually:",
+                &format!(
+                    "  ppa tests ppa:rust-toolchain/staging -p {pkg_name} --release {release} --show-url"
+                ),
+            ],
+        );
+    } else {
+        let mut lines = vec![
+            "Click each URL to trigger an autopkgtest run for that architecture.".to_owned(),
+            "Re-run the command to check status after a few minutes.".to_owned(),
+            String::new(),
+        ];
+        lines.extend(test_urls.iter().cloned());
+        lines.push(String::new());
+        lines.push("Note: the self-build test has been disabled for this backport.".to_owned());
+        lines.push("All other tests must pass before requesting archive upload.".to_owned());
+        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        print_info_box("Staging PPA autopkgtest URLs", &line_refs);
+    }
+    if prompt_select(
+        "Confirm autopkgtest results.",
+        &["All autopkgtests passed — continue", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // ── Phase 14: Push Branch to Foundations Repository ──────────────────────
+    // H3 fix: branch is pushed only after autopkgtests pass.
+    print_phase_header(14, "Push Branch to Foundations Repository");
+    print_phase_explanation(14);
+
+    info!("pushing {target_branch} to {git_remote}");
+    if confirm_sink(
+        params.dry_run,
+        "Push branch to Foundations repository",
+        &[
+            &format!("  Branch : {target_branch}"),
+            &format!("  Remote : {git_remote}"),
+        ],
+    ) {
+        git::push_branch(repo_dir, git_remote, &target_branch).await?;
+        println!("  Branch '{target_branch}' pushed to '{git_remote}'.");
+        print_info_box(
+            "Branch pushed",
+            &[
+                &format!("  Branch : {target_branch}"),
+                &format!("  Remote : {git_remote}"),
+                "",
+                "The branch is now the authoritative record of this backport and must be referenced in any Archive upload request.",
+            ],
+        );
+    }
+
+    // ── Phase 15: Archive Upload (optional) ──────────────────────────────────
+    print_phase_header(15, "Archive Upload (optional)");
+    print_phase_explanation(15);
+
+    print_info_box(
+        "Requesting archive upload",
+        &[
+            "Archive upload is only needed if the backport is specifically required in the Ubuntu Archive. For bootstrapping future Rust versions, the staging PPA is sufficient.",
+            "",
+            "If archive upload is needed, contact the Ubuntu Security team with:",
+            &format!(
+                "  • Bug link      : https://bugs.launchpad.net/ubuntu/+bug/{}",
+                lp_bug.as_deref().unwrap_or("<no bug>")
+            ),
+            "  • Staging PPA   : https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/",
+            &format!("  • Package       : {pkg_name} ({new_version})"),
+            "",
+            "Monitor upload progress:",
+            "  https://launchpad.net/~ubuntu-security-proposed/+archive/ubuntu/ppa/+packages",
+        ],
+    );
+    prompt_select("Backport workflow complete.", &["Finish"], 0);
+
+    println!("\nthermite backport complete.");
+    Ok(())
+}
+
+// ── interactive helper loops ──────────────────────────────────────────────────
+
+/// Build the `--extra-repository` argument for `ppa:rust-toolchain/staging`.
+///
+/// The staging PPA provides the bootstrap compiler (`rustc-X.Y_old`,
+/// `cargo-X.Y_old`) when it has not yet landed in the target release's
+/// archive.  It is always passed to sbuild during a backport build so the
+/// resolver can find the bootstrap compiler without manual intervention.
+///
+/// Format matches the official backport-rust documentation.
+fn staging_ppa_extra_repository(release: &str) -> String {
+    format!(
+        "--extra-repository=deb [trusted=yes] http://ppa.launchpad.net/rust-toolchain/staging/ubuntu/ {release} main"
+    )
+}
+
+/// Interactive local build loop using sbuild.
+///
+/// Returns `Ok(true)` when the build succeeds, `Ok(false)` when the user
+/// chooses to abort from the retry prompt.
+async fn run_interactive_local_build(
+    repo_dir: &Path,
+    parent_dir: &Path,
+    release: &str,
+) -> Result<bool> {
+    // Always include the staging PPA so sbuild can resolve the bootstrap
+    // compiler (rustc-X.Y_old / cargo-X.Y_old) when it is not yet in the
+    // target release's archive.
+    let extra_args = vec![staging_ppa_extra_repository(release)];
+    loop {
+        // M3: quilt pop -a before cleaning to avoid leaving modified source
+        // files without quilt tracking them.
+        build::quilt_pop_all(repo_dir).await?;
+        build::clean_build_artifacts(parent_dir, repo_dir).await?;
+        match build::run_sbuild(repo_dir, release, &extra_args).await? {
+            build::SbuildResult::Success => {
+                println!("  sbuild succeeded.");
+                return Ok(true);
+            }
+            build::SbuildResult::Failure {
+                log_path,
+                stdout,
+                stderr,
+            } => {
+                let failures = log_path
+                    .as_ref()
+                    .and_then(|p| build::extract_test_failures(p).ok())
+                    .unwrap_or_default();
+
+                // Resolve an absolute path for display, and pick the right
+                // message depending on whether sbuild produced a real build
+                // log or we fell back to capturing its output.
+                let log_line = match log_path
+                    .as_ref()
+                    .and_then(|p| std::fs::canonicalize(p).ok())
+                {
+                    Some(abs) => format!("Build log: {}", abs.display()),
+                    None => {
+                        // No file at all (even our fallback write failed).
+                        // Surface a snippet of the captured output inline.
+                        let snippet = if !stderr.trim().is_empty() {
+                            stderr.trim()
+                        } else {
+                            stdout.trim()
+                        };
+                        let snippet: String = snippet.chars().take(400).collect();
+                        format!(
+                            "sbuild failed before producing a build log. Captured output:\n{snippet}"
+                        )
+                    }
+                };
+
+                print_info_box(
+                    "Build failed — common backporting fixes",
+                    &[
+                        &log_line,
+                        "",
+                        "Consult the backporting guide for common fixes:",
+                        "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
+                        "",
+                        "Quick reference (see Phase 6 compatibility guidance for details):",
+                        "  LLVM too old       → vendor LLVM from src/llvm-project",
+                        "  libgit2 too old    → downgrade or vendor libgit2",
+                        "  dh-cargo missing   → comment out from Build-Depends",
+                        "  pkgconf missing    → replace with pkg-config",
+                        "  cmake too old      → add cmake-mozilla fallback",
+                        "  debhelper-compat   → downgrade compat level",
+                        "",
+                        "For rustdoc-ui test failures (make < 4.4 jobserver warnings), proceed to PPA build — Launchpad builders do not trigger them.",
+                        "",
+                        "The staging PPA is already included via --extra-repository. If the bootstrap compiler is still not found, verify that rustc-X.Y exists in ppa:rust-toolchain/staging for this release.",
+                    ],
+                );
+                if !failures.is_empty() {
+                    println!("  Extracted {} test failure section(s).", failures.len());
+                }
+                match prompt_select(
+                    "Build failed. What would you like to do?",
+                    &[
+                        "Fix failure and retry",
+                        "Skip — proceed despite failure",
+                        "Abort",
+                    ],
+                    0,
+                ) {
+                    0 => { /* retry — loop continues */ }
+                    1 => {
+                        println!(
+                            "  Warning: skipping failed local build. \
+                             Proceeding to source package build."
+                        );
+                        return Ok(true);
+                    }
+                    _ => return Ok(false),
+                }
+            }
+        }
+    }
+}
+
+// ── small helpers ─────────────────────────────────────────────────────────────
+
+/// Find the newest `.changes` file in `parent_dir`.
+fn find_changes_file(parent_dir: &Path) -> Result<PathBuf> {
+    let mut entries: Vec<_> = std::fs::read_dir(parent_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".changes"))
+        .collect();
+
+    // Sort newest-first by modification time.
+    entries.sort_by(|a, b| {
+        let mt_a = a.metadata().and_then(|m| m.modified()).ok();
+        let mt_b = b.metadata().and_then(|m| m.modified()).ok();
+        mt_b.cmp(&mt_a)
+    });
+
+    entries.into_iter().next().map(|e| e.path()).ok_or_else(|| {
+        crate::error::ThermiteError::CommandFailed {
+            cmd: "dpkg-buildpackage".to_owned(),
+            code: 0,
+            stdout: String::new(),
+            stderr: "no .changes file found in parent directory".to_owned(),
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// All workflow-critical tools must appear in REQUIRED_TOOLS.
+    #[test]
+    fn required_tools_contains_workflow_dependencies() {
+        for tool in &[
+            "git",
+            "dch",
+            "uscan",
+            "quilt",
+            "dpkg-buildpackage",
+            "lintian",
+            "sbuild",
+            "dput",
+            "ppa",
+        ] {
+            assert!(
+                REQUIRED_TOOLS.contains(tool),
+                "REQUIRED_TOOLS is missing '{tool}'"
+            );
+        }
+    }
+
+    #[test]
+    fn find_changes_file_returns_newest() {
+        use std::fs;
+        use std::time::Duration;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "thermite-backport-changes-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let old_path = tmp.join("rustc-1.84_amd64.changes");
+        let new_path = tmp.join("rustc-1.85_amd64.changes");
+        fs::write(&old_path, "old").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&new_path, "new").unwrap();
+
+        let result = find_changes_file(&tmp).unwrap();
+        assert_eq!(
+            result.file_name().unwrap(),
+            new_path.file_name().unwrap(),
+            "should pick the newest .changes file"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn staging_ppa_extra_repository_format() {
+        let arg = staging_ppa_extra_repository("noble");
+        assert_eq!(
+            arg,
+            "--extra-repository=deb [trusted=yes] http://ppa.launchpad.net/rust-toolchain/staging/ubuntu/ noble main"
+        );
+    }
+
+    #[test]
+    fn staging_ppa_extra_repository_includes_release_name() {
+        let arg = staging_ppa_extra_repository("jammy");
+        assert!(
+            arg.contains("jammy main"),
+            "expected release name in extra-repository arg, got: {arg}"
+        );
+    }
+}

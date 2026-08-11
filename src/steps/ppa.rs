@@ -69,3 +69,32 @@ pub async fn get_ppa_test_urls(lpuser: &str, ppa_name: &str, release: &str) -> R
         .collect();
     Ok(urls)
 }
+
+/// Run `ppa tests ppa:rust-toolchain/staging` to get autopkgtest trigger URLs
+/// for a package in the staging PPA.
+///
+/// `pkg_name` should be the versioned package name (e.g. `"rustc-1.85"`).
+pub async fn get_staging_ppa_test_urls(pkg_name: &str, release: &str) -> Result<Vec<String>> {
+    let output = run_command(
+        "ppa",
+        &[
+            "tests",
+            "ppa:rust-toolchain/staging",
+            "-p",
+            pkg_name,
+            "--release",
+            release,
+            "--show-url",
+        ],
+        Path::new("."),
+        &[],
+    )
+    .await?;
+    let urls: Vec<String> = output
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("http"))
+        .map(|l| l.to_owned())
+        .collect();
+    Ok(urls)
+}

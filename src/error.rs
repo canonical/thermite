@@ -26,6 +26,9 @@ pub enum ThermiteError {
     #[error("command '{0}' was not found on PATH")]
     CommandNotFound(String),
 
+    #[error("command '{0}' output could not be interpreted as a string")]
+    CommandOutputParseError(String),
+
     #[error("patch refresh required manual intervention: {0}")]
     PatchRefreshRequired(String),
 
@@ -39,6 +42,10 @@ pub enum ThermiteError {
     /// Launchpad bug number was not a non-empty digit string.
     #[error("invalid Launchpad bug number '{0}': must be a non-empty string of digits")]
     InvalidLpBugNumber(String),
+
+    /// Source and target releases for a backport were the same.
+    #[error("invalid backport releases: {0}")]
+    InvalidBackportReleases(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

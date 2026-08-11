@@ -8,22 +8,34 @@ use tracing::{debug, info};
 
 use crate::error::{Result, ThermiteError};
 
-/// Whether verbose output is enabled for this process.
+/// Global verbosity level for this process.
 ///
-/// Set once at startup via [`set_verbose`]; read anywhere via [`is_verbose`].
-static VERBOSE: OnceLock<bool> = OnceLock::new();
+/// | Level | Flag  | Effect                                                   |
+/// |-------|-------|----------------------------------------------------------|
+/// | 0     | (none)| Normal output only                                       |
+/// | 1     | `-v`  | Print each external command before it is executed        |
+/// | 2     | `-vv` | Level 1 + per-phase explanations with documentation links|
+///
+/// Set once at startup via [`set_verbosity`]; read anywhere via
+/// [`verbosity`] or the convenience helper [`is_verbose`].
+static VERBOSITY: OnceLock<u8> = OnceLock::new();
 
-/// Enable or disable verbose command output.
+/// Set the process-wide verbosity level.
 ///
 /// Must be called before any commands are run.  Subsequent calls are silently
-/// ignored (the flag is immutable after the first call).
-pub fn set_verbose(verbose: bool) {
-    let _ = VERBOSE.set(verbose);
+/// ignored (the level is immutable after the first call).
+pub fn set_verbosity(level: u8) {
+    let _ = VERBOSITY.set(level);
 }
 
-/// Returns `true` if verbose mode is active.
+/// Returns the current verbosity level (0 = quiet, 1 = `-v`, 2 = `-vv`).
+pub fn verbosity() -> u8 {
+    VERBOSITY.get().copied().unwrap_or(0)
+}
+
+/// Returns `true` if at least one `-v` flag was given (`verbosity >= 1`).
 pub fn is_verbose() -> bool {
-    VERBOSE.get().copied().unwrap_or(false)
+    verbosity() >= 1
 }
 
 /// Output captured from a completed external command.
@@ -51,9 +63,20 @@ pub async fn run_command(
         println!("+ {display_cmd}");
     }
 
-    // Check the program exists on PATH before spawning so we surface a clear
-    // error rather than a cryptic OS error.
-    which(program)?;
+    // Check the program exists before spawning so we surface a clear error
+    // rather than a cryptic OS error.
+    //
+    // Programs that contain '/' are relative or absolute path references
+    // (e.g. "debian/rules"), not PATH lookups; verify them as files relative
+    // to `cwd` rather than searching PATH.
+    if program.contains('/') {
+        let full_path = cwd.join(program);
+        if !full_path.exists() {
+            return Err(ThermiteError::CommandNotFound(program.to_owned()));
+        }
+    } else {
+        which(program)?;
+    }
 
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -188,18 +211,20 @@ pub async fn run_interactive_command(
 
 /// Check that `program` is available on `PATH`, returning
 /// [`ThermiteError::CommandNotFound`] if it is not.
-pub fn which(program: &str) -> Result<()> {
-    let found = std::process::Command::new("which")
+pub fn which(program: &str) -> Result<String> {
+    let output = std::process::Command::new("which")
         .arg(program)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .map_err(|_e| ThermiteError::CommandNotFound(program.to_owned()))?;
 
-    if found {
-        Ok(())
-    } else {
-        Err(ThermiteError::CommandNotFound(program.to_owned()))
+    if !output.status.success() {
+        return Err(ThermiteError::CommandNotFound(program.to_owned()));
     }
+
+    let output = String::from_utf8(output.stdout)
+        .map_err(|_e| ThermiteError::CommandOutputParseError(program.to_owned()))?;
+
+    Ok(output)
 }
 
 #[cfg(test)]
