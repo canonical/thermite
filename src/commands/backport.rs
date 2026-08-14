@@ -191,7 +191,7 @@ const PHASE_DOCS: &[PhaseDoc] = &[
 /// Print per-phase documentation when verbosity is >= 2 (`-vv`).
 ///
 /// Called immediately after [`print_phase_header`] for every phase.
-fn print_phase_explanation(phase: usize) {
+pub fn print_phase_explanation(phase: usize) {
     if crate::shell::verbosity() < 2 {
         return;
     }

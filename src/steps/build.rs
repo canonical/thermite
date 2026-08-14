@@ -73,11 +73,7 @@ pub async fn run_sbuild(
 
     match run_command("sbuild", &args, repo_dir, &[]).await {
         Ok(_) => Ok(SbuildResult::Success),
-        Err(crate::error::ThermiteError::CommandFailed {
-            stdout,
-            stderr,
-            ..
-        }) => {
+        Err(crate::error::ThermiteError::CommandFailed { stdout, stderr, .. }) => {
             // Find the most recent .build log sbuild may have produced.
             let parent = repo_dir.parent().unwrap_or(repo_dir);
             let log_path = find_latest_build_log(parent);
@@ -206,7 +202,10 @@ pub fn disable_self_build_test(repo_dir: &Path) -> Result<()> {
             skip_remaining -= 1;
             continue;
         }
-        if line.trim_start().starts_with("Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1") {
+        if line
+            .trim_start()
+            .starts_with("Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1")
+        {
             // Skip this line and the next two.
             skip_remaining = 2;
             continue;
@@ -216,7 +215,11 @@ pub fn disable_self_build_test(repo_dir: &Path) -> Result<()> {
 
     // Remove any leading blank lines that were left at the top of the file
     // after the block was removed.
-    while out_lines.first().map(|l| l.trim().is_empty()).unwrap_or(false) {
+    while out_lines
+        .first()
+        .map(|l| l.trim().is_empty())
+        .unwrap_or(false)
+    {
         out_lines.remove(0);
     }
 

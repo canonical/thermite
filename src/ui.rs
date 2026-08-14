@@ -36,7 +36,7 @@ pub fn print_phase_header(phase: u32, title: &str) {
 /// the visual style of [`print_info_box`] so it reads as a natural peer of
 /// "About this phase" without needing box-drawing characters.
 ///
-/// Call this after [`print_phase_explanation`] and before the parameters box
+/// Call this after [`crate::commands::backport::print_phase_explanation`] and before the parameters box
 /// so the user sees every check result before being asked to confirm.
 pub fn print_tool_checks(checks: &[(&str, bool)]) {
     if is_tty() {

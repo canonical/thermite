@@ -102,9 +102,7 @@ pub fn read_current_version(changelog_path: &Path) -> Result<String> {
     if version.is_empty() {
         return Err(crate::error::ThermiteError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "could not parse version from debian/changelog first line: '{first_line}'"
-            ),
+            format!("could not parse version from debian/changelog first line: '{first_line}'"),
         )));
     }
     Ok(version)

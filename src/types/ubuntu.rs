@@ -18,6 +18,7 @@ const KNOWN_RELEASES: &[(&str, &str)] = &[
     ("plucky", "25.04"),   // 25.04
     ("questing", "25.10"), // 25.10
     ("resolute", "26.04"), // 26.04 LTS
+    ("stonking", "26.10"), // 26.10
 ];
 
 /// A validated Ubuntu release adjective (e.g. `"noble"`).
@@ -42,7 +43,7 @@ impl UbuntuRelease {
     /// Return the numeric series identifier for this release (e.g. `"22.04"`).
     ///
     /// Panics if the release was somehow constructed with an unknown adjective,
-    /// which cannot happen through the public [`parse`] constructor.
+    /// which cannot happen through the public [`Self::parse`] constructor.
     pub fn series_number(&self) -> &'static str {
         KNOWN_RELEASES
             .iter()
@@ -76,9 +77,21 @@ mod tests {
 
     #[test]
     fn series_number_returns_correct_value() {
-        assert_eq!(UbuntuRelease::parse("jammy").unwrap().series_number(), "22.04");
-        assert_eq!(UbuntuRelease::parse("noble").unwrap().series_number(), "24.04");
-        assert_eq!(UbuntuRelease::parse("focal").unwrap().series_number(), "20.04");
-        assert_eq!(UbuntuRelease::parse("questing").unwrap().series_number(), "25.10");
+        assert_eq!(
+            UbuntuRelease::parse("jammy").unwrap().series_number(),
+            "22.04"
+        );
+        assert_eq!(
+            UbuntuRelease::parse("noble").unwrap().series_number(),
+            "24.04"
+        );
+        assert_eq!(
+            UbuntuRelease::parse("focal").unwrap().series_number(),
+            "20.04"
+        );
+        assert_eq!(
+            UbuntuRelease::parse("questing").unwrap().series_number(),
+            "25.10"
+        );
     }
 }

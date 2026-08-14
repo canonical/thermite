@@ -793,13 +793,20 @@ async fn run_interactive_local_build(
                 println!("  sbuild succeeded.");
                 return Ok(true);
             }
-            build::SbuildResult::Failure { log_path, stdout, stderr } => {
+            build::SbuildResult::Failure {
+                log_path,
+                stdout,
+                stderr,
+            } => {
                 let failures = log_path
                     .as_ref()
                     .and_then(|p| build::extract_test_failures(p).ok())
                     .unwrap_or_default();
 
-                let log_line = match log_path.as_ref().and_then(|p| std::fs::canonicalize(p).ok()) {
+                let log_line = match log_path
+                    .as_ref()
+                    .and_then(|p| std::fs::canonicalize(p).ok())
+                {
                     Some(abs) => format!("Build log: {}", abs.display()),
                     None => {
                         let snippet = if !stderr.trim().is_empty() {
@@ -808,7 +815,9 @@ async fn run_interactive_local_build(
                             stdout.trim()
                         };
                         let snippet: String = snippet.chars().take(400).collect();
-                        format!("sbuild failed before producing a build log. Captured output:\n{snippet}")
+                        format!(
+                            "sbuild failed before producing a build log. Captured output:\n{snippet}"
+                        )
                     }
                 };
 
@@ -880,7 +889,11 @@ async fn run_interactive_lintian(repo_dir: &Path) -> Result<()> {
     );
     let extra_log = repo_dir.join("lintian-extra.log");
     let _ = lintian::run_lintian(repo_dir, &["-i", "-I", "-E", "--pedantic"], &extra_log).await;
-    prompt_select("Review extra lints if desired, then continue.", &["Continue"], 0);
+    prompt_select(
+        "Review extra lints if desired, then continue.",
+        &["Continue"],
+        0,
+    );
 
     Ok(())
 }

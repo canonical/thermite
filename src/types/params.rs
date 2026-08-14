@@ -79,8 +79,16 @@ mod backport_params_tests {
     use crate::error::ThermiteError;
 
     fn valid_backport() -> BackportParams {
-        BackportParams::new("1.85.0", "noble", "jammy", "jdoe", "foundations", None, false)
-            .unwrap()
+        BackportParams::new(
+            "1.85.0",
+            "noble",
+            "jammy",
+            "jdoe",
+            "foundations",
+            None,
+            false,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -108,7 +116,13 @@ mod backport_params_tests {
     #[test]
     fn non_digit_bug_number_returns_error() {
         let result = BackportParams::new(
-            "1.85.0", "noble", "jammy", "jdoe", "foundations", Some("abc"), false,
+            "1.85.0",
+            "noble",
+            "jammy",
+            "jdoe",
+            "foundations",
+            Some("abc"),
+            false,
         );
         assert!(
             matches!(result, Err(ThermiteError::InvalidLpBugNumber(_))),
@@ -119,7 +133,13 @@ mod backport_params_tests {
     #[test]
     fn empty_bug_number_returns_error() {
         let result = BackportParams::new(
-            "1.85.0", "noble", "jammy", "jdoe", "foundations", Some(""), false,
+            "1.85.0",
+            "noble",
+            "jammy",
+            "jdoe",
+            "foundations",
+            Some(""),
+            false,
         );
         assert!(
             matches!(result, Err(ThermiteError::InvalidLpBugNumber(_))),
@@ -129,8 +149,15 @@ mod backport_params_tests {
 
     #[test]
     fn same_source_and_target_release_returns_error() {
-        let result =
-            BackportParams::new("1.85.0", "noble", "noble", "jdoe", "foundations", None, false);
+        let result = BackportParams::new(
+            "1.85.0",
+            "noble",
+            "noble",
+            "jdoe",
+            "foundations",
+            None,
+            false,
+        );
         assert!(
             matches!(result, Err(ThermiteError::InvalidBackportReleases(_))),
             "expected InvalidBackportReleases, got: {result:?}"
@@ -149,14 +176,28 @@ mod backport_params_tests {
 
     #[test]
     fn dry_run_flag_is_stored() {
-        let p =
-            BackportParams::new("1.85.0", "noble", "jammy", "jdoe", "foundations", None, true)
-                .unwrap();
+        let p = BackportParams::new(
+            "1.85.0",
+            "noble",
+            "jammy",
+            "jdoe",
+            "foundations",
+            None,
+            true,
+        )
+        .unwrap();
         assert!(p.dry_run, "dry_run should be stored as true");
 
-        let p2 =
-            BackportParams::new("1.85.0", "noble", "jammy", "jdoe", "foundations", None, false)
-                .unwrap();
+        let p2 = BackportParams::new(
+            "1.85.0",
+            "noble",
+            "jammy",
+            "jdoe",
+            "foundations",
+            None,
+            false,
+        )
+        .unwrap();
         assert!(!p2.dry_run, "dry_run should be stored as false");
     }
 }
