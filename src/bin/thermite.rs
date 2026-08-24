@@ -412,17 +412,17 @@ fn dispatch_version(cmd: VersionCommands) -> Result<()> {
             backport_revision,
             ppa,
         } => {
-            version::run_format(
-                &upstream,
-                repack,
-                series.as_deref(),
-                release.as_deref(),
+            version::run_format(&version::FormatParams {
+                upstream: &upstream,
+                repack_number: repack,
+                series: series.as_deref(),
+                release: release.as_deref(),
                 backport_repack,
                 stage0,
                 ubuntu_revision,
                 backport_revision,
                 ppa,
-            )?;
+            })?;
         }
 
         VersionCommands::Bump { operation } => {

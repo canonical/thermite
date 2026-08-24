@@ -21,8 +21,8 @@ pub fn run_parse(input: Option<&str>, json: bool) -> Result<()> {
     let v = RustcPackageVersion::parse(&version_str)?;
 
     if json {
-        let output = serde_json::to_string(&v)
-            .map_err(|e| ThermiteError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let output =
+            serde_json::to_string(&v).map_err(|e| ThermiteError::Io(std::io::Error::other(e)))?;
         println!("{output}");
     } else {
         print_parsed(&v);
@@ -39,36 +39,53 @@ pub fn run_explain(input: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Parameters for the `thermite version format` subcommand.
+///
+/// Collected into a struct to keep `run_format` below clippy's argument-count
+/// threshold and to mirror the `BackportParams` / `UpdateParams` convention.
+#[derive(Debug)]
+pub struct FormatParams<'a> {
+    /// Full upstream Rust version, e.g. `"1.95.0"`.
+    pub upstream: &'a str,
+    /// Optional `+dfsgN` repack number.
+    pub repack_number: Option<u32>,
+    /// Explicit Ubuntu series (e.g. `"24.04"`), as an alternative to `release`.
+    pub series: Option<&'a str>,
+    /// Ubuntu release adjective (e.g. `"noble"`), resolved to a series.
+    pub release: Option<&'a str>,
+    /// Repack number for the backport portion of the version.
+    pub backport_repack: Option<u32>,
+    /// Whether this is a stage0 (bootstrap) build.
+    pub stage0: bool,
+    /// Ubuntu revision after `0ubuntu`.
+    pub ubuntu_revision: u32,
+    /// Backport revision after the series suffix; defaults to `1` when a
+    /// series is present.
+    pub backport_revision: Option<u32>,
+    /// PPA number for a `~ppaN` suffix.
+    pub ppa: Option<u32>,
+}
+
 /// Run the `version format` subcommand.
-pub fn run_format(
-    upstream: &str,
-    repack_number: Option<u32>,
-    series: Option<&str>,
-    release: Option<&str>,
-    backport_repack: Option<u32>,
-    stage0: bool,
-    ubuntu_revision: u32,
-    backport_revision: Option<u32>,
-    ppa: Option<u32>,
-) -> Result<()> {
-    let upstream_ver = RustVersion::parse(upstream)?;
+pub fn run_format(params: &FormatParams<'_>) -> Result<()> {
+    let upstream_ver = RustVersion::parse(params.upstream)?;
 
     // Resolve the series: either directly provided or via release adjective.
-    let resolved_series = resolve_series(series, release)?;
+    let resolved_series = resolve_series(params.series, params.release)?;
 
     // Validate: backport-specific options require a series.
     if resolved_series.is_none() {
-        if backport_repack.is_some() {
+        if params.backport_repack.is_some() {
             return Err(ThermiteError::InvalidRustVersion(
                 "--backport-repack requires --series or --release".to_owned(),
             ));
         }
-        if stage0 {
+        if params.stage0 {
             return Err(ThermiteError::InvalidRustVersion(
                 "--stage0 requires --series or --release".to_owned(),
             ));
         }
-        if backport_revision.is_some() {
+        if params.backport_revision.is_some() {
             return Err(ThermiteError::InvalidRustVersion(
                 "--backport-revision requires --series or --release".to_owned(),
             ));
@@ -77,21 +94,21 @@ pub fn run_format(
 
     // Default backport_revision to 1 when series is present.
     let bp_rev = if resolved_series.is_some() {
-        Some(backport_revision.unwrap_or(1))
+        Some(params.backport_revision.unwrap_or(1))
     } else {
         None
     };
 
     let mut v = RustcPackageVersion::new(
         upstream_ver,
-        repack_number,
+        params.repack_number,
         resolved_series,
-        backport_repack,
-        stage0,
-        ubuntu_revision,
+        params.backport_repack,
+        params.stage0,
+        params.ubuntu_revision,
         bp_rev,
     );
-    v.set_ppa(ppa);
+    v.set_ppa(params.ppa);
 
     println!("{v}");
     Ok(())
@@ -146,8 +163,8 @@ pub fn run_bump(input: Option<&str>, operation: &BumpOperation, json: bool) -> R
     }
 
     if json {
-        let output = serde_json::to_string(&v)
-            .map_err(|e| ThermiteError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let output =
+            serde_json::to_string(&v).map_err(|e| ThermiteError::Io(std::io::Error::other(e)))?;
         println!("{output}");
     } else {
         println!("{v}");
@@ -458,50 +475,81 @@ mod tests {
 
     #[test]
     fn run_format_simple() {
-        run_format("1.95.0", None, None, None, None, false, 1, None, None).unwrap();
+        run_format(&FormatParams {
+            upstream: "1.95.0",
+            repack_number: None,
+            series: None,
+            release: None,
+            backport_repack: None,
+            stage0: false,
+            ubuntu_revision: 1,
+            backport_revision: None,
+            ppa: None,
+        })
+        .unwrap();
     }
 
     #[test]
     fn run_format_with_release() {
-        run_format(
-            "1.95.0",
-            None,
-            None,
-            Some("noble"),
-            None,
-            false,
-            1,
-            None,
-            None,
-        )
+        run_format(&FormatParams {
+            upstream: "1.95.0",
+            repack_number: None,
+            series: None,
+            release: Some("noble"),
+            backport_repack: None,
+            stage0: false,
+            ubuntu_revision: 1,
+            backport_revision: None,
+            ppa: None,
+        })
         .unwrap();
     }
 
     #[test]
     fn run_format_with_series() {
-        run_format(
-            "1.95.0",
-            Some(2),
-            Some("24.04"),
-            None,
-            None,
-            false,
-            3,
-            Some(1),
-            None,
-        )
+        run_format(&FormatParams {
+            upstream: "1.95.0",
+            repack_number: Some(2),
+            series: Some("24.04"),
+            release: None,
+            backport_repack: None,
+            stage0: false,
+            ubuntu_revision: 3,
+            backport_revision: Some(1),
+            ppa: None,
+        })
         .unwrap();
     }
 
     #[test]
     fn run_format_backport_repack_requires_series() {
-        let result = run_format("1.95.0", None, None, None, Some(1), false, 1, None, None);
+        let result = run_format(&FormatParams {
+            upstream: "1.95.0",
+            repack_number: None,
+            series: None,
+            release: None,
+            backport_repack: Some(1),
+            stage0: false,
+            ubuntu_revision: 1,
+            backport_revision: None,
+            ppa: None,
+        });
         assert!(result.is_err());
     }
 
     #[test]
     fn run_format_stage0_requires_series() {
-        let result = run_format("1.95.0", None, None, None, None, true, 1, None, None);
+        let result = run_format(&FormatParams {
+            upstream: "1.95.0",
+            repack_number: None,
+            series: None,
+            release: None,
+            backport_repack: None,
+            stage0: true,
+            ubuntu_revision: 1,
+            backport_revision: None,
+            ppa: None,
+        });
         assert!(result.is_err());
     }
 

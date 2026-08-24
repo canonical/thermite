@@ -298,10 +298,11 @@ fn strip_ppa_suffix(s: &str) -> (&str, Option<u32>) {
     // Look for the last occurrence of "~ppa" followed by digits.
     if let Some(ppa_pos) = s.rfind("~ppa") {
         let after_ppa = &s[ppa_pos + 4..]; // skip "~ppa"
-        if !after_ppa.is_empty() && after_ppa.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(n) = after_ppa.parse::<u32>() {
-                return (&s[..ppa_pos], Some(n));
-            }
+        if !after_ppa.is_empty()
+            && after_ppa.chars().all(|c| c.is_ascii_digit())
+            && let Ok(n) = after_ppa.parse::<u32>()
+        {
+            return (&s[..ppa_pos], Some(n));
         }
     }
     (s, None)
