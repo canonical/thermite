@@ -1,6 +1,7 @@
 pub mod autopkgtest;
 pub mod build;
 pub mod changelog;
+pub mod compat;
 pub mod control;
 pub mod copyright;
 pub mod gbp;

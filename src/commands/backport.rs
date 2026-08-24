@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::error::{Result, ThermiteError};
 use crate::shell;
-use crate::steps::{build, changelog, git, lintian, ppa, uscan, vendor};
+use crate::steps::{build, changelog, compat, git, lintian, ppa, uscan, vendor};
 use crate::types::params::BackportParams;
 use crate::ui::{
     confirm_sink, print_info_box, print_phase_header, print_tool_checks, prompt_input,
@@ -79,32 +79,35 @@ const PHASE_DOCS: &[PhaseDoc] = &[
             across series.",
         anchor: "#changelog-version",
     },
-    // Phase 4 — Orig Tarball
+    // Phase 4 — Compatibility Checks
+    PhaseDoc {
+        explanation: "The target release's archive may have older versions of build \
+            dependencies than the source release's packaging assumes. Six compatibility \
+            checks are performed in order before tarball generation: \
+            (1) LLVM version, (2) libgit2 version, (3) dh-cargo availability, \
+            (4) pkgconf availability, (5) cmake version, (6) debhelper-compat level. \
+            Each check infers the required version from the source packaging, queries \
+            the archive via rmadison, and reports whether action is needed. Fixes are \
+            applied before the orig tarball is generated so that vendored sources \
+            (e.g. LLVM, libgit2) are included in a single uscan run.",
+        anchor: "#common-backporting-changes",
+    },
+    // Phase 5 — Orig Tarball
     PhaseDoc {
         explanation: "uscan downloads and filters the upstream Rust source according to \
             'Files-Excluded' in debian/copyright. If LLVM or libgit2 vendoring is needed \
-            (see the compatibility checks in Phase 6), 'Files-Excluded' must be edited first \
+            (see the compatibility checks in Phase 4), 'Files-Excluded' must be edited first \
             and the tarball regenerated before running this phase. The tarball is renamed to include \
             '~<series>' so its filename matches the backport version string.",
         anchor: "#generating-the-orig-tarball",
     },
-    // Phase 5 — Vendor Tarball
+    // Phase 6 — Vendor Tarball
     PhaseDoc {
         explanation: "Generates the orig-vendor tarball containing filtered Cargo crate \
             dependencies. This requires a local Rust toolchain at the exact patch version \
             being packaged (installed via rustup). Only applies to Rust 1.89 and later; \
             earlier versions bundle vendored crates directly in the orig tarball.",
         anchor: "#generating-the-orig-vendor-tarball",
-    },
-    // Phase 6 — Compatibility Checks
-    PhaseDoc {
-        explanation: "The target release's archive may have older versions of build \
-            dependencies than the source release's packaging assumes. Six compatibility \
-            checks must be performed in order before attempting to build: \
-            (1) LLVM version, (2) libgit2 version, (3) dh-cargo availability, \
-            (4) pkgconf availability, (5) cmake version, (6) debhelper-compat level. \
-            Each check is independent and multiple may apply to the same backport.",
-        anchor: "#common-backporting-changes",
     },
     // Phase 7 — Disable Self-Build Test
     PhaseDoc {
@@ -560,9 +563,132 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         println!("  Backport changelog entry already committed — nothing to commit.");
     }
 
-    // ── Phase 4: Generate Orig Tarball ───────────────────────────────────────
-    print_phase_header(4, "Generate Orig Tarball");
+    // ── Phase 4: Compatibility Checks ────────────────────────────────────────
+    print_phase_header(4, "Compatibility Checks");
     print_phase_explanation(4);
+
+    info!("running compatibility checks for target release {}", release);
+    let check_results = compat::run_all_checks(repo_dir, release).await;
+
+    // Track how many checks need attention so the summary line is accurate.
+    let mut ok_count = 0usize;
+    let mut attention_count = 0usize;
+    let mut infer_failed_count = 0usize;
+    let mut archive_check_failed_count = 0usize;
+
+    for result in &check_results {
+        println!("\n  {}", result.name);
+        match &result.inference {
+            compat::Inference::Inferred { value, source } => {
+                if value.is_empty() {
+                    println!("    Inferred: (no version constraint) ({source})");
+                } else {
+                    println!("    Inferred: {value} ({source})");
+                }
+            }
+            compat::Inference::CouldNotInfer(reason) => {
+                println!("    Could not infer automatically.");
+                println!("    Reason: {reason}");
+                infer_failed_count += 1;
+            }
+        }
+
+        match &result.archive_status {
+            compat::ArchiveStatus::Available(version) => {
+                println!("    Archive: \u{2714} available ({version})");
+                if result.inference.is_inferred() {
+                    ok_count += 1;
+                }
+            }
+            compat::ArchiveStatus::TooOld { available, required } => {
+                println!(
+                    "    Archive: \u{2717} too old — available {available}, required {required}"
+                );
+                attention_count += 1;
+            }
+            compat::ArchiveStatus::NotPublished => {
+                println!("    Archive: \u{2717} not published in {release}");
+                attention_count += 1;
+            }
+            compat::ArchiveStatus::CheckFailed(detail) => {
+                println!("    Archive: could not check ({detail})");
+                archive_check_failed_count += 1;
+            }
+        }
+
+        if !result.is_ok() {
+            if !result.guidance.is_empty() {
+                println!("    Action needed: {}", result.guidance);
+            }
+            println!("    Reference: {}", result.url);
+        }
+    }
+
+    // Print a summary line.
+    println!();
+    let total = check_results.len();
+    if attention_count == 0
+        && infer_failed_count == 0
+        && archive_check_failed_count == 0
+    {
+        println!(
+            "  Summary: {ok_count}/{total} checks passed — no action needed."
+        );
+    } else {
+        let parts: Vec<String> = [
+            if attention_count > 0 {
+                format!("{attention_count} need attention")
+            } else {
+                String::new()
+            },
+            if infer_failed_count > 0 {
+                format!("{infer_failed_count} could not infer")
+            } else {
+                String::new()
+            },
+            if archive_check_failed_count > 0 {
+                format!("{archive_check_failed_count} archive check failed")
+            } else {
+                String::new()
+            },
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+        println!(
+            "  Summary: {ok_count}/{total} checks passed, {}.",
+            parts.join(", ")
+        );
+
+        print_info_box(
+            "Guidance for checks needing attention",
+            &[
+                "Apply all needed changes to debian/control, debian/control.in,",
+                "debian/copyright, debian/rules, and debian/config.toml.in as",
+                "described above. Commit them together before continuing.",
+                "",
+                "If LLVM or libgit2 vendoring is needed, the orig tarball (Phase 5)",
+                "must be regenerated after editing Files-Excluded in debian/copyright.",
+                "",
+                "Full documentation:",
+                "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
+            ],
+        );
+    }
+
+    if prompt_select(
+        "All applicable compatibility changes worked through and committed?",
+        &["Continue", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // ── Phase 5: Generate Orig Tarball ───────────────────────────────────────
+    print_phase_header(5, "Generate Orig Tarball");
+    print_phase_explanation(5);
 
     // The expected final tarball name encodes the target series suffix so that
     // the filename matches the backport version string (e.g. ~20.04).
@@ -575,7 +701,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         &[
             "Choose how to provide the orig tarball for this backport:",
             "",
-            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 6). uscan will run now; takes 20–60 minutes.",
+            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 4). uscan will run now; takes 20–60 minutes.",
             "",
             "  DOWNLOAD   — No Files-Excluded change; tarball not yet local. Download from the staging PPA, name the file exactly:",
             &format!("               {expected_tarball_name}"),
@@ -654,9 +780,9 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     };
     println!("  Orig tarball: {}", tarball.display());
 
-    // ── Phase 5: Generate Orig-Vendor Tarball ────────────────────────────────
-    print_phase_header(5, "Generate Orig-Vendor Tarball");
-    print_phase_explanation(5);
+    // ── Phase 6: Generate Orig-Vendor Tarball ────────────────────────────────
+    print_phase_header(6, "Generate Orig-Vendor Tarball");
+    print_phase_explanation(6);
 
     info!("installing Rust toolchain {rust_ver}");
     let rust_bootstrap_dir = vendor::rustup_install_toolchain(rust_ver).await?;
@@ -710,57 +836,6 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     };
     println!("  Vendor tarball: {}", vendor_tarball.display());
 
-    // ── Phase 6: Compatibility Checks ────────────────────────────────────────
-    print_phase_header(6, "Compatibility Checks");
-    print_phase_explanation(6);
-
-    // Build the check list with the target release adjective interpolated
-    // into the Launchpad URLs (e.g. focal, jammy). The LLVM toolchain
-    // number <N> stays as a placeholder — the user greps debian/rules for
-    // the LLVM_VERSION assignment.
-    print_info_box(
-        "Work through each compatibility check before building",
-        &[
-            "Check each item in order. Apply ALL changes before proceeding.",
-            "After completing all applicable changes, commit them together.",
-            "",
-            "LLVM availability",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/llvm-toolchain-<N>"),
-            "  If 404 / not published: vendor LLVM (remove src/llvm-project from Files-Excluded, regenerate tarball, update control/config.toml.in/rules).",
-            "",
-            "libgit2 availability",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/libgit2"),
-            "  If archive version < required: downgrade version constraint, or vendor libgit2 (comment out exclusion, regenerate tarball, update control).",
-            "",
-            "dh-cargo (>= 28ubuntu1~) availability",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/dh-cargo"),
-            "  If absent: comment out dh-cargo from Build-Depends; remove dh-cargo-vendored-sources check from debian/rules.",
-            "",
-            "pkgconf availability",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/pkgconf"),
-            "  If absent: replace pkgconf with pkg-config in control files; add 'export PKG_CONFIG=pkg-config' to debian/rules.",
-            "",
-            "cmake version (>= 3.0)",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/cmake"),
-            "  If too old: add cmake-mozilla (>= 3.0) as fallback in control files.",
-            "",
-            "debhelper-compat level",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/debhelper"),
-            "  If required compat level absent: downgrade debhelper-compat in control files and update .install.in substitution variables.",
-            "",
-            "Full documentation: see the official backport-rust guide.",
-        ],
-    );
-    if prompt_select(
-        "All applicable compatibility changes worked through and committed?",
-        &["Continue", "Abort"],
-        0,
-    ) != 0
-    {
-        println!("Aborted.");
-        return Ok(());
-    }
-
     // ── Phase 7: Disable Autopkgtest Self-Build Test ─────────────────────────
     // H2 fix: this phase is now before the local build.
     print_phase_header(7, "Disable Autopkgtest Self-Build Test");
@@ -800,7 +875,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_info_box(
         "About to run sbuild",
         &[
-            "The local build may fail if the target Ubuntu release has older versions of certain dependencies. Use the Phase 6 compatibility guidance to diagnose failures.",
+            "The local build may fail if the target Ubuntu release has older versions of certain dependencies. Use the Phase 4 compatibility guidance to diagnose failures.",
             "",
             "Consult the backporting guide for detailed diagnostics:",
             "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
@@ -1296,7 +1371,7 @@ async fn run_interactive_local_build(
                         "Consult the backporting guide for common fixes:",
                         "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
                         "",
-                        "Quick reference (see Phase 6 compatibility guidance for details):",
+                        "Quick reference (see Phase 4 compatibility guidance for details):",
                         "  LLVM too old       → vendor LLVM from src/llvm-project",
                         "  libgit2 too old    → downgrade or vendor libgit2",
                         "  dh-cargo missing   → comment out from Build-Depends",
