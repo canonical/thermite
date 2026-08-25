@@ -63,11 +63,15 @@ const PHASE_DOCS: &[PhaseDoc] = &[
     },
     // Phase 2 — Git Branch
     PhaseDoc {
-        explanation: "Creates a local branch '<release>-X.Y' from '<source_release>-X.Y'. \
+        explanation: "Creates a local branch '<release>-X.Y' from '<source_release>-X.Y' for \
+            stable-to-stable backports. When backporting from the current devel \
+            release, the '<source_release>-X.Y' branch does not exist yet — the \
+            authoritative source lives on 'merge-X.Y' instead, and thermite \
+            probes the Foundations remote to pick the right branch automatically. \
             Backports must go one release at a time (e.g. Noble→Jammy, never \
-            Questing→Jammy directly) to isolate release-specific failures and provide \
-            stable checkpoints. The branch is not pushed to the Foundations repository \
-            until Phase 14, after autopkgtests pass.",
+            Questing→Jammy directly) to isolate release-specific failures and \
+            provide stable checkpoints. The branch is not pushed to the \
+            Foundations repository until Phase 14, after autopkgtests pass.",
         anchor: "#setup",
     },
     // Phase 3 — Changelog
@@ -265,6 +269,29 @@ async fn generate_vendor_tarball_for_backport(
     .await
 }
 
+/// Pure decision logic for the source-branch resolver used in Phase 2.
+///
+/// Given the two candidate branch names (`primary` = `<source_release>-X.Y`,
+/// `fallback` = `merge-X.Y`) and whether each exists on the remote, return the
+/// branch name to check out, or `None` if neither exists (in which case the
+/// caller prompts the user for a branch name interactively).
+///
+/// Extracted as a free function so it can be unit-tested without touching git.
+fn resolve_source_branch_name<'a>(
+    primary: &'a str,
+    fallback: &'a str,
+    has_primary: bool,
+    has_fallback: bool,
+) -> Option<&'a str> {
+    if has_primary {
+        Some(primary)
+    } else if has_fallback {
+        Some(fallback)
+    } else {
+        None
+    }
+}
+
 /// Run the full `thermite backport` workflow.
 pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     let rust_ver = &params.rust_version;
@@ -281,7 +308,13 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     let pkg_name = format!("rustc-{rust_short}");
     let bugs_url = format!("https://bugs.launchpad.net/ubuntu/+source/{pkg_name}");
     let filebug_url = format!("{bugs_url}/+filebug");
-    let source_branch = format!("{source_release}-{rust_short}");
+    // Primary candidate for the source branch. When the source release is a
+    // stable release, this branch exists on the Foundations remote. When the
+    // source release is the current devel release, this branch does not exist
+    // yet — the authoritative source lives on `merge-X.Y` instead. Phase 2
+    // resolves the actual branch to use by probing the remote.
+    let primary_source_branch = format!("{source_release}-{rust_short}");
+    let fallback_source_branch = format!("merge-{rust_short}");
     let target_branch = format!("{release}-{rust_short}");
     let ppa_name = format!("rustc-{rust_short}-{release}");
     let parent_dir = repo_dir.parent().unwrap_or(repo_dir).to_path_buf();
@@ -336,7 +369,113 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             &format!("  Repo dir         : {}", repo_dir.display()),
         ],
     );
-    if prompt_select("Proceed with these parameters?", &["Proceed", "Abort"], 0) != 0 {
+
+    // If the user passed `--source-release devel`, surface the resolved
+    // concrete adjective before any further processing so that the rest of
+    // the output (and the adjacency check) is unambiguous.
+    if params.source_release_is_devel_alias {
+        println!(
+            "  Note: --source-release 'devel' resolved to '{source_release}' \
+             (current Ubuntu development release)."
+        );
+    }
+
+    // ── One-release-at-a-time adjacency check ─────────────────────────────
+    //
+    // Backports should go one release at a time along the LTS+devel chain
+    // (e.g. devel→resolute→noble→jammy→focal) so that release-specific
+    // failures are isolated and each step has a stable checkpoint. When the
+    // source and target span more than one step on that chain, warn the user
+    // and list the skipped intermediate releases before proceeding.
+    let source_pos = params.source_release.chain_position();
+    let target_pos = params.release.chain_position();
+    let proceed_prompt = match (source_pos, target_pos) {
+        (Some(sp), Some(tp)) => {
+            let distance = sp.abs_diff(tp);
+            if distance <= 1 {
+                // Adjacent (or the same release, which params validation
+                // already rejects) — no warning.
+                "Proceed with these parameters?"
+            } else {
+                // Both in the chain but not adjacent — multi-step backport.
+                let (upper, lower) = if sp > tp { (sp, tp) } else { (tp, sp) };
+                let chain = crate::types::ubuntu::UbuntuRelease::backport_chain();
+                let skipped: Vec<String> = chain[lower + 1..upper]
+                    .iter()
+                    .map(|name| {
+                        let r = crate::types::ubuntu::UbuntuRelease::parse(name)
+                            .expect("chain entries are valid releases");
+                        let series = r.series_number();
+                        let kind = if r.is_devel() { "devel" } else { "LTS" };
+                        format!("  - {name} (series {series}, {kind})")
+                    })
+                    .collect();
+                let skipped_block = skipped.join("\n");
+                let source_kind = if params.source_release.is_devel() {
+                    "devel"
+                } else {
+                    "LTS"
+                };
+                let target_kind = if params.release.is_devel() {
+                    "devel"
+                } else {
+                    "LTS"
+                };
+                print_info_box(
+                    "Multi-step backport detected",
+                    &[
+                        &format!(
+                            "  Source : {source_release} (series {source_series}, {source_kind})"
+                        ),
+                        &format!("  Target : {release} (series {target_series}, {target_kind})"),
+                        "",
+                        "This backport spans more than one release on the LTS+devel chain:",
+                        &skipped_block,
+                        "",
+                        "Backporting one release at a time is recommended so that \
+                         release-specific failures are isolated and each step has a \
+                         stable checkpoint. Backport through each skipped release \
+                         in turn before attempting this longer hop.",
+                    ],
+                );
+                "Proceed with this multi-step backport anyway?"
+            }
+        }
+        _ => {
+            // At least one release is not in the LTS+devel chain (a non-LTS,
+            // non-devel release such as `oracular` or `questing`).
+            let non_lts: Vec<String> = [
+                (&params.source_release, "source"),
+                (&params.release, "target"),
+            ]
+            .iter()
+            .filter(|(r, _)| r.chain_position().is_none())
+            .map(|(r, role)| {
+                format!(
+                    "  - {role}: {} (series {}, non-LTS, non-devel)",
+                    r.as_str(),
+                    r.series_number()
+                )
+            })
+            .collect();
+            print_info_box(
+                "Non-LTS release in backport",
+                &[
+                    "Backports normally target Ubuntu LTS releases. The following \
+                     release(s) in this backport are not LTS and not the current \
+                     devel release:",
+                    &non_lts.join("\n"),
+                    "",
+                    "The one-release-at-a-time check only applies to the LTS+devel \
+                     chain and is skipped here. Proceed with caution — non-LTS \
+                     releases may not have the full bootstrapping chain available.",
+                ],
+            );
+            "Proceed with these parameters?"
+        }
+    };
+
+    if prompt_select(proceed_prompt, &["Proceed", "Abort"], 0) != 0 {
         println!("Aborted.");
         return Ok(());
     }
@@ -467,13 +606,97 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         info!("fetching all remotes");
         git::fetch_all(repo_dir).await?;
 
-        info!("checking out {source_branch}");
-        git::checkout_branch(repo_dir, &source_branch).await?;
+        // Resolve the source branch to check out from. The primary candidate
+        // is `<source_release>-X.Y` (used for stable-to-stable backports). When
+        // the source release is the current devel release, that branch does not
+        // exist yet — the authoritative source lives on `merge-X.Y` instead.
+        // Probe the Foundations remote to decide which to use.
+        let is_devel_source = params.source_release.is_devel();
+        let has_primary =
+            git::remote_branch_exists(repo_dir, git_remote, &primary_source_branch).await?;
+        let has_fallback =
+            git::remote_branch_exists(repo_dir, git_remote, &fallback_source_branch).await?;
+
+        let resolved_source_branch: String = match resolve_source_branch_name(
+            &primary_source_branch,
+            &fallback_source_branch,
+            has_primary,
+            has_fallback,
+        ) {
+            Some(branch) => {
+                if branch == fallback_source_branch {
+                    // We're falling back to `merge-X.Y`. Explain why.
+                    if is_devel_source {
+                        print_info_box(
+                            "Backporting from the current devel release",
+                            &[
+                                &format!(
+                                    "  {source_release} is the current Ubuntu development release."
+                                ),
+                                &format!(
+                                    "  No '{primary_source_branch}' branch exists yet on '{git_remote}';"
+                                ),
+                                &format!(
+                                    "  using the authoritative development branch '{fallback_source_branch}' instead."
+                                ),
+                                "",
+                                &format!(
+                                    "  Once {source_release} is released, a '{primary_source_branch}' branch"
+                                ),
+                                "  will be created and this fallback will no longer be needed.",
+                            ],
+                        );
+                    } else {
+                        print_info_box(
+                            "Source branch fallback",
+                            &[
+                                &format!(
+                                    "  No '{primary_source_branch}' branch found on '{git_remote}'."
+                                ),
+                                &format!(
+                                    "  Falling back to '{fallback_source_branch}' as the source branch."
+                                ),
+                            ],
+                        );
+                    }
+                }
+                branch.to_owned()
+            }
+            None => {
+                // Neither candidate exists — prompt the user for the branch.
+                print_info_box(
+                    "Source branch not found",
+                    &[
+                        &format!(
+                            "Neither '{primary_source_branch}' nor '{fallback_source_branch}' exists on '{git_remote}'."
+                        ),
+                        "",
+                        "This may mean:",
+                        &format!(
+                            "  - the source release backport has not been pushed to '{git_remote}' yet, or"
+                        ),
+                        "  - the source release uses a non-standard branch naming convention.",
+                        "",
+                        "Enter the name of the branch to use as the backport source,",
+                        "or leave blank to abort.",
+                    ],
+                );
+                let input = prompt_input("Source branch name:");
+                if input.is_empty() {
+                    println!("\n  Aborted.");
+                    return Ok(());
+                }
+                input
+            }
+        };
+
+        info!("checking out {resolved_source_branch}");
+        git::checkout_branch(repo_dir, &resolved_source_branch).await?;
 
         info!("creating branch {target_branch}");
         crate::shell::run_command("git", &["checkout", "-b", &target_branch], repo_dir, &[])
             .await?;
-        println!("  Branch '{target_branch}' created from '{source_branch}'.");
+        println!("  Branch '{target_branch}' created from '{resolved_source_branch}'.");
     }
 
     // ── Phase 3: Update Changelog ────────────────────────────────────────────
@@ -1518,6 +1741,40 @@ mod tests {
         assert!(
             arg.contains("jammy main"),
             "expected release name in extra-repository arg, got: {arg}"
+        );
+    }
+
+    #[test]
+    fn resolve_source_branch_name_prefers_primary_when_present() {
+        assert_eq!(
+            resolve_source_branch_name("resolute-1.85", "merge-1.85", true, true),
+            Some("resolute-1.85")
+        );
+    }
+
+    #[test]
+    fn resolve_source_branch_name_falls_back_to_merge_when_primary_absent() {
+        assert_eq!(
+            resolve_source_branch_name("stonking-1.85", "merge-1.85", false, true),
+            Some("merge-1.85")
+        );
+    }
+
+    #[test]
+    fn resolve_source_branch_name_returns_none_when_both_absent() {
+        assert_eq!(
+            resolve_source_branch_name("stonking-1.85", "merge-1.85", false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_source_branch_name_returns_none_when_only_primary_absent_and_no_fallback() {
+        // primary absent, fallback absent → None (covered above, but assert the
+        // asymmetric case explicitly for clarity).
+        assert_eq!(
+            resolve_source_branch_name("resolute-1.85", "merge-1.85", false, false),
+            None
         );
     }
 }

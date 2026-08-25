@@ -172,7 +172,7 @@ Adapts an existing versioned `rustc-X.Y` package for an older Ubuntu release.
 ```
 thermite backport [OPTIONS]
   -u, --rust-version      <X.Y.Z>   Rust version to backport        (e.g. 1.85.0)
-  -s, --source-release    <NAME>    Ubuntu release to port FROM      (e.g. noble)
+  -s, --source-release    <NAME>    Ubuntu release to port FROM      (e.g. noble, or 'devel')
   -r, --release           <NAME>    Ubuntu release to port TO        (e.g. jammy)
   -l, --lpuser            <NAME>    Launchpad username
   -b, --lp-bug-number     <NUMBER>  Launchpad bug ID (optional; omit for proactive backports)
@@ -264,7 +264,7 @@ start of each phase.
 |-------|-------------|------|
 | 0 | Preflight checks — verify required tools and repository layout | Automated |
 | 1 | Create a Launchpad bug report (optional for proactive backports) | Interactive |
-| 2 | Set up Git branch (`<release>-X.Y` from `<source_release>-X.Y`) | Automated |
+| 2 | Set up Git branch (`<release>-X.Y` from `<source_release>-X.Y`, or `merge-X.Y` when the source is the devel release) | Automated |
 | 3 | Compute and apply backport version string; update `debian/changelog` | Automated |
 | 4 | Generate orig tarball with `uscan`; rename to include `~<series>` suffix | Automated |
 | 5 | Generate orig-vendor tarball with `debian/rules vendor-tarball` | Automated |
