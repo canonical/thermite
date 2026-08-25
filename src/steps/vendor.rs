@@ -62,6 +62,14 @@ pub async fn generate_vendor_tarball(
     version: &RustVersion,
     dfsg_suffix: &str,
 ) -> Result<PathBuf> {
+    let parent = repo_dir.parent().unwrap_or(repo_dir);
+    for temp in ["vendor", "std-vendor"] {
+        let dir = parent.join(temp);
+        if dir.is_dir() {
+            std::fs::remove_dir_all(&dir).map_err(crate::error::ThermiteError::Io)?;
+        }
+    }
+
     let bootstrap_str = rust_bootstrap_dir.to_string_lossy().to_string();
     run_command(
         "debian/rules",
@@ -72,8 +80,7 @@ pub async fn generate_vendor_tarball(
     .await?;
 
     // Finding 6: construct the expected filename deterministically from the
-    // Rust version rather than picking the first .orig-vendor.tar.xz found.
-    let parent = repo_dir.parent().unwrap_or(repo_dir);
+    // Rust version rather than picking the first matching .orig-vendor.tar.xz found.
     let short = version.short();
     let tarball_name = format!("rustc-{short}_{version}+dfsg{dfsg_suffix}.orig-vendor.tar.xz");
     let tarball_path = parent.join(&tarball_name);
