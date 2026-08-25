@@ -54,10 +54,10 @@ impl UbuntuRelease {
 
     /// Return the adjective of the current Ubuntu development release.
     ///
-    /// The devel release is defined as the **last** entry in
-    /// [`KNOWN_RELEASES`]. This list is appended to as new Ubuntu releases are
-    /// announced, so the value returned here tracks the current devel release
-    /// as long as the list is kept up to date.
+    /// The devel release is defined as the **last** entry in `KNOWN_RELEASES`.
+    /// This list is appended to as new Ubuntu releases are announced, so the
+    /// value returned here tracks the current devel release as long as the
+    /// list is kept up to date.
     pub fn devel() -> &'static str {
         KNOWN_RELEASES
             .last()
@@ -75,10 +75,10 @@ impl UbuntuRelease {
     }
 
     /// Return `true` when this release is the current Ubuntu development
-    /// release (i.e. the last entry in [`KNOWN_RELEASES`]).
+    /// release (i.e. the last entry in `KNOWN_RELEASES`).
     ///
     /// This is a **static** heuristic: it is correct only as long as
-    /// [`KNOWN_RELEASES`] is kept up to date with the release cadence. Callers
+    /// `KNOWN_RELEASES` is kept up to date with the release cadence. Callers
     /// that need to be robust against the devel→stable transition should treat
     /// this as a hint for messaging only, not as the source of truth for
     /// branch-name decisions.
@@ -91,7 +91,7 @@ impl UbuntuRelease {
     /// LTS releases fall on even-numbered years in April (`YY.04`). This is
     /// derived from [`series_number()`](Self::series_number) rather than a
     /// static list so that it stays correct as new LTS releases are appended
-    /// to [`KNOWN_RELEASES`].
+    /// to `KNOWN_RELEASES`.
     pub fn is_lts(&self) -> bool {
         let series = self.series_number();
         let (year, month) = series
@@ -105,9 +105,9 @@ impl UbuntuRelease {
     /// current devel release down to the oldest supported LTS.
     ///
     /// The chain consists of the current devel release (the last entry in
-    /// [`KNOWN_RELEASES`]) followed by every LTS release in
-    /// [`KNOWN_RELEASES`], newest-first. Non-LTS, non-devel releases are
-    /// excluded — backports normally go one LTS at a time.
+    /// `KNOWN_RELEASES`) followed by every LTS release in `KNOWN_RELEASES`,
+    /// newest-first. Non-LTS, non-devel releases are excluded — backports
+    /// normally go one LTS at a time.
     ///
     /// Example (today): `["stonking", "resolute", "noble", "jammy", "focal"]`.
     pub fn backport_chain() -> Vec<&'static str> {
@@ -123,7 +123,7 @@ impl UbuntuRelease {
         chain
     }
 
-    /// Return the position of this release in [`backport_chain()`], or
+    /// Return the position of this release in [`Self::backport_chain()`], or
     /// `None` when the release is not part of the LTS+devel chain (i.e. it is
     /// a non-LTS, non-devel release such as `oracular` or `questing`).
     pub fn chain_position(&self) -> Option<usize> {
@@ -134,8 +134,8 @@ impl UbuntuRelease {
 
     /// Return `true` when `series` (a `"YY.MM"` string) is an LTS series.
     ///
-    /// Helper for [`backport_chain`] / [`is_lts`] so the LTS test lives in
-    /// one place.
+    /// Helper for [`Self::backport_chain`] / [`Self::is_lts`] so the LTS test
+    /// lives in one place.
     fn series_is_lts(series: &str) -> bool {
         let Some((year, month)) = series.split_once('.') else {
             return false;
