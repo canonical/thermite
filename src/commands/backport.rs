@@ -516,7 +516,9 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
                 &[
                     "No LP bug number was provided. This is fine for proactive backports.",
                     "",
-                    &format!("First, check whether there are already open bugs against {pkg_name}:"),
+                    &format!(
+                        "First, check whether there are already open bugs against {pkg_name}:"
+                    ),
                     &format!("  {bugs_url}"),
                     "",
                     "If this backport is for a specific reason (e.g. a package that needs a newer Rust to build), file a Launchpad bug:",
