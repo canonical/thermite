@@ -175,34 +175,41 @@ Build a table of the form:
 
 Using the table from § 1.2, derive the complete ordered list of `(X.Y, source_release, release)` triples.
 
+**The backport chain.** Backports traverse the **LTS+devel chain**: the current devel release,
+then each LTS release newest-to-oldest. Today the chain is:
+
+```
+Stonking (devel) → Resolute (26.04 LTS) → Noble (24.04 LTS) → Jammy (22.04 LTS) → Focal (20.04 LTS)
+```
+
+Backports go **one release at a time** along this chain so that release-specific failures are
+isolated and each step has a stable checkpoint. Non-LTS, non-devel releases (e.g. Oracular,
+Questing) are not on the chain; thermite warns when a backport involves a non-LTS release.
+
 **Algorithm:**
 
 1. For the final target release (e.g. Jammy), list every Rust version between the current version
    in that release (exclusive) and the desired target version (inclusive). These are all the
    intermediate versions that must be backported.
-2. For each intermediate version, backport it from the release that was just above it in the chain,
-   working top-down through the release list.
-3. For each `(X.Y, release)` pair, the `source_release` is the next higher Ubuntu release that
+2. For each intermediate version, backport it from the release that is one step above it on the
+   chain, working top-down.
+3. For each `(X.Y, release)` pair, the `source_release` is the next release up the chain that
    already has `X.Y` either in its archive or in the staging PPA.
 
-**Example — backporting `rustc-1.86` to Jammy:**
+**Example — backporting `rustc-1.86` to Jammy from Resolute:**
 
 | Step | X.Y    | source_release | release |
 | ---- | ------ | -------------- | ------- |
-| 1    | `1.84` | Plucky         | Noble   |
-| 2    | `1.84` | Noble          | Jammy   |
-| 3    | `1.85` | Plucky         | Noble   |
-| 4    | `1.85` | Noble          | Jammy   |
-| 5    | `1.86` | Questing       | Plucky  |
-| 6    | `1.86` | Plucky         | Noble   |
-| 7    | `1.86` | Noble          | Jammy   |
+| 1    | `1.86` | Stonking (devel) | Resolute |
+| 2    | `1.86` | Resolute       | Noble   |
+| 3    | `1.86` | Noble          | Jammy   |
 
 Execute each row in the order given. Do not start row N+1 until row N's package has successfully
 built and been uploaded to the staging PPA (§ 3.9).
 
 > **Requires:** Archive and staging PPA queried for current rustc versions.  
-> **Ensures:** A complete, ordered work plan of `(X.Y, source_release, release)` triples exists.  
-> **On failure:** If the current archive state is unexpected (e.g. a version is present in Noble but not in Plucky), investigate before proceeding. The chain must be consistent.
+> **Ensures:** A complete, ordered work plan of `(X.Y, source_release, release)` triples exists, with each step adjacent on the LTS+devel chain.  
+> **On failure:** If the current archive state is unexpected (e.g. a version is present in Noble but not in Resolute), investigate before proceeding. The chain must be consistent.
 
 ---
 

@@ -366,7 +366,103 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             &format!("  Repo dir         : {}", repo_dir.display()),
         ],
     );
-    if prompt_select("Proceed with these parameters?", &["Proceed", "Abort"], 0) != 0 {
+
+    // ── One-release-at-a-time adjacency check ─────────────────────────────
+    //
+    // Backports should go one release at a time along the LTS+devel chain
+    // (e.g. devel→resolute→noble→jammy→focal) so that release-specific
+    // failures are isolated and each step has a stable checkpoint. When the
+    // source and target span more than one step on that chain, warn the user
+    // and list the skipped intermediate releases before proceeding.
+    let source_pos = params.source_release.chain_position();
+    let target_pos = params.release.chain_position();
+    let proceed_prompt = match (source_pos, target_pos) {
+        (Some(sp), Some(tp)) => {
+            let distance = sp.abs_diff(tp);
+            if distance <= 1 {
+                // Adjacent (or the same release, which params validation
+                // already rejects) — no warning.
+                "Proceed with these parameters?"
+            } else {
+                // Both in the chain but not adjacent — multi-step backport.
+                let (upper, lower) = if sp > tp { (sp, tp) } else { (tp, sp) };
+                let chain = crate::types::ubuntu::UbuntuRelease::backport_chain();
+                let skipped: Vec<String> = chain[lower + 1..upper]
+                    .iter()
+                    .map(|name| {
+                        let r = crate::types::ubuntu::UbuntuRelease::parse(name)
+                            .expect("chain entries are valid releases");
+                        let series = r.series_number();
+                        let kind = if r.is_devel() { "devel" } else { "LTS" };
+                        format!("  - {name} (series {series}, {kind})")
+                    })
+                    .collect();
+                let skipped_block = skipped.join("\n");
+                let source_kind = if params.source_release.is_devel() {
+                    "devel"
+                } else {
+                    "LTS"
+                };
+                let target_kind = if params.release.is_devel() {
+                    "devel"
+                } else {
+                    "LTS"
+                };
+                print_info_box(
+                    "Multi-step backport detected",
+                    &[
+                        &format!(
+                            "  Source : {source_release} (series {source_series}, {source_kind})"
+                        ),
+                        &format!("  Target : {release} (series {target_series}, {target_kind})"),
+                        "",
+                        "This backport spans more than one release on the LTS+devel chain:",
+                        &skipped_block,
+                        "",
+                        "Backporting one release at a time is recommended so that \
+                         release-specific failures are isolated and each step has a \
+                         stable checkpoint. Backport through each skipped release \
+                         in turn before attempting this longer hop.",
+                    ],
+                );
+                "Proceed with this multi-step backport anyway?"
+            }
+        }
+        _ => {
+            // At least one release is not in the LTS+devel chain (a non-LTS,
+            // non-devel release such as `oracular` or `questing`).
+            let non_lts: Vec<String> = [
+                (&params.source_release, "source"),
+                (&params.release, "target"),
+            ]
+            .iter()
+            .filter(|(r, _)| r.chain_position().is_none())
+            .map(|(r, role)| {
+                format!(
+                    "  - {role}: {} (series {}, non-LTS, non-devel)",
+                    r.as_str(),
+                    r.series_number()
+                )
+            })
+            .collect();
+            print_info_box(
+                "Non-LTS release in backport",
+                &[
+                    "Backports normally target Ubuntu LTS releases. The following \
+                     release(s) in this backport are not LTS and not the current \
+                     devel release:",
+                    &non_lts.join("\n"),
+                    "",
+                    "The one-release-at-a-time check only applies to the LTS+devel \
+                     chain and is skipped here. Proceed with caution — non-LTS \
+                     releases may not have the full bootstrapping chain available.",
+                ],
+            );
+            "Proceed with these parameters?"
+        }
+    };
+
+    if prompt_select(proceed_prompt, &["Proceed", "Abort"], 0) != 0 {
         println!("Aborted.");
         return Ok(());
     }
