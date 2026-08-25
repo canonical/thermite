@@ -264,7 +264,7 @@ start of each phase.
 |-------|-------------|------|
 | 0 | Preflight checks — verify required tools and repository layout | Automated |
 | 1 | Create a Launchpad bug report (optional for proactive backports) | Interactive |
-| 2 | Set up Git branch (`<release>-X.Y` from `<source_release>-X.Y`) | Automated |
+| 2 | Set up Git branch (`<release>-X.Y` from `<source_release>-X.Y`, or `merge-X.Y` when the source is the devel release) | Automated |
 | 3 | Compute and apply backport version string; update `debian/changelog` | Automated |
 | 4 | Generate orig tarball with `uscan`; rename to include `~<series>` suffix | Automated |
 | 5 | Generate orig-vendor tarball with `debian/rules vendor-tarball` | Automated |

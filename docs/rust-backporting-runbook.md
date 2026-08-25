@@ -267,23 +267,41 @@ All commands are run from inside `~/rustc/rustc/` unless otherwise specified.
 Start from the branch for `<X.Y>` on `<source_release>` — that is, the packaging that already
 works on the newer release — and create a new branch targeting `<release>`.
 
+When `<source_release>` is a **stable** release, the source branch is named
+`<source_release>-<X.Y>`. When `<source_release>` is the **current development
+release**, no `<source_release>-<X.Y>` branch exists yet — the authoritative
+packaging lives on the `merge-<X.Y>` branch instead. thermite probes the
+Foundations remote and picks the correct branch automatically; the commands
+below show the stable-release case.
+
 ```shell
 git fetch origin
 git checkout <source_release>-<X.Y>
 git checkout -b <release>-<X.Y>
 ```
 
-**Example** — backporting `rustc-1.85` to Jammy from Noble:
+**Example** — backporting `rustc-1.85` to Jammy from Noble (stable source):
 
 ```shell
 git checkout noble-1.85
 git checkout -b jammy-1.85
 ```
 
-> **Requires:** The `<source_release>-<X.Y>` branch exists on `origin` and is up to date.  
-> **Ensures:** You are on a new local branch `<release>-<X.Y>` whose tip matches `<source_release>-<X.Y>`.  
-> **On failure:** If the source branch does not exist, the `source_release` backport (from § 1.3) has
-> not yet been completed. Complete that step first.
+**Example** — backporting `rustc-1.85` to Resolute from Stonking (devel source):
+
+```shell
+# No 'stonking-1.85' branch exists yet; use 'merge-1.85' instead.
+git checkout merge-1.85
+git checkout -b resolute-1.85
+```
+
+> **Requires:** The `<source_release>-<X.Y>` branch exists on `origin` and is up to date,
+> **or** `<source_release>` is the current devel release and `merge-<X.Y>` exists on `origin`.  
+> **Ensures:** You are on a new local branch `<release>-<X.Y>` whose tip matches the resolved
+> source branch (`<source_release>-<X.Y>` for stable sources, `merge-<X.Y>` for the devel source).  
+> **On failure:** If neither `<source_release>-<X.Y>` nor `merge-<X.Y>` exists on `origin`, the
+> `source_release` backport (from § 1.3) has not yet been completed. Complete that step first,
+> or enter the correct source branch name when thermite prompts for it.
 
 ---
 

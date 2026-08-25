@@ -51,6 +51,31 @@ impl UbuntuRelease {
             .map(|(_, series)| *series)
             .expect("UbuntuRelease invariant: adjective is always in KNOWN_RELEASES")
     }
+
+    /// Return the adjective of the current Ubuntu development release.
+    ///
+    /// The devel release is defined as the **last** entry in
+    /// [`KNOWN_RELEASES`]. This list is appended to as new Ubuntu releases are
+    /// announced, so the value returned here tracks the current devel release
+    /// as long as the list is kept up to date.
+    pub fn devel() -> &'static str {
+        KNOWN_RELEASES
+            .last()
+            .map(|(name, _)| *name)
+            .expect("KNOWN_RELEASES is non-empty by construction")
+    }
+
+    /// Return `true` when this release is the current Ubuntu development
+    /// release (i.e. the last entry in [`KNOWN_RELEASES`]).
+    ///
+    /// This is a **static** heuristic: it is correct only as long as
+    /// [`KNOWN_RELEASES`] is kept up to date with the release cadence. Callers
+    /// that need to be robust against the devel→stable transition should treat
+    /// this as a hint for messaging only, not as the source of truth for
+    /// branch-name decisions.
+    pub fn is_devel(&self) -> bool {
+        self.0 == Self::devel()
+    }
 }
 
 impl std::fmt::Display for UbuntuRelease {
@@ -93,5 +118,28 @@ mod tests {
             UbuntuRelease::parse("questing").unwrap().series_number(),
             "25.10"
         );
+    }
+
+    #[test]
+    fn devel_returns_last_known_release_adjective() {
+        let last = KNOWN_RELEASES.last().expect("KNOWN_RELEASES is non-empty");
+        assert_eq!(UbuntuRelease::devel(), last.0);
+    }
+
+    #[test]
+    fn is_devel_true_for_last_known_release() {
+        let last = KNOWN_RELEASES.last().expect("KNOWN_RELEASES is non-empty");
+        let r = UbuntuRelease::parse(last.0).unwrap();
+        assert!(r.is_devel(), "{} should be devel", last.0);
+    }
+
+    #[test]
+    fn is_devel_false_for_non_last_release() {
+        let r = UbuntuRelease::parse("noble").unwrap();
+        // `noble` is only the devel release if it happens to be the last entry
+        // in KNOWN_RELEASES; assert against the known devel adjective instead.
+        if UbuntuRelease::devel() != "noble" {
+            assert!(!r.is_devel());
+        }
     }
 }
