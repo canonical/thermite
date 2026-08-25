@@ -47,10 +47,7 @@ pub enum ArchiveStatus {
     /// The package is published in the archive; carries its version string.
     Available(String),
     /// The package is published but older than the required version.
-    TooOld {
-        available: String,
-        required: String,
-    },
+    TooOld { available: String, required: String },
     /// The package is not published in the archive at all.
     NotPublished,
     /// The archive check itself failed (e.g. `rmadison` not installed,
@@ -107,14 +104,8 @@ pub fn infer_llvm_version(repo_dir: &Path) -> Inference {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("LLVM_VERSION") {
             // Accept optional surrounding whitespace and a '=' or ':' separator.
-            let rest = rest
-                .trim_start_matches([' ', '=', ':', '\t'])
-                .trim_end();
-            if !rest.is_empty()
-                && rest
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c == '.')
-            {
+            let rest = rest.trim_start_matches([' ', '=', ':', '\t']).trim_end();
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
                 let value = rest.to_owned();
                 return Inference::Inferred {
                     value: value.clone(),
@@ -124,8 +115,7 @@ pub fn infer_llvm_version(repo_dir: &Path) -> Inference {
         }
     }
     Inference::CouldNotInfer(
-        "no uncommented 'LLVM_VERSION = <N>' assignment found in debian/rules"
-            .to_owned(),
+        "no uncommented 'LLVM_VERSION = <N>' assignment found in debian/rules".to_owned(),
     )
 }
 
@@ -217,9 +207,7 @@ pub fn infer_pkgconf(repo_dir: &Path) -> Inference {
             };
         }
     }
-    Inference::CouldNotInfer(
-        "neither pkgconf nor pkg-config found in debian/control".to_owned(),
-    )
+    Inference::CouldNotInfer("neither pkgconf nor pkg-config found in debian/control".to_owned())
 }
 
 /// Infer the cmake minimum version from `debian/control`.
@@ -287,9 +275,7 @@ pub fn infer_debhelper_compat(repo_dir: &Path) -> Inference {
             }
         }
     }
-    Inference::CouldNotInfer(
-        "no debhelper-compat entry found in debian/control".to_owned(),
-    )
+    Inference::CouldNotInfer("no debhelper-compat entry found in debian/control".to_owned())
 }
 
 // ── Word-boundary helpers ─────────────────────────────────────────────────────
@@ -343,28 +329,22 @@ pub async fn check_archive(package: &str, release: &str) -> ArchiveStatus {
             "rmadison not installed (sudo apt install devscripts)".to_owned(),
         );
     }
-    let output = match run_command(
-        "rmadison",
-        &["-u", "ubuntu", package],
-        Path::new("."),
-        &[],
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(ThermiteError::CommandFailed { stdout, stderr, .. }) => {
-            // rmadison exits non-zero on network failure; surface a hint.
-            let detail = if !stderr.trim().is_empty() {
-                stderr.trim().to_owned()
-            } else if !stdout.trim().is_empty() {
-                stdout.trim().to_owned()
-            } else {
-                "rmadison exited non-zero".to_owned()
-            };
-            return ArchiveStatus::CheckFailed(detail);
-        }
-        Err(e) => return ArchiveStatus::CheckFailed(e.to_string()),
-    };
+    let output =
+        match run_command("rmadison", &["-u", "ubuntu", package], Path::new("."), &[]).await {
+            Ok(o) => o,
+            Err(ThermiteError::CommandFailed { stdout, stderr, .. }) => {
+                // rmadison exits non-zero on network failure; surface a hint.
+                let detail = if !stderr.trim().is_empty() {
+                    stderr.trim().to_owned()
+                } else if !stdout.trim().is_empty() {
+                    stdout.trim().to_owned()
+                } else {
+                    "rmadison exited non-zero".to_owned()
+                };
+                return ArchiveStatus::CheckFailed(detail);
+            }
+            Err(e) => return ArchiveStatus::CheckFailed(e.to_string()),
+        };
     match parse_rmadison_version(&output.stdout, release) {
         Some(v) => ArchiveStatus::Available(v),
         None => ArchiveStatus::NotPublished,
@@ -451,9 +431,7 @@ pub async fn check_llvm(repo_dir: &Path, release: &str) -> CheckResult {
             }
         }
         Inference::CouldNotInfer(reason) => {
-            let url = format!(
-                "https://launchpad.net/ubuntu/{release}/+source/llvm-toolchain-<N>"
-            );
+            let url = format!("https://launchpad.net/ubuntu/{release}/+source/llvm-toolchain-<N>");
             CheckResult {
                 name: "LLVM",
                 inference: Inference::CouldNotInfer(reason.clone()),
@@ -831,7 +809,11 @@ rustc | 1.85.0+dfsg1-0ubuntu1 | jammy | source
     #[test]
     fn infer_llvm_version_missing_returns_could_not_infer() {
         let repo = temp_repo();
-        write(&repo, "debian/rules", "#!/usr/bin/make -f\nall:\n\techo hi\n");
+        write(
+            &repo,
+            "debian/rules",
+            "#!/usr/bin/make -f\nall:\n\techo hi\n",
+        );
         assert!(matches!(
             infer_llvm_version(&repo),
             Inference::CouldNotInfer(_)
@@ -859,11 +841,7 @@ rustc | 1.85.0+dfsg1-0ubuntu1 | jammy | source
     #[test]
     fn infer_libgit2_version_without_constraint() {
         let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Build-Depends:\n libgit2-dev,\n",
-        );
+        write(&repo, "debian/control", "Build-Depends:\n libgit2-dev,\n");
         match infer_libgit2_version(&repo) {
             Inference::Inferred { value, .. } => assert!(value.is_empty()),
             other => panic!("expected Inferred, got {other:?}"),
@@ -902,11 +880,12 @@ rustc | 1.85.0+dfsg1-0ubuntu1 | jammy | source
     #[test]
     fn infer_dh_cargo_absent_returns_could_not_infer() {
         let repo = temp_repo();
-        write(&repo, "debian/control", "Build-Depends:\n debhelper (>= 13),\n");
-        assert!(matches!(
-            infer_dh_cargo(&repo),
-            Inference::CouldNotInfer(_)
-        ));
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 13),\n",
+        );
+        assert!(matches!(infer_dh_cargo(&repo), Inference::CouldNotInfer(_)));
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -915,11 +894,7 @@ rustc | 1.85.0+dfsg1-0ubuntu1 | jammy | source
     #[test]
     fn infer_pkgconf_present() {
         let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Build-Depends:\n pkgconf,\n",
-        );
+        write(&repo, "debian/control", "Build-Depends:\n pkgconf,\n");
         match infer_pkgconf(&repo) {
             Inference::Inferred { value, .. } => assert_eq!(value, "present"),
             other => panic!("expected Inferred, got {other:?}"),
@@ -930,11 +905,7 @@ rustc | 1.85.0+dfsg1-0ubuntu1 | jammy | source
     #[test]
     fn infer_pkgconf_pkg_config_in_use() {
         let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Build-Depends:\n pkg-config,\n",
-        );
+        write(&repo, "debian/control", "Build-Depends:\n pkg-config,\n");
         match infer_pkgconf(&repo) {
             Inference::Inferred { value, .. } => assert_eq!(value, "pkg-config"),
             other => panic!("expected Inferred, got {other:?}"),
@@ -950,10 +921,7 @@ rustc | 1.85.0+dfsg1-0ubuntu1 | jammy | source
             "debian/control",
             "Build-Depends:\n debhelper (>= 13),\n",
         );
-        assert!(matches!(
-            infer_pkgconf(&repo),
-            Inference::CouldNotInfer(_)
-        ));
+        assert!(matches!(infer_pkgconf(&repo), Inference::CouldNotInfer(_)));
         let _ = fs::remove_dir_all(&repo);
     }
 

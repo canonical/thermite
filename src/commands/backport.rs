@@ -377,7 +377,9 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
                 &[
                     "No LP bug number was provided. This is fine for proactive backports.",
                     "",
-                    &format!("First, check whether there are already open bugs against {pkg_name}:"),
+                    &format!(
+                        "First, check whether there are already open bugs against {pkg_name}:"
+                    ),
                     &format!("  {bugs_url}"),
                     "",
                     "If this backport is for a specific reason (e.g. a package that needs a newer Rust to build), file a Launchpad bug:",
@@ -576,7 +578,10 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_phase_header(4, "Compatibility Checks");
     print_phase_explanation(4);
 
-    info!("running compatibility checks for target release {}", release);
+    info!(
+        "running compatibility checks for target release {}",
+        release
+    );
     let check_results = compat::run_all_checks(repo_dir, release).await;
 
     // Track how many checks need attention so the summary line is accurate.
@@ -609,7 +614,10 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
                     ok_count += 1;
                 }
             }
-            compat::ArchiveStatus::TooOld { available, required } => {
+            compat::ArchiveStatus::TooOld {
+                available,
+                required,
+            } => {
                 println!(
                     "    Archive: \u{2717} too old — available {available}, required {required}"
                 );
@@ -636,13 +644,8 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     // Print a summary line.
     println!();
     let total = check_results.len();
-    if attention_count == 0
-        && infer_failed_count == 0
-        && archive_check_failed_count == 0
-    {
-        println!(
-            "  Summary: {ok_count}/{total} checks passed — no action needed."
-        );
+    if attention_count == 0 && infer_failed_count == 0 && archive_check_failed_count == 0 {
+        println!("  Summary: {ok_count}/{total} checks passed — no action needed.");
     } else {
         let parts: Vec<String> = [
             if attention_count > 0 {
