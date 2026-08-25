@@ -306,6 +306,8 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
 
     // Derived names used throughout.
     let pkg_name = format!("rustc-{rust_short}");
+    let bugs_url = format!("https://bugs.launchpad.net/ubuntu/+source/{pkg_name}");
+    let filebug_url = format!("{bugs_url}/+filebug");
     // Primary candidate for the source branch. When the source release is a
     // stable release, this branch exists on the Foundations remote. When the
     // source release is the current devel release, this branch does not exist
@@ -363,6 +365,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             &format!("  Launchpad user   : {lpuser}"),
             &format!("  Git remote       : {git_remote}"),
             &format!("  LP bug number    : {bug_display}"),
+            &format!("  Open bugs        : {bugs_url}"),
             &format!("  Repo dir         : {}", repo_dir.display()),
         ],
     );
@@ -488,8 +491,11 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
                 &[
                     &format!("LP bug #{bug} has been provided on the command line."),
                     "",
-                    "If this is a new backport and no bug exists yet, you can file one at:",
-                    "  https://bugs.launchpad.net/ubuntu/+filebug",
+                    &format!("Check for existing open bugs against {pkg_name} first:"),
+                    &format!("  {bugs_url}"),
+                    "",
+                    "If no suitable bug exists yet, file one at:",
+                    &format!("  {filebug_url}"),
                     "",
                     "If backporting across multiple releases, target the bug to all affected series so each intermediate backport can be tracked.",
                 ],
@@ -510,8 +516,13 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
                 &[
                     "No LP bug number was provided. This is fine for proactive backports.",
                     "",
-                    "If this backport is for a specific reason (e.g. a package that needs a newer Rust to build), create a Launchpad bug first:",
-                    "  https://bugs.launchpad.net/ubuntu/+filebug",
+                    &format!(
+                        "First, check whether there are already open bugs against {pkg_name}:"
+                    ),
+                    &format!("  {bugs_url}"),
+                    "",
+                    "If this backport is for a specific reason (e.g. a package that needs a newer Rust to build), file a Launchpad bug:",
+                    &format!("  {filebug_url}"),
                     "",
                     "All backports (with or without a bug) are uploaded to the staging PPA:",
                     "  https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/",

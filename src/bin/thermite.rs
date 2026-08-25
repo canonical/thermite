@@ -138,9 +138,14 @@ async fn run() -> Result<()> {
                 &lp_bug_number,
             )?;
 
-            // Finding 11: replace expect() with structured error propagation.
+            // Canonicalize so that `repo_dir.parent().unwrap_or(repo_dir)`
+            // in downstream steps resolves to the real parent directory even
+            // when a relative path with no parent component (e.g. `.`) is
+            // passed: `Path::new(".").parent()` returns `Some("")`, which
+            // would otherwise resolve to the process cwd (the source tree
+            // itself) and cause logs/tarballs to be written there.
             let repo_path = match repo_dir {
-                Some(p) => p,
+                Some(p) => std::fs::canonicalize(&p).map_err(thermite::error::ThermiteError::Io)?,
                 None => std::env::current_dir().map_err(thermite::error::ThermiteError::Io)?,
             };
 
@@ -168,7 +173,7 @@ async fn run() -> Result<()> {
             )?;
 
             let repo_path = match repo_dir {
-                Some(p) => p,
+                Some(p) => std::fs::canonicalize(&p).map_err(thermite::error::ThermiteError::Io)?,
                 None => std::env::current_dir().map_err(thermite::error::ThermiteError::Io)?,
             };
 
