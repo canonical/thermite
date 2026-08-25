@@ -367,6 +367,16 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         ],
     );
 
+    // If the user passed `--source-release devel`, surface the resolved
+    // concrete adjective before any further processing so that the rest of
+    // the output (and the adjacency check) is unambiguous.
+    if params.source_release_is_devel_alias {
+        println!(
+            "  Note: --source-release 'devel' resolved to '{source_release}' \
+             (current Ubuntu development release)."
+        );
+    }
+
     // ── One-release-at-a-time adjacency check ─────────────────────────────
     //
     // Backports should go one release at a time along the LTS+devel chain

@@ -281,6 +281,11 @@ packaging lives on the `merge-<X.Y>` branch instead. thermite probes the
 Foundations remote and picks the correct branch automatically; the commands
 below show the stable-release case.
 
+`--source-release devel` is accepted as a shorthand for the current development
+release (resolved to its concrete adjective, e.g. `stonking`). The target
+release (`--release`) must always be a concrete adjective — `devel` is not a
+valid backport target.
+
 ```shell
 git fetch origin
 git checkout <source_release>-<X.Y>
@@ -298,6 +303,7 @@ git checkout -b jammy-1.85
 
 ```shell
 # No 'stonking-1.85' branch exists yet; use 'merge-1.85' instead.
+# `thermite backport -s devel -r resolute -u 1.85.0` resolves 'devel' to 'stonking'.
 git checkout merge-1.85
 git checkout -b resolute-1.85
 ```

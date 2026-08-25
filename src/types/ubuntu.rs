@@ -65,6 +65,15 @@ impl UbuntuRelease {
             .expect("KNOWN_RELEASES is non-empty by construction")
     }
 
+    /// Construct the [`UbuntuRelease`] for the current devel release.
+    ///
+    /// Equivalent to `UbuntuRelease::parse(UbuntuRelease::devel()).unwrap()`
+    /// but infallible, since [`devel`](Self::devel) always returns a known
+    /// adjective.
+    pub fn devel_release() -> Self {
+        Self(Self::devel().to_owned())
+    }
+
     /// Return `true` when this release is the current Ubuntu development
     /// release (i.e. the last entry in [`KNOWN_RELEASES`]).
     ///
@@ -201,6 +210,14 @@ mod tests {
         if UbuntuRelease::devel() != "noble" {
             assert!(!r.is_devel());
         }
+    }
+
+    #[test]
+    fn devel_release_matches_parse_of_devel_adjective() {
+        let via_devel_release = UbuntuRelease::devel_release();
+        let via_parse = UbuntuRelease::parse(UbuntuRelease::devel()).unwrap();
+        assert_eq!(via_devel_release.as_str(), via_parse.as_str());
+        assert!(via_devel_release.is_devel());
     }
 
     #[test]

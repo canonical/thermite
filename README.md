@@ -172,7 +172,7 @@ Adapts an existing versioned `rustc-X.Y` package for an older Ubuntu release.
 ```
 thermite backport [OPTIONS]
   -u, --rust-version      <X.Y.Z>   Rust version to backport        (e.g. 1.85.0)
-  -s, --source-release    <NAME>    Ubuntu release to port FROM      (e.g. noble)
+  -s, --source-release    <NAME>    Ubuntu release to port FROM      (e.g. noble, or 'devel')
   -r, --release           <NAME>    Ubuntu release to port TO        (e.g. jammy)
   -l, --lpuser            <NAME>    Launchpad username
   -b, --lp-bug-number     <NUMBER>  Launchpad bug ID (optional; omit for proactive backports)
