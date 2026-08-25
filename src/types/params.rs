@@ -10,6 +10,10 @@ pub struct BackportParams {
     pub rust_version: RustVersion,
     /// Ubuntu release being backported **from**, e.g. `"noble"`.
     pub source_release: UbuntuRelease,
+    /// `true` when the user passed `--source-release devel` and the value was
+    /// resolved to the current devel release
+    /// ([`UbuntuRelease::devel_release`]). `false` for a concrete adjective.
+    pub source_release_is_devel_alias: bool,
     /// Ubuntu release being backported **to**, e.g. `"jammy"`.
     pub release: UbuntuRelease,
     /// Launchpad username; also used as the personal Git remote name.
@@ -54,16 +58,31 @@ impl BackportParams {
                 "'{bug}' must be a non-empty string of digits"
             )));
         }
-        let source = UbuntuRelease::parse(source_release)?;
+        let source = if source_release.eq_ignore_ascii_case("devel") {
+            UbuntuRelease::devel_release()
+        } else {
+            UbuntuRelease::parse(source_release)?
+        };
+        let source_release_is_devel_alias = source_release.eq_ignore_ascii_case("devel");
+        // The target release must be a concrete adjective; "devel" is not a
+        // valid backport target.
+        if release.eq_ignore_ascii_case("devel") {
+            return Err(ThermiteError::InvalidBackportReleases(
+                "cannot backport to 'devel'; specify a concrete target release \
+                 (e.g. 'resolute', 'noble')"
+                    .to_owned(),
+            ));
+        }
         let target = UbuntuRelease::parse(release)?;
         if source == target {
             return Err(ThermiteError::InvalidBackportReleases(format!(
-                "source release and target release must differ (both are '{source_release}')"
+                "source release and target release must differ (both are '{release}')"
             )));
         }
         Ok(Self {
             rust_version: RustVersion::parse(rust_version)?,
             source_release: source,
+            source_release_is_devel_alias,
             release: target,
             lpuser: lpuser.to_owned(),
             git_remote: git_remote.to_owned(),
@@ -199,6 +218,74 @@ mod backport_params_tests {
         )
         .unwrap();
         assert!(!p2.dry_run, "dry_run should be stored as false");
+    }
+
+    #[test]
+    fn devel_as_source_resolves_to_current_devel_release() {
+        let p = BackportParams::new(
+            "1.85.0",
+            "devel",
+            "resolute",
+            "jdoe",
+            "foundations",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(p.source_release.as_str(), UbuntuRelease::devel());
+        assert!(
+            p.source_release_is_devel_alias,
+            "source_release_is_devel_alias should be true for 'devel'"
+        );
+    }
+
+    #[test]
+    fn concrete_source_release_does_not_set_devel_alias_flag() {
+        let p = BackportParams::new(
+            "1.85.0",
+            "resolute",
+            "noble",
+            "jdoe",
+            "foundations",
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!p.source_release_is_devel_alias);
+    }
+
+    #[test]
+    fn devel_as_target_is_rejected() {
+        let result = BackportParams::new(
+            "1.85.0",
+            "resolute",
+            "devel",
+            "jdoe",
+            "foundations",
+            None,
+            false,
+        );
+        assert!(
+            matches!(result, Err(ThermiteError::InvalidBackportReleases(_))),
+            "expected InvalidBackportReleases for 'devel' target, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn devel_source_and_devel_target_is_rejected() {
+        let result = BackportParams::new(
+            "1.85.0",
+            "devel",
+            "devel",
+            "jdoe",
+            "foundations",
+            None,
+            false,
+        );
+        assert!(
+            matches!(result, Err(ThermiteError::InvalidBackportReleases(_))),
+            "expected InvalidBackportReleases for 'devel' target, got: {result:?}"
+        );
     }
 }
 

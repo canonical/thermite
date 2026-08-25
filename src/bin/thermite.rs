@@ -64,7 +64,8 @@ enum Commands {
         #[arg(short = 'u', long)]
         rust_version: String,
 
-        /// Ubuntu release to backport FROM (e.g. noble).
+        /// Ubuntu release to backport FROM (e.g. noble, or 'devel' for the
+        /// current Ubuntu development release).
         #[arg(short = 's', long)]
         source_release: String,
 

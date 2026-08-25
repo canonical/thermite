@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::error::{Result, ThermiteError};
 use crate::shell;
-use crate::steps::{build, changelog, git, lintian, ppa, uscan, vendor};
+use crate::steps::{build, changelog, compat, git, lintian, ppa, uscan, vendor};
 use crate::types::params::BackportParams;
 use crate::ui::{
     confirm_sink, print_info_box, print_phase_header, print_tool_checks, prompt_input,
@@ -63,11 +63,15 @@ const PHASE_DOCS: &[PhaseDoc] = &[
     },
     // Phase 2 — Git Branch
     PhaseDoc {
-        explanation: "Creates a local branch '<release>-X.Y' from '<source_release>-X.Y'. \
+        explanation: "Creates a local branch '<release>-X.Y' from '<source_release>-X.Y' for \
+            stable-to-stable backports. When backporting from the current devel \
+            release, the '<source_release>-X.Y' branch does not exist yet — the \
+            authoritative source lives on 'merge-X.Y' instead, and thermite \
+            probes the Foundations remote to pick the right branch automatically. \
             Backports must go one release at a time (e.g. Noble→Jammy, never \
-            Questing→Jammy directly) to isolate release-specific failures and provide \
-            stable checkpoints. The branch is not pushed to the Foundations repository \
-            until Phase 14, after autopkgtests pass.",
+            Questing→Jammy directly) to isolate release-specific failures and \
+            provide stable checkpoints. The branch is not pushed to the \
+            Foundations repository until Phase 14, after autopkgtests pass.",
         anchor: "#setup",
     },
     // Phase 3 — Changelog
@@ -79,32 +83,35 @@ const PHASE_DOCS: &[PhaseDoc] = &[
             across series.",
         anchor: "#changelog-version",
     },
-    // Phase 4 — Orig Tarball
+    // Phase 4 — Compatibility Checks
+    PhaseDoc {
+        explanation: "The target release's archive may have older versions of build \
+            dependencies than the source release's packaging assumes. Six compatibility \
+            checks are performed in order before tarball generation: \
+            (1) LLVM version, (2) libgit2 version, (3) dh-cargo availability, \
+            (4) pkgconf availability, (5) cmake version, (6) debhelper-compat level. \
+            Each check infers the required version from the source packaging, queries \
+            the archive via rmadison, and reports whether action is needed. Fixes are \
+            applied before the orig tarball is generated so that vendored sources \
+            (e.g. LLVM, libgit2) are included in a single uscan run.",
+        anchor: "#common-backporting-changes",
+    },
+    // Phase 5 — Orig Tarball
     PhaseDoc {
         explanation: "uscan downloads and filters the upstream Rust source according to \
             'Files-Excluded' in debian/copyright. If LLVM or libgit2 vendoring is needed \
-            (see the compatibility checks in Phase 6), 'Files-Excluded' must be edited first \
+            (see the compatibility checks in Phase 4), 'Files-Excluded' must be edited first \
             and the tarball regenerated before running this phase. The tarball is renamed to include \
             '~<series>' so its filename matches the backport version string.",
         anchor: "#generating-the-orig-tarball",
     },
-    // Phase 5 — Vendor Tarball
+    // Phase 6 — Vendor Tarball
     PhaseDoc {
         explanation: "Generates the orig-vendor tarball containing filtered Cargo crate \
             dependencies. This requires a local Rust toolchain at the exact patch version \
             being packaged (installed via rustup). Only applies to Rust 1.89 and later; \
             earlier versions bundle vendored crates directly in the orig tarball.",
         anchor: "#generating-the-orig-vendor-tarball",
-    },
-    // Phase 6 — Compatibility Checks
-    PhaseDoc {
-        explanation: "The target release's archive may have older versions of build \
-            dependencies than the source release's packaging assumes. Six compatibility \
-            checks must be performed in order before attempting to build: \
-            (1) LLVM version, (2) libgit2 version, (3) dh-cargo availability, \
-            (4) pkgconf availability, (5) cmake version, (6) debhelper-compat level. \
-            Each check is independent and multiple may apply to the same backport.",
-        anchor: "#common-backporting-changes",
     },
     // Phase 7 — Disable Self-Build Test
     PhaseDoc {
@@ -262,6 +269,29 @@ async fn generate_vendor_tarball_for_backport(
     .await
 }
 
+/// Pure decision logic for the source-branch resolver used in Phase 2.
+///
+/// Given the two candidate branch names (`primary` = `<source_release>-X.Y`,
+/// `fallback` = `merge-X.Y`) and whether each exists on the remote, return the
+/// branch name to check out, or `None` if neither exists (in which case the
+/// caller prompts the user for a branch name interactively).
+///
+/// Extracted as a free function so it can be unit-tested without touching git.
+fn resolve_source_branch_name<'a>(
+    primary: &'a str,
+    fallback: &'a str,
+    has_primary: bool,
+    has_fallback: bool,
+) -> Option<&'a str> {
+    if has_primary {
+        Some(primary)
+    } else if has_fallback {
+        Some(fallback)
+    } else {
+        None
+    }
+}
+
 /// Run the full `thermite backport` workflow.
 pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     let rust_ver = &params.rust_version;
@@ -276,7 +306,13 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
 
     // Derived names used throughout.
     let pkg_name = format!("rustc-{rust_short}");
-    let source_branch = format!("{source_release}-{rust_short}");
+    // Primary candidate for the source branch. When the source release is a
+    // stable release, this branch exists on the Foundations remote. When the
+    // source release is the current devel release, this branch does not exist
+    // yet — the authoritative source lives on `merge-X.Y` instead. Phase 2
+    // resolves the actual branch to use by probing the remote.
+    let primary_source_branch = format!("{source_release}-{rust_short}");
+    let fallback_source_branch = format!("merge-{rust_short}");
     let target_branch = format!("{release}-{rust_short}");
     let ppa_name = format!("rustc-{rust_short}-{release}");
     let parent_dir = repo_dir.parent().unwrap_or(repo_dir).to_path_buf();
@@ -330,7 +366,113 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             &format!("  Repo dir         : {}", repo_dir.display()),
         ],
     );
-    if prompt_select("Proceed with these parameters?", &["Proceed", "Abort"], 0) != 0 {
+
+    // If the user passed `--source-release devel`, surface the resolved
+    // concrete adjective before any further processing so that the rest of
+    // the output (and the adjacency check) is unambiguous.
+    if params.source_release_is_devel_alias {
+        println!(
+            "  Note: --source-release 'devel' resolved to '{source_release}' \
+             (current Ubuntu development release)."
+        );
+    }
+
+    // ── One-release-at-a-time adjacency check ─────────────────────────────
+    //
+    // Backports should go one release at a time along the LTS+devel chain
+    // (e.g. devel→resolute→noble→jammy→focal) so that release-specific
+    // failures are isolated and each step has a stable checkpoint. When the
+    // source and target span more than one step on that chain, warn the user
+    // and list the skipped intermediate releases before proceeding.
+    let source_pos = params.source_release.chain_position();
+    let target_pos = params.release.chain_position();
+    let proceed_prompt = match (source_pos, target_pos) {
+        (Some(sp), Some(tp)) => {
+            let distance = sp.abs_diff(tp);
+            if distance <= 1 {
+                // Adjacent (or the same release, which params validation
+                // already rejects) — no warning.
+                "Proceed with these parameters?"
+            } else {
+                // Both in the chain but not adjacent — multi-step backport.
+                let (upper, lower) = if sp > tp { (sp, tp) } else { (tp, sp) };
+                let chain = crate::types::ubuntu::UbuntuRelease::backport_chain();
+                let skipped: Vec<String> = chain[lower + 1..upper]
+                    .iter()
+                    .map(|name| {
+                        let r = crate::types::ubuntu::UbuntuRelease::parse(name)
+                            .expect("chain entries are valid releases");
+                        let series = r.series_number();
+                        let kind = if r.is_devel() { "devel" } else { "LTS" };
+                        format!("  - {name} (series {series}, {kind})")
+                    })
+                    .collect();
+                let skipped_block = skipped.join("\n");
+                let source_kind = if params.source_release.is_devel() {
+                    "devel"
+                } else {
+                    "LTS"
+                };
+                let target_kind = if params.release.is_devel() {
+                    "devel"
+                } else {
+                    "LTS"
+                };
+                print_info_box(
+                    "Multi-step backport detected",
+                    &[
+                        &format!(
+                            "  Source : {source_release} (series {source_series}, {source_kind})"
+                        ),
+                        &format!("  Target : {release} (series {target_series}, {target_kind})"),
+                        "",
+                        "This backport spans more than one release on the LTS+devel chain:",
+                        &skipped_block,
+                        "",
+                        "Backporting one release at a time is recommended so that \
+                         release-specific failures are isolated and each step has a \
+                         stable checkpoint. Backport through each skipped release \
+                         in turn before attempting this longer hop.",
+                    ],
+                );
+                "Proceed with this multi-step backport anyway?"
+            }
+        }
+        _ => {
+            // At least one release is not in the LTS+devel chain (a non-LTS,
+            // non-devel release such as `oracular` or `questing`).
+            let non_lts: Vec<String> = [
+                (&params.source_release, "source"),
+                (&params.release, "target"),
+            ]
+            .iter()
+            .filter(|(r, _)| r.chain_position().is_none())
+            .map(|(r, role)| {
+                format!(
+                    "  - {role}: {} (series {}, non-LTS, non-devel)",
+                    r.as_str(),
+                    r.series_number()
+                )
+            })
+            .collect();
+            print_info_box(
+                "Non-LTS release in backport",
+                &[
+                    "Backports normally target Ubuntu LTS releases. The following \
+                     release(s) in this backport are not LTS and not the current \
+                     devel release:",
+                    &non_lts.join("\n"),
+                    "",
+                    "The one-release-at-a-time check only applies to the LTS+devel \
+                     chain and is skipped here. Proceed with caution — non-LTS \
+                     releases may not have the full bootstrapping chain available.",
+                ],
+            );
+            "Proceed with these parameters?"
+        }
+    };
+
+    if prompt_select(proceed_prompt, &["Proceed", "Abort"], 0) != 0 {
         println!("Aborted.");
         return Ok(());
     }
@@ -453,13 +595,97 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         info!("fetching all remotes");
         git::fetch_all(repo_dir).await?;
 
-        info!("checking out {source_branch}");
-        git::checkout_branch(repo_dir, &source_branch).await?;
+        // Resolve the source branch to check out from. The primary candidate
+        // is `<source_release>-X.Y` (used for stable-to-stable backports). When
+        // the source release is the current devel release, that branch does not
+        // exist yet — the authoritative source lives on `merge-X.Y` instead.
+        // Probe the Foundations remote to decide which to use.
+        let is_devel_source = params.source_release.is_devel();
+        let has_primary =
+            git::remote_branch_exists(repo_dir, git_remote, &primary_source_branch).await?;
+        let has_fallback =
+            git::remote_branch_exists(repo_dir, git_remote, &fallback_source_branch).await?;
+
+        let resolved_source_branch: String = match resolve_source_branch_name(
+            &primary_source_branch,
+            &fallback_source_branch,
+            has_primary,
+            has_fallback,
+        ) {
+            Some(branch) => {
+                if branch == fallback_source_branch {
+                    // We're falling back to `merge-X.Y`. Explain why.
+                    if is_devel_source {
+                        print_info_box(
+                            "Backporting from the current devel release",
+                            &[
+                                &format!(
+                                    "  {source_release} is the current Ubuntu development release."
+                                ),
+                                &format!(
+                                    "  No '{primary_source_branch}' branch exists yet on '{git_remote}';"
+                                ),
+                                &format!(
+                                    "  using the authoritative development branch '{fallback_source_branch}' instead."
+                                ),
+                                "",
+                                &format!(
+                                    "  Once {source_release} is released, a '{primary_source_branch}' branch"
+                                ),
+                                "  will be created and this fallback will no longer be needed.",
+                            ],
+                        );
+                    } else {
+                        print_info_box(
+                            "Source branch fallback",
+                            &[
+                                &format!(
+                                    "  No '{primary_source_branch}' branch found on '{git_remote}'."
+                                ),
+                                &format!(
+                                    "  Falling back to '{fallback_source_branch}' as the source branch."
+                                ),
+                            ],
+                        );
+                    }
+                }
+                branch.to_owned()
+            }
+            None => {
+                // Neither candidate exists — prompt the user for the branch.
+                print_info_box(
+                    "Source branch not found",
+                    &[
+                        &format!(
+                            "Neither '{primary_source_branch}' nor '{fallback_source_branch}' exists on '{git_remote}'."
+                        ),
+                        "",
+                        "This may mean:",
+                        &format!(
+                            "  - the source release backport has not been pushed to '{git_remote}' yet, or"
+                        ),
+                        "  - the source release uses a non-standard branch naming convention.",
+                        "",
+                        "Enter the name of the branch to use as the backport source,",
+                        "or leave blank to abort.",
+                    ],
+                );
+                let input = prompt_input("Source branch name:");
+                if input.is_empty() {
+                    println!("\n  Aborted.");
+                    return Ok(());
+                }
+                input
+            }
+        };
+
+        info!("checking out {resolved_source_branch}");
+        git::checkout_branch(repo_dir, &resolved_source_branch).await?;
 
         info!("creating branch {target_branch}");
         crate::shell::run_command("git", &["checkout", "-b", &target_branch], repo_dir, &[])
             .await?;
-        println!("  Branch '{target_branch}' created from '{source_branch}'.");
+        println!("  Branch '{target_branch}' created from '{resolved_source_branch}'.");
     }
 
     // ── Phase 3: Update Changelog ────────────────────────────────────────────
@@ -560,9 +786,133 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         println!("  Backport changelog entry already committed — nothing to commit.");
     }
 
-    // ── Phase 4: Generate Orig Tarball ───────────────────────────────────────
-    print_phase_header(4, "Generate Orig Tarball");
+    // ── Phase 4: Compatibility Checks ────────────────────────────────────────
+    print_phase_header(4, "Compatibility Checks");
     print_phase_explanation(4);
+
+    info!(
+        "running compatibility checks for target release {}",
+        release
+    );
+    let check_results = compat::run_all_checks(repo_dir, release).await;
+
+    // Track how many checks need attention so the summary line is accurate.
+    let mut ok_count = 0usize;
+    let mut attention_count = 0usize;
+    let mut infer_failed_count = 0usize;
+    let mut archive_check_failed_count = 0usize;
+
+    for result in &check_results {
+        println!("\n  {}", result.name);
+        match &result.inference {
+            compat::Inference::Inferred { value, source } => {
+                if value.is_empty() {
+                    println!("    Inferred: (no version constraint) ({source})");
+                } else {
+                    println!("    Inferred: {value} ({source})");
+                }
+            }
+            compat::Inference::CouldNotInfer(reason) => {
+                println!("    Could not infer automatically.");
+                println!("    Reason: {reason}");
+                infer_failed_count += 1;
+            }
+        }
+
+        match &result.archive_status {
+            compat::ArchiveStatus::Available(version) => {
+                println!("    Archive: \u{2714} available ({version})");
+                if result.inference.is_inferred() {
+                    ok_count += 1;
+                }
+            }
+            compat::ArchiveStatus::TooOld {
+                available,
+                required,
+            } => {
+                println!(
+                    "    Archive: \u{2717} too old — available {available}, required {required}"
+                );
+                attention_count += 1;
+            }
+            compat::ArchiveStatus::NotPublished => {
+                println!("    Archive: \u{2717} not published in {release}");
+                attention_count += 1;
+            }
+            compat::ArchiveStatus::CheckFailed(detail) => {
+                println!("    Archive: could not check ({detail})");
+                archive_check_failed_count += 1;
+            }
+        }
+
+        if !result.is_ok() {
+            if !result.guidance.is_empty() {
+                println!("    Action needed: {}", result.guidance);
+            }
+            println!("    Reference: {}", result.url);
+        }
+    }
+
+    // Print a summary line.
+    println!();
+    let total = check_results.len();
+    if attention_count == 0 && infer_failed_count == 0 && archive_check_failed_count == 0 {
+        println!("  Summary: {ok_count}/{total} checks passed — no action needed.");
+    } else {
+        let parts: Vec<String> = [
+            if attention_count > 0 {
+                format!("{attention_count} need attention")
+            } else {
+                String::new()
+            },
+            if infer_failed_count > 0 {
+                format!("{infer_failed_count} could not infer")
+            } else {
+                String::new()
+            },
+            if archive_check_failed_count > 0 {
+                format!("{archive_check_failed_count} archive check failed")
+            } else {
+                String::new()
+            },
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+        println!(
+            "  Summary: {ok_count}/{total} checks passed, {}.",
+            parts.join(", ")
+        );
+
+        print_info_box(
+            "Guidance for checks needing attention",
+            &[
+                "Apply all needed changes to debian/control, debian/control.in,",
+                "debian/copyright, debian/rules, and debian/config.toml.in as",
+                "described above. Commit them together before continuing.",
+                "",
+                "If LLVM or libgit2 vendoring is needed, the orig tarball (Phase 5)",
+                "must be regenerated after editing Files-Excluded in debian/copyright.",
+                "",
+                "Full documentation:",
+                "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
+            ],
+        );
+    }
+
+    if prompt_select(
+        "All applicable compatibility changes worked through and committed?",
+        &["Continue", "Abort"],
+        0,
+    ) != 0
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // ── Phase 5: Generate Orig Tarball ───────────────────────────────────────
+    print_phase_header(5, "Generate Orig Tarball");
+    print_phase_explanation(5);
 
     // The expected final tarball name encodes the target series suffix so that
     // the filename matches the backport version string (e.g. ~20.04).
@@ -575,7 +925,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         &[
             "Choose how to provide the orig tarball for this backport:",
             "",
-            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 6). uscan will run now; takes 20–60 minutes.",
+            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 4). uscan will run now; takes 20–60 minutes.",
             "",
             "  DOWNLOAD   — No Files-Excluded change; tarball not yet local. Download from the staging PPA, name the file exactly:",
             &format!("               {expected_tarball_name}"),
@@ -654,9 +1004,9 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     };
     println!("  Orig tarball: {}", tarball.display());
 
-    // ── Phase 5: Generate Orig-Vendor Tarball ────────────────────────────────
-    print_phase_header(5, "Generate Orig-Vendor Tarball");
-    print_phase_explanation(5);
+    // ── Phase 6: Generate Orig-Vendor Tarball ────────────────────────────────
+    print_phase_header(6, "Generate Orig-Vendor Tarball");
+    print_phase_explanation(6);
 
     info!("installing Rust toolchain {rust_ver}");
     let rust_bootstrap_dir = vendor::rustup_install_toolchain(rust_ver).await?;
@@ -710,57 +1060,6 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     };
     println!("  Vendor tarball: {}", vendor_tarball.display());
 
-    // ── Phase 6: Compatibility Checks ────────────────────────────────────────
-    print_phase_header(6, "Compatibility Checks");
-    print_phase_explanation(6);
-
-    // Build the check list with the target release adjective interpolated
-    // into the Launchpad URLs (e.g. focal, jammy). The LLVM toolchain
-    // number <N> stays as a placeholder — the user greps debian/rules for
-    // the LLVM_VERSION assignment.
-    print_info_box(
-        "Work through each compatibility check before building",
-        &[
-            "Check each item in order. Apply ALL changes before proceeding.",
-            "After completing all applicable changes, commit them together.",
-            "",
-            "LLVM availability",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/llvm-toolchain-<N>"),
-            "  If 404 / not published: vendor LLVM (remove src/llvm-project from Files-Excluded, regenerate tarball, update control/config.toml.in/rules).",
-            "",
-            "libgit2 availability",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/libgit2"),
-            "  If archive version < required: downgrade version constraint, or vendor libgit2 (comment out exclusion, regenerate tarball, update control).",
-            "",
-            "dh-cargo (>= 28ubuntu1~) availability",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/dh-cargo"),
-            "  If absent: comment out dh-cargo from Build-Depends; remove dh-cargo-vendored-sources check from debian/rules.",
-            "",
-            "pkgconf availability",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/pkgconf"),
-            "  If absent: replace pkgconf with pkg-config in control files; add 'export PKG_CONFIG=pkg-config' to debian/rules.",
-            "",
-            "cmake version (>= 3.0)",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/cmake"),
-            "  If too old: add cmake-mozilla (>= 3.0) as fallback in control files.",
-            "",
-            "debhelper-compat level",
-            &format!("  Check: https://launchpad.net/ubuntu/{release}/+source/debhelper"),
-            "  If required compat level absent: downgrade debhelper-compat in control files and update .install.in substitution variables.",
-            "",
-            "Full documentation: see the official backport-rust guide.",
-        ],
-    );
-    if prompt_select(
-        "All applicable compatibility changes worked through and committed?",
-        &["Continue", "Abort"],
-        0,
-    ) != 0
-    {
-        println!("Aborted.");
-        return Ok(());
-    }
-
     // ── Phase 7: Disable Autopkgtest Self-Build Test ─────────────────────────
     // H2 fix: this phase is now before the local build.
     print_phase_header(7, "Disable Autopkgtest Self-Build Test");
@@ -800,7 +1099,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_info_box(
         "About to run sbuild",
         &[
-            "The local build may fail if the target Ubuntu release has older versions of certain dependencies. Use the Phase 6 compatibility guidance to diagnose failures.",
+            "The local build may fail if the target Ubuntu release has older versions of certain dependencies. Use the Phase 4 compatibility guidance to diagnose failures.",
             "",
             "Consult the backporting guide for detailed diagnostics:",
             "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
@@ -1296,7 +1595,7 @@ async fn run_interactive_local_build(
                         "Consult the backporting guide for common fixes:",
                         "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
                         "",
-                        "Quick reference (see Phase 6 compatibility guidance for details):",
+                        "Quick reference (see Phase 4 compatibility guidance for details):",
                         "  LLVM too old       → vendor LLVM from src/llvm-project",
                         "  libgit2 too old    → downgrade or vendor libgit2",
                         "  dh-cargo missing   → comment out from Build-Depends",
@@ -1431,6 +1730,40 @@ mod tests {
         assert!(
             arg.contains("jammy main"),
             "expected release name in extra-repository arg, got: {arg}"
+        );
+    }
+
+    #[test]
+    fn resolve_source_branch_name_prefers_primary_when_present() {
+        assert_eq!(
+            resolve_source_branch_name("resolute-1.85", "merge-1.85", true, true),
+            Some("resolute-1.85")
+        );
+    }
+
+    #[test]
+    fn resolve_source_branch_name_falls_back_to_merge_when_primary_absent() {
+        assert_eq!(
+            resolve_source_branch_name("stonking-1.85", "merge-1.85", false, true),
+            Some("merge-1.85")
+        );
+    }
+
+    #[test]
+    fn resolve_source_branch_name_returns_none_when_both_absent() {
+        assert_eq!(
+            resolve_source_branch_name("stonking-1.85", "merge-1.85", false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_source_branch_name_returns_none_when_only_primary_absent_and_no_fallback() {
+        // primary absent, fallback absent → None (covered above, but assert the
+        // asymmetric case explicitly for clarity).
+        assert_eq!(
+            resolve_source_branch_name("resolute-1.85", "merge-1.85", false, false),
+            None
         );
     }
 }
