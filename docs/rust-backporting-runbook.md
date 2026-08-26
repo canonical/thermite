@@ -1037,13 +1037,40 @@ packaged toolchain. This test validates that the packaged compiler can bootstrap
 versions. However, for backports — especially those that vendor LLVM — this test is resource-
 intensive and frequently times out on the `autopkgtest` infrastructure.
 
-Remove the self-build test stanza from `debian/tests/control`:
+Remove the self-build test stanza from `debian/tests/control`. Upstream Debian
+has used two stanza shapes so far; both are removed by thermite automatically.
+
+**Pattern A** (older Rust packaging, 3 lines):
 
 ```diff
--Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
--Depends: @, @builddeps@
--Restrictions: rw-build-tree, allow-stderr
+ -Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+ -Depends: @, @builddeps@
+ -Restrictions: rw-build-tree, allow-stderr
 ```
+
+**Pattern B** (newer Rust packaging, 6 lines — adds two comments and an
+`Architecture:` restriction):
+
+```diff
+ -Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+ -Depends: @, @builddeps@
+ -Restrictions: rw-build-tree, allow-stderr
+ -# Other arches work but are flaky due to memory limitations.
+ -# Additionally, the test doesn't test for anything arch-specific.
+ -Architecture: amd64
+```
+
+If the stanza in `debian/tests/control` does not match either shape — for
+example because upstream added a new field, changed a comment, or altered the
+`Architecture:` list — thermite will **not** edit the file (to avoid leaving it
+half-removed and broken). It prints the documentation link below and prompts
+you to either:
+
+1. manually delete the whole stanza in `debian/tests/control` and commit the
+   change, then continue; or
+2. skip the removal, leaving the self-build autopkgtest active (it will likely
+   time out on the autopkgtest infrastructure — if this backport vendors LLVM,
+   prefer option 1).
 
 > **Note:** The build process still performs internal bootstrapping: the previous-version compiler
 > builds a stage1 compiler, which then builds the stage2 compiler that gets packaged. This is
@@ -1055,6 +1082,8 @@ Remove the self-build test stanza from `debian/tests/control`:
 > **Ensures:** `debian/tests/control` does not contain the `RUST_TEST_SELFBUILD=1` stanza.  
 > **On failure:** This step cannot fail. If the stanza is already absent from
 > `debian/tests/control`, it was removed in a prior step or upstream — no action needed.
+> If the stanza shape is not recognised, thermite prompts for manual removal
+> (or skipping); it never writes a partially-edited `debian/tests/control`.
 
 ---
 
