@@ -215,6 +215,48 @@ pub fn print_phase_explanation(phase: usize) {
     );
 }
 
+/// Handle the case where the self-build test stanza in `debian/tests/control`
+/// does not match any shape that thermite knows how to remove automatically.
+///
+/// Prints the relevant documentation link and prompts the user to either
+/// confirm they have manually removed and committed the stanza, or skip the
+/// removal (leaving the self-build autopkgtest active, which is likely to time
+/// out on the autopkgtest infrastructure).
+async fn handle_manual_self_build_removal() {
+    let docs_url = format!("{DOCS_BASE}#disabling-autopkgtest-self-build-test");
+    print_info_box(
+        "Self-build test stanza not recognised",
+        &[
+            "thermite found the 'RUST_TEST_SELFBUILD=1' marker in debian/tests/control \
+             but the surrounding stanza does not match any known shape, so it has \
+             been left untouched to avoid leaving the file in a broken state.",
+            "",
+            "Open debian/tests/control and delete the entire self-build test stanza \
+             (the Test-Command line plus its Depends, Restrictions, comment, and \
+             Architecture lines), then commit the change.",
+            "",
+            &format!("Documentation: {docs_url}"),
+        ],
+    );
+    let options = [
+        "I've removed and committed the stanza — continue",
+        "Skip this removal (leave the self-build test active)",
+    ];
+    let choice = prompt_select("How would you like to proceed?", &options, 0);
+    match choice {
+        0 => {
+            println!("  Continuing after manual self-build test removal.");
+        }
+        _ => {
+            println!(
+                "  WARNING: the self-build autopkgtest remains enabled and will \
+                 likely time out on the autopkgtest infrastructure. If this \
+                 backport vendors LLVM, consider disabling it before uploading."
+            );
+        }
+    }
+}
+
 /// Remove any stale orig-vendor tarballs for `version` in `parent_dir` that
 /// would cause `debian/rules vendor-tarball-quick-check` to abort, then run
 /// `debian/rules vendor-tarball` and return the generated tarball path.
@@ -1077,30 +1119,35 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_phase_explanation(7);
 
     info!("removing self-build test from debian/tests/control");
-    build::disable_self_build_test(repo_dir)?;
+    let outcome = build::disable_self_build_test(repo_dir)?;
 
-    let tests_control = repo_dir.join("debian/tests/control");
-    if tests_control.exists() {
-        let status_output = crate::shell::run_command(
-            "git",
-            &["status", "--porcelain", "debian/tests/control"],
-            repo_dir,
-            &[],
-        )
-        .await?;
-        if !status_output.stdout.trim().is_empty() {
-            git::add_and_commit(
+    match outcome {
+        build::SelfBuildTestOutcome::Removed => {
+            let status_output = crate::shell::run_command(
+                "git",
+                &["status", "--porcelain", "debian/tests/control"],
                 repo_dir,
-                &["debian/tests/control"],
-                "Disable autopkgtest self-build test for backport",
+                &[],
             )
             .await?;
-            println!("  Self-build test block removed and committed.");
-        } else {
+            if !status_output.stdout.trim().is_empty() {
+                git::add_and_commit(
+                    repo_dir,
+                    &["debian/tests/control"],
+                    "Disable autopkgtest self-build test for backport",
+                )
+                .await?;
+                println!("  Self-build test block removed and committed.");
+            } else {
+                println!("  Self-build test block was already absent — nothing to commit.");
+            }
+        }
+        build::SelfBuildTestOutcome::AlreadyAbsent => {
             println!("  Self-build test block was already absent — nothing to commit.");
         }
-    } else {
-        println!("  debian/tests/control not found — skipping.");
+        build::SelfBuildTestOutcome::NeedsManualIntervention => {
+            handle_manual_self_build_removal().await;
+        }
     }
 
     // ── Phase 8: Local Build and Bug Fixing ──────────────────────────────────
