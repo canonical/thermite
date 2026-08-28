@@ -973,38 +973,59 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         format!("rustc-{rust_short}_{rust_ver}+dfsg~{target_series}.orig.tar.xz");
     let expected_tarball = parent_dir.join(&expected_tarball_name);
 
+    let reuse_header = if expected_tarball.exists() {
+        "  REUSE      — No Files-Excluded change; tarball already exists at:"
+    } else {
+        "  REUSE      — No Files-Excluded change; tarball NOT detected at the path below — Reuse will fail until it exists:"
+    };
+
     print_info_box(
         "Tarball decision",
         &[
             "Choose how to provide the orig tarball for this backport:",
             "",
-            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 4). uscan will run now; takes 20–60 minutes.",
+            reuse_header,
+            &format!("               {}", expected_tarball.display()),
             "",
             "  DOWNLOAD   — No Files-Excluded change; tarball not yet local. Download from the staging PPA, name the file exactly:",
             &format!("               {expected_tarball_name}"),
             &format!("               and place it in: {}", parent_dir.display()),
             "",
-            "  REUSE      — No Files-Excluded change; tarball already exists at:",
-            &format!("               {}", expected_tarball.display()),
+            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 4). uscan will run now; takes 20–60 minutes.",
         ],
     );
+
+    let reuse_label = if expected_tarball.exists() {
+        "Reuse      — tarball already exists in the parent directory"
+    } else {
+        "Reuse      — tarball NOT detected in the parent directory — will fail unless you place it there first"
+    };
 
     let tarball = match prompt_select(
         "How would you like to provide the orig tarball?",
         &[
-            "Regenerate — run uscan now (20–60 min; required if Files-Excluded changed)",
+            reuse_label,
             "Download   — I will place the correctly-named tarball in the parent directory",
-            "Reuse      — tarball already exists in the parent directory",
+            "Regenerate — run uscan now (20–60 min; required if Files-Excluded changed)",
             "Abort",
         ],
         0,
     ) {
         0 => {
-            // Regenerate: run uscan and rename to include the series suffix.
-            let uscan_log = parent_dir.join(format!("uscan-{rust_ver}-backport.log"));
-            info!("running uscan --download-version {rust_ver}");
-            let t = uscan::run_uscan(repo_dir, rust_ver, &uscan_log).await?;
-            uscan::rename_tarball_with_suffix(&t, &format!("~{target_series}"))?
+            // Reuse: verify the tarball is present locally.
+            if !expected_tarball.exists() {
+                return Err(crate::error::ThermiteError::CommandFailed {
+                    cmd: "reuse orig tarball".to_owned(),
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "tarball not found: {}\n\
+                         Select 'Download' or 'Regenerate' to obtain it first.",
+                        expected_tarball.display(),
+                    ),
+                });
+            }
+            expected_tarball
         }
         1 => {
             // Download: pause for the user to place the file, then verify it exists.
@@ -1034,20 +1055,11 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             expected_tarball
         }
         2 => {
-            // Reuse: verify the tarball is present locally.
-            if !expected_tarball.exists() {
-                return Err(crate::error::ThermiteError::CommandFailed {
-                    cmd: "reuse orig tarball".to_owned(),
-                    code: 0,
-                    stdout: String::new(),
-                    stderr: format!(
-                        "tarball not found: {}\n\
-                         Select 'Download' or 'Regenerate' to obtain it first.",
-                        expected_tarball.display(),
-                    ),
-                });
-            }
-            expected_tarball
+            // Regenerate: run uscan and rename to include the series suffix.
+            let uscan_log = parent_dir.join(format!("uscan-{rust_ver}-backport.log"));
+            info!("running uscan --download-version {rust_ver}");
+            let t = uscan::run_uscan(repo_dir, rust_ver, &uscan_log).await?;
+            uscan::rename_tarball_with_suffix(&t, &format!("~{target_series}"))?
         }
         _ => {
             // Abort
@@ -1061,55 +1073,118 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     print_phase_header(6, "Generate Orig-Vendor Tarball");
     print_phase_explanation(6);
 
-    info!("installing Rust toolchain {rust_ver}");
-    let rust_bootstrap_dir = vendor::rustup_install_toolchain(rust_ver).await?;
-
     // The vendor tarball name encodes the same series suffix as the orig
     // tarball so it matches the backport changelog version.
     let vendor_tarball_name =
         format!("rustc-{rust_short}_{rust_ver}+dfsg~{target_series}.orig-vendor.tar.xz");
     let expected_vendor_tarball = parent_dir.join(&vendor_tarball_name);
 
-    let vendor_tarball = if expected_vendor_tarball.exists() {
-        match prompt_select(
-            "Orig-vendor tarball already exists. What would you like to do?",
-            &[
-                "Reuse      — use the existing vendor tarball",
-                "Regenerate — delete it and rebuild from scratch",
-                "Abort",
-            ],
-            0,
-        ) {
-            0 => {
-                println!("  Reusing existing vendor tarball.");
-                expected_vendor_tarball
+    let vendor_reuse_header = if expected_vendor_tarball.exists() {
+        "  REUSE      — vendor tarball already exists at:"
+    } else {
+        "  REUSE      — vendor tarball NOT detected at the path below — Reuse will fail until it exists:"
+    };
+
+    print_info_box(
+        "Vendor tarball decision",
+        &[
+            "Choose how to provide the orig-vendor tarball for this backport:",
+            "",
+            vendor_reuse_header,
+            &format!("               {}", expected_vendor_tarball.display()),
+            "",
+            "  DOWNLOAD   — Vendor tarball not yet local. Download from the staging PPA (e.g. from a previous build attempt), name the file exactly:",
+            &format!("               {vendor_tarball_name}"),
+            &format!("               and place it in: {}", parent_dir.display()),
+            "",
+            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 4). Installs the matching Rust toolchain via rustup, then runs `debian/rules vendor-tarball`; takes several minutes.",
+        ],
+    );
+
+    let vendor_reuse_label = if expected_vendor_tarball.exists() {
+        "Reuse      — vendor tarball already exists in the parent directory"
+    } else {
+        "Reuse      — vendor tarball NOT detected in the parent directory — will fail unless you place it there first"
+    };
+
+    let vendor_tarball = match prompt_select(
+        "How would you like to provide the orig-vendor tarball?",
+        &[
+            vendor_reuse_label,
+            "Download   — I will place the correctly-named vendor tarball in the parent directory",
+            "Regenerate — build it now (installs the Rust toolchain via rustup; slow)",
+            "Abort",
+        ],
+        0,
+    ) {
+        0 => {
+            // Reuse: verify the vendor tarball is present locally.
+            if !expected_vendor_tarball.exists() {
+                return Err(crate::error::ThermiteError::CommandFailed {
+                    cmd: "reuse orig-vendor tarball".to_owned(),
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "vendor tarball not found: {}\n\
+                         Select 'Download' or 'Regenerate' to obtain it first.",
+                        expected_vendor_tarball.display(),
+                    ),
+                });
             }
-            1 => {
-                std::fs::remove_file(&expected_vendor_tarball)
-                    .map_err(crate::error::ThermiteError::Io)?;
-                generate_vendor_tarball_for_backport(
-                    repo_dir,
-                    &rust_bootstrap_dir,
-                    rust_ver,
-                    target_series,
-                    &parent_dir,
-                )
-                .await?
-            }
-            _ => {
-                println!("\n  Aborted at Phase 5.");
+            expected_vendor_tarball
+        }
+        1 => {
+            // Download: pause for the user to place the file, then verify it exists.
+            if prompt_select(
+                "Place the vendor tarball at the path shown above, then continue.",
+                &["I've placed the vendor tarball — continue", "Abort"],
+                0,
+            ) != 0
+            {
+                println!("Aborted.");
                 return Ok(());
             }
+            if !expected_vendor_tarball.exists() {
+                return Err(crate::error::ThermiteError::CommandFailed {
+                    cmd: "download orig-vendor tarball".to_owned(),
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "vendor tarball not found: {}\n\
+                         Ensure the file is named exactly '{}' and placed in '{}'.",
+                        expected_vendor_tarball.display(),
+                        vendor_tarball_name,
+                        parent_dir.display(),
+                    ),
+                });
+            }
+            expected_vendor_tarball
         }
-    } else {
-        generate_vendor_tarball_for_backport(
-            repo_dir,
-            &rust_bootstrap_dir,
-            rust_ver,
-            target_series,
-            &parent_dir,
-        )
-        .await?
+        2 => {
+            // Regenerate: install the Rust toolchain (deferred until needed),
+            // prune any stale series tarballs, and rebuild from scratch.
+            if expected_vendor_tarball.exists() {
+                std::fs::remove_file(&expected_vendor_tarball)
+                    .map_err(crate::error::ThermiteError::Io)?;
+            }
+            info!("installing Rust toolchain {rust_ver}");
+            let rust_bootstrap_dir = vendor::rustup_install_toolchain(rust_ver).await?;
+            generate_vendor_tarball_for_backport(
+                repo_dir,
+                &rust_bootstrap_dir,
+                rust_ver,
+                target_series,
+                &parent_dir,
+            )
+            .await?
+        }
+        _ => {
+            // Abort
+            println!(
+                "\n  Aborted at Phase 5. Re-run when ready to provide the orig-vendor tarball."
+            );
+            return Ok(());
+        }
     };
     println!("  Vendor tarball: {}", vendor_tarball.display());
 
