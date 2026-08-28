@@ -973,38 +973,59 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         format!("rustc-{rust_short}_{rust_ver}+dfsg~{target_series}.orig.tar.xz");
     let expected_tarball = parent_dir.join(&expected_tarball_name);
 
+    let reuse_header = if expected_tarball.exists() {
+        "  REUSE      — No Files-Excluded change; tarball already exists at:"
+    } else {
+        "  REUSE      — No Files-Excluded change; tarball NOT detected at the path below — Reuse will fail until it exists:"
+    };
+
     print_info_box(
         "Tarball decision",
         &[
             "Choose how to provide the orig tarball for this backport:",
             "",
-            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 4). uscan will run now; takes 20–60 minutes.",
+            reuse_header,
+            &format!("               {}", expected_tarball.display()),
             "",
             "  DOWNLOAD   — No Files-Excluded change; tarball not yet local. Download from the staging PPA, name the file exactly:",
             &format!("               {expected_tarball_name}"),
             &format!("               and place it in: {}", parent_dir.display()),
             "",
-            "  REUSE      — No Files-Excluded change; tarball already exists at:",
-            &format!("               {}", expected_tarball.display()),
+            "  REGENERATE — Files-Excluded in debian/copyright was changed (e.g. LLVM or libgit2 vendoring — see Phase 4). uscan will run now; takes 20–60 minutes.",
         ],
     );
+
+    let reuse_label = if expected_tarball.exists() {
+        "Reuse      — tarball already exists in the parent directory"
+    } else {
+        "Reuse      — tarball NOT detected in the parent directory — will fail unless you place it there first"
+    };
 
     let tarball = match prompt_select(
         "How would you like to provide the orig tarball?",
         &[
-            "Regenerate — run uscan now (20–60 min; required if Files-Excluded changed)",
+            reuse_label,
             "Download   — I will place the correctly-named tarball in the parent directory",
-            "Reuse      — tarball already exists in the parent directory",
+            "Regenerate — run uscan now (20–60 min; required if Files-Excluded changed)",
             "Abort",
         ],
         0,
     ) {
         0 => {
-            // Regenerate: run uscan and rename to include the series suffix.
-            let uscan_log = parent_dir.join(format!("uscan-{rust_ver}-backport.log"));
-            info!("running uscan --download-version {rust_ver}");
-            let t = uscan::run_uscan(repo_dir, rust_ver, &uscan_log).await?;
-            uscan::rename_tarball_with_suffix(&t, &format!("~{target_series}"))?
+            // Reuse: verify the tarball is present locally.
+            if !expected_tarball.exists() {
+                return Err(crate::error::ThermiteError::CommandFailed {
+                    cmd: "reuse orig tarball".to_owned(),
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "tarball not found: {}\n\
+                         Select 'Download' or 'Regenerate' to obtain it first.",
+                        expected_tarball.display(),
+                    ),
+                });
+            }
+            expected_tarball
         }
         1 => {
             // Download: pause for the user to place the file, then verify it exists.
