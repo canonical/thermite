@@ -352,7 +352,7 @@ pub async fn check_archive(package: &str, release: &str) -> ArchiveStatus {
 }
 
 /// Parse `rmadison -u ubuntu <package>` output and return the version string
-/// of the first entry whose suite starts with `release`.
+/// of the first entry whose suite matches `release`.
 ///
 /// rmadison output format (one source per line, pipe-separated):
 /// ```text
@@ -361,9 +361,18 @@ pub async fn check_archive(package: &str, release: &str) -> ArchiveStatus {
 ///   rustc | 1.85.0+dfsg1-0ubuntu1               | noble           | source
 /// ```
 ///
-/// We accept entries whose suite equals `release` or starts with
-/// `<release>-` (e.g. `jammy-security`, `jammy-updates`).
+/// The suite field is emitted as `<suite>` or `<suite>/<component>`
+/// (e.g. `noble` or `resolute/universe`), and may carry a pocket suffix
+/// (e.g. `noble-security`, `noble-updates`, `resolute-proposed/universe`).
+///
+/// We accept entries whose suite equals `release`, starts with
+/// `<release>-` (e.g. `jammy-security`, `jammy-updates`), or starts with
+/// `<release>/` (e.g. `resolute/universe`). Iteration preserves rmadison's
+/// output order, so the first matching line wins — callers that need the
+/// newest version across pockets should pre-sort the input.
 pub fn parse_rmadison_version(stdout: &str, release: &str) -> Option<String> {
+    let with_hyphen = format!("{release}-");
+    let with_slash = format!("{release}/");
     for line in stdout.lines() {
         // Skip blank lines, warnings, and headers.
         if line.trim().is_empty() || !line.contains('|') {
@@ -376,7 +385,7 @@ pub fn parse_rmadison_version(stdout: &str, release: &str) -> Option<String> {
         // parts[0] = package, parts[1] = version, parts[2] = suite, parts[3+] = archs
         let version = parts[1];
         let suite = parts[2];
-        if suite == release || suite.starts_with(&format!("{release}-")) {
+        if suite == release || suite.starts_with(&with_hyphen) || suite.starts_with(&with_slash) {
             return Some(version.to_owned());
         }
     }
@@ -769,6 +778,52 @@ rustc | 1.85.0+dfsg1-0ubuntu1 | jammy | source
     #[test]
     fn parse_rmadison_version_handles_empty_output() {
         assert!(parse_rmadison_version("", "jammy").is_none());
+    }
+
+    #[test]
+    fn parse_rmadison_version_handles_component_suffix() {
+        // rmadison emits the suite as `<suite>/<component>` rather than a bare
+        // suite name (e.g. `resolute/universe`, `stonking-proposed/universe`).
+        // Regression test for LLVM on Resolute, where the previous parser only
+        // matched `<release>` and `<release>-*` and so reported NotPublished.
+        let out = "\
+llvm-toolchain-22 | 1:22.1.2-1ubuntu1 | resolute/universe          | source
+llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe          | source
+llvm-toolchain-22 | 1:22.1.6-1ubuntu2 | stonking-proposed/universe | source
+";
+        let v = parse_rmadison_version(out, "resolute");
+        assert_eq!(v.as_deref(), Some("1:22.1.2-1ubuntu1"));
+    }
+
+    #[test]
+    fn parse_rmadison_version_component_suffix_for_pocket() {
+        // A pocket with a component (e.g. `resolute-proposed/universe`)
+        // should still match `release = "resolute"` via the `<release>-`
+        // rule, regardless of the trailing `/component`.
+        let out = "\
+llvm-toolchain-22 | 1:22.1.6-1ubuntu2 | resolute-proposed/universe | source
+llvm-toolchain-22 | 1:22.1.2-1ubuntu1 | resolute/universe          | source
+";
+        let v = parse_rmadison_version(out, "resolute");
+        assert_eq!(v.as_deref(), Some("1:22.1.6-1ubuntu2"));
+    }
+
+    #[test]
+    fn parse_rmadison_version_component_suffix_does_not_cross_release() {
+        // `stonking/universe` must not match `release = "resolute"`,
+        // nor vice versa, even though both carry `/universe`.
+        let out = "\
+llvm-toolchain-22 | 1:22.1.2-1ubuntu1 | resolute/universe | source
+llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe | source
+";
+        assert_eq!(
+            parse_rmadison_version(out, "resolute").as_deref(),
+            Some("1:22.1.2-1ubuntu1")
+        );
+        assert_eq!(
+            parse_rmadison_version(out, "stonking").as_deref(),
+            Some("1:22.1.6-1ubuntu1")
+        );
     }
 
     // ── infer_llvm_version ─────────────────────────────────────────────────
