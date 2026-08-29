@@ -102,6 +102,7 @@ Options:
 Commands:
   update    Package a new upstream Rust toolchain release for Ubuntu
   backport  Backport an existing Rust toolchain package to an older Ubuntu release
+  version   Parse, explain, format, or bump Ubuntu rustc package version strings
   help      Print this message or the help of the given subcommand(s)
 ```
 
@@ -218,6 +219,84 @@ Pass `-vv` to display a concise explanation of what each phase does and why,
 together with a link to the relevant section of the official docs.
 Pass `-v` (single) to print each external command without the explanations.
 
+### `thermite version`
+
+Utilities for working with Ubuntu `rustc` package version strings.  The version
+string format is documented in the [Ubuntu project docs](https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/rust-version-strings/).
+
+```
+thermite version <SUBCOMMAND>
+
+Subcommands:
+  parse    Parse a version string and display its components
+  explain  Explain each component of a version string with documentation
+  format   Construct a version string from individual components
+  bump     Bump a version string according to a specified operation
+```
+
+#### `thermite version parse`
+
+Parse a version string into its structured components:
+
+```sh
+thermite version parse "1.90.0+dfsg2~24.04-0ubuntu3~24.04.1"
+# Upstream version:  1.90.0
+# Repack number:     2
+# Series:            24.04
+# ...
+
+thermite version parse "1.90.0+dfsg2~24.04-0ubuntu3~24.04.1" --json
+# {"upstream":{"major":1,"minor":90,"patch":0},"repack_number":2,...}
+
+# Or read from debian/changelog:
+thermite version parse --from-changelog
+```
+
+#### `thermite version explain`
+
+Display an educational breakdown of each component:
+
+```sh
+thermite version explain "1.90.0+dfsg2~24.04-0ubuntu3~24.04.1"
+```
+
+#### `thermite version format`
+
+Construct a version string from individual options:
+
+```sh
+thermite version format --upstream 1.95.0 --release noble --ubuntu-revision 3
+# 1.95.0+dfsg~24.04-0ubuntu3~24.04.1
+
+thermite version format --upstream 1.95.0
+# 1.95.0+dfsg-0ubuntu1
+```
+
+#### `thermite version bump`
+
+Apply a bump operation to a version string:
+
+```sh
+# Increment Ubuntu revision
+thermite version bump "1.95.0+dfsg-0ubuntu1" ubuntu-revision
+# 1.95.0+dfsg-0ubuntu2
+
+# Generate a backport version
+thermite version bump "1.95.0+dfsg-0ubuntu2" backport --release noble
+# 1.95.0+dfsg~24.04-0ubuntu2~24.04.1
+
+# Retarget to a different series
+thermite version bump "1.90.0+dfsg2~24.04-0ubuntu3~24.04.1" retarget --series 22.04
+# 1.90.0+dfsg2~22.04-0ubuntu3~22.04.1
+
+# Increment PPA number
+thermite version bump "1.95.0+dfsg-0ubuntu1" ppa
+# 1.95.0+dfsg-0ubuntu1~ppa1
+
+# Read from changelog:
+thermite version bump --from-changelog ubuntu-revision
+```
+
 ---
 
 ## Workflow Phases (update command)
@@ -289,6 +368,7 @@ src/
   commands/
     update.rs           Orchestrates the full update workflow
     backport.rs         Orchestrates the full backport workflow
+    version.rs          Version string utilities (parse, explain, format, bump)
   steps/
     autopkgtest.rs      autopkgtest invocations
     build.rs            dpkg-buildpackage, sbuild, and debian/tests/control editing
@@ -303,6 +383,7 @@ src/
     uscan.rs            uscan and orig tarball management
     vendor.rs           cargo-vendor-filterer and vendor-tarball rule
   types/
+    package_version.rs  RustcPackageVersion — full Debian version string parser and formatter
     params.rs           UpdateParams and BackportParams — validated CLI parameters
     ubuntu.rs           UbuntuRelease — validated Ubuntu release names and series numbers
     versions.rs         RustVersion — X.Y.Z and X.Y version newtypes

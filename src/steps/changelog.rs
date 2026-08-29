@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::error::Result;
 use crate::shell::run_command;
+use crate::types::package_version::RustcPackageVersion;
 use crate::types::versions::RustVersion;
 
 /// Run `dch -v <version_str>` to open a new changelog entry.
@@ -110,13 +111,9 @@ pub fn read_current_version(changelog_path: &Path) -> Result<String> {
 
 /// Compute the Debian version string for a backport to `target_series`.
 ///
-/// The algorithm:
-/// 1. Split the version on the **first** `-` to obtain the upstream part and
-///    the Debian revision.
-/// 2. In the upstream part, strip any trailing `~XX.YY[.Z…]` suffix and
-///    append `~<target_series>`.
-/// 3. In the Debian revision, strip any trailing `~XX.YY[.Z…]` suffix and
-///    append `~<target_series>.1`.
+/// Uses the structured [`RustcPackageVersion`] parser to decompose the current
+/// version, then applies the backport transformation (sets the target series
+/// and resets backport-specific fields).
 ///
 /// Examples (from the backporting docs):
 /// - `"1.93.0+dfsg-0ubuntu1"` + `"24.04"`
@@ -124,12 +121,30 @@ pub fn read_current_version(changelog_path: &Path) -> Result<String> {
 /// - `"1.89.0+dfsg2~24.04.1-0ubuntu3~24.04.2"` + `"22.04"`
 ///   → `"1.89.0+dfsg2~22.04-0ubuntu3~22.04.1"`
 pub fn compute_backport_version(current_version: &str, target_series: &str) -> String {
-    // Split on the first `-`.  Debian version strings guarantee at least one
-    // `-` separating the upstream version from the revision.
+    match RustcPackageVersion::parse(current_version) {
+        Ok(mut v) => {
+            v.to_backport(target_series);
+            v.to_string()
+        }
+        Err(_) => {
+            // Fallback for versions that don't fully conform to the new schema
+            // (e.g. legacy format). Use the old string-manipulation approach.
+            compute_backport_version_legacy(current_version, target_series)
+        }
+    }
+}
+
+/// Legacy fallback for computing a backport version via string manipulation.
+///
+/// This handles version strings that don't conform to the new schema (e.g.
+/// older legacy format packages). The algorithm:
+/// 1. Split on the first `-` to get upstream + debian revision.
+/// 2. Strip any trailing `~XX.YY[.Z…]` suffix from both parts.
+/// 3. Append `~<target_series>` and `~<target_series>.1` respectively.
+fn compute_backport_version_legacy(current_version: &str, target_series: &str) -> String {
     let (upstream_raw, debian_rev_raw) = match current_version.split_once('-') {
         Some(pair) => pair,
         None => {
-            // Fallback: treat the whole string as the upstream part.
             return format!("{current_version}~{target_series}-0ubuntu1~{target_series}.1");
         }
     };
