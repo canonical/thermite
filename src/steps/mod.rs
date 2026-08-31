@@ -9,5 +9,6 @@ pub mod git;
 pub mod lintian;
 pub mod patches;
 pub mod ppa;
+pub mod tarball_fetch;
 pub mod uscan;
 pub mod vendor;
