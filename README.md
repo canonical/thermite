@@ -266,18 +266,18 @@ start of each phase.
 | 1 | Create a Launchpad bug report (optional for proactive backports) | Interactive |
 | 2 | Set up Git branch (`<release>-X.Y` from `<source_release>-X.Y`, or `merge-X.Y` when the source is the devel release) | Automated |
 | 3 | Compute and apply backport version string; update `debian/changelog` | Automated |
-| 4 | Generate orig tarball with `uscan`; rename to include `~<series>` suffix | Automated |
-| 5 | Generate orig-vendor tarball with `debian/rules vendor-tarball` | Automated |
-| 6 | Compatibility Checks — check and apply changes for LLVM, libgit2, dh-cargo, pkgconf, cmake, debhelper-compat | Interactive |
+| 4 | Compatibility checks — LLVM, libgit2, dh-cargo, pkgconf, cmake, debhelper-compat against the target release | Interactive |
+| 5 | Provide orig tarball — reuse locally, download automatically from the staging PPA / Ubuntu archive, or regenerate with `uscan` | Interactive |
+| 6 | Provide orig-vendor tarball — reuse, download, or regenerate with `debian/rules vendor-tarball` | Interactive |
 | 7 | Disable autopkgtest self-build test in `debian/tests/control` | Automated |
 | 8 | Local build and bug fixing with `sbuild` (skippable) | Interactive |
-| 9 | Build source package with `dpkg-buildpackage -S` (skippable if `.dsc` exists) | Automated |
+| 9 | Build source package with `dpkg-buildpackage -S` (skippable if `.dsc` exists) | Interactive |
 | 10 | Lintian checks on the source package (skippable) | Interactive |
 | 11 | PPA build — upload to personal Launchpad PPA and verify all architectures | Interactive |
 | 12 | Staging PPA upload — update changelog and upload to `ppa:rust-toolchain/staging` | Interactive |
-| 13 | Run `autopkgtest`s via the staging PPA | Interactive |
-| 14 | Push branch to the Foundations repository | Automated |
-| 15 | Archive upload request (optional — priority backports only) | Interactive |
+| 13 | Autopkgtests — trigger and verify via `ppa tests` on the staging PPA | Interactive |
+| 14 | Push branch to the Foundations rustc repository | Interactive |
+| 15 | Archive upload (optional) — request via the Ubuntu Security team | Interactive |
 
 ---
 

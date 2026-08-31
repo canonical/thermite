@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::error::{Result, ThermiteError};
 use crate::shell;
-use crate::steps::{build, changelog, compat, git, lintian, ppa, uscan, vendor};
+use crate::steps::{build, changelog, compat, git, lintian, ppa, tarball_fetch, uscan, vendor};
 use crate::types::params::BackportParams;
 use crate::ui::{
     confirm_sink, print_info_box, print_phase_header, print_tool_checks, prompt_input,
@@ -987,7 +987,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             reuse_header,
             &format!("               {}", expected_tarball.display()),
             "",
-            "  DOWNLOAD   — No Files-Excluded change; tarball not yet local. Download from the staging PPA, name the file exactly:",
+            "  DOWNLOAD   — No Files-Excluded change; tarball not yet local. Fetch automatically from the staging PPA or Ubuntu archive (falls back to manual placement, file named exactly):",
             &format!("               {expected_tarball_name}"),
             &format!("               and place it in: {}", parent_dir.display()),
             "",
@@ -1005,7 +1005,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         "How would you like to provide the orig tarball?",
         &[
             reuse_label,
-            "Download   — I will place the correctly-named tarball in the parent directory",
+            "Download   — fetch automatically from the staging PPA / Ubuntu archive (falls back to manual placement)",
             "Regenerate — run uscan now (20–60 min; required if Files-Excluded changed)",
             "Abort",
         ],
@@ -1028,15 +1028,27 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             expected_tarball
         }
         1 => {
-            // Download: pause for the user to place the file, then verify it exists.
-            if prompt_select(
-                "Place the tarball at the path shown above, then continue.",
-                &["I've placed the tarball — continue", "Abort"],
-                0,
-            ) != 0
-            {
-                println!("Aborted.");
-                return Ok(());
+            // Download: try to fetch automatically from the staging PPA or the
+            // Ubuntu archive; fall back to manual placement.
+            let fetched = tarball_fetch::fetch_backport_tarball(
+                &rust_short,
+                rust_ver,
+                target_series,
+                &parent_dir,
+                tarball_fetch::TarballKind::Orig,
+            )
+            .await?;
+            if fetched.is_none() {
+                println!("  Automated download unavailable — place the tarball manually.");
+                if prompt_select(
+                    "Place the tarball at the path shown above, then continue.",
+                    &["I've placed the tarball — continue", "Abort"],
+                    0,
+                ) != 0
+                {
+                    println!("Aborted.");
+                    return Ok(());
+                }
             }
             if !expected_tarball.exists() {
                 return Err(crate::error::ThermiteError::CommandFailed {
@@ -1063,7 +1075,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         }
         _ => {
             // Abort
-            println!("\n  Aborted at Phase 4. Re-run when ready to provide the orig tarball.");
+            println!("\n  Aborted at Phase 5. Re-run when ready to provide the orig tarball.");
             return Ok(());
         }
     };
@@ -1093,7 +1105,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             vendor_reuse_header,
             &format!("               {}", expected_vendor_tarball.display()),
             "",
-            "  DOWNLOAD   — Vendor tarball not yet local. Download from the staging PPA (e.g. from a previous build attempt), name the file exactly:",
+            "  DOWNLOAD   — Vendor tarball not yet local. Fetch automatically from the staging PPA or Ubuntu archive (e.g. from a previous build attempt; falls back to manual placement, file named exactly):",
             &format!("               {vendor_tarball_name}"),
             &format!("               and place it in: {}", parent_dir.display()),
             "",
@@ -1111,7 +1123,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         "How would you like to provide the orig-vendor tarball?",
         &[
             vendor_reuse_label,
-            "Download   — I will place the correctly-named vendor tarball in the parent directory",
+            "Download   — fetch automatically from the staging PPA / Ubuntu archive (falls back to manual placement)",
             "Regenerate — build it now (installs the Rust toolchain via rustup; slow)",
             "Abort",
         ],
@@ -1134,15 +1146,27 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             expected_vendor_tarball
         }
         1 => {
-            // Download: pause for the user to place the file, then verify it exists.
-            if prompt_select(
-                "Place the vendor tarball at the path shown above, then continue.",
-                &["I've placed the vendor tarball — continue", "Abort"],
-                0,
-            ) != 0
-            {
-                println!("Aborted.");
-                return Ok(());
+            // Download: try to fetch automatically from the staging PPA or the
+            // Ubuntu archive; fall back to manual placement.
+            let fetched = tarball_fetch::fetch_backport_tarball(
+                &rust_short,
+                rust_ver,
+                target_series,
+                &parent_dir,
+                tarball_fetch::TarballKind::OrigVendor,
+            )
+            .await?;
+            if fetched.is_none() {
+                println!("  Automated download unavailable — place the vendor tarball manually.");
+                if prompt_select(
+                    "Place the vendor tarball at the path shown above, then continue.",
+                    &["I've placed the vendor tarball — continue", "Abort"],
+                    0,
+                ) != 0
+                {
+                    println!("Aborted.");
+                    return Ok(());
+                }
             }
             if !expected_vendor_tarball.exists() {
                 return Err(crate::error::ThermiteError::CommandFailed {
@@ -1181,7 +1205,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         _ => {
             // Abort
             println!(
-                "\n  Aborted at Phase 5. Re-run when ready to provide the orig-vendor tarball."
+                "\n  Aborted at Phase 6. Re-run when ready to provide the orig-vendor tarball."
             );
             return Ok(());
         }

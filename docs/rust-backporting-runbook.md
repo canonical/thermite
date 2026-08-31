@@ -419,13 +419,31 @@ This step takes 20–60 minutes. The log file is useful for debugging.
 #### 3.3.2 Downloading the Orig Tarball from Launchpad
 
 If no changes to `Files-Excluded` were made, the tarball can be reused from a prior upload.
-Find it under the package files for either the Ubuntu Archive or the staging PPA:
+When the **Download** option is selected in thermite, it attempts an automated fetch from,
+in order:
 
-```
-https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/+packages
-```
+1. The rust-toolchain staging PPA, whose published source files already carry the
+   `~<release_number>` suffix of a previous backport upload:
 
-Download the `.orig.tar.xz` file and place it in `~/rustc/`.
+   ```
+   https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/+files/<filename>
+   ```
+
+2. The primary Ubuntu archive, reusing the `.orig.tar.xz` published for the same upstream
+   version (candidate filenames are resolved with `rmadison -u ubuntu rustc-<X.Y>`):
+
+   ```
+   https://launchpad.net/ubuntu/+archive/primary/+files/<filename>
+   ```
+
+Downloads use `wget` (or `curl`) and are saved directly under the expected
+`rustc-<X.Y>_<X.Y.Z>+dfsg~<release_number>.orig.tar.xz` name in `~/rustc/`.
+
+If neither source has the tarball (e.g. this is the first backport attempt for the
+version), thermite falls back to a manual-placement prompt: download the `.orig.tar.xz`
+file from the staging PPA package page at
+`https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/+packages`, name it exactly
+as prompted, and place it in `~/rustc/`.
 
 #### 3.3.3 Generating the Vendor Tarball (Rust 1.89+)
 
