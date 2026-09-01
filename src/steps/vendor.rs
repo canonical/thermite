@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use tracing::info;
+
 use crate::error::{Result, ThermiteError};
 use crate::shell::{run_command, which};
 use crate::types::versions::RustVersion;
@@ -100,8 +102,87 @@ pub async fn generate_vendor_tarball(
     Ok(tarball_path)
 }
 
+/// Returns `true` when `name` is an orig-vendor tarball for `version` carrying
+/// a series suffix other than the expected one (i.e. a leftover from a
+/// previous series build that would make `debian/rules vendor-tarball-quick-check`
+/// abort).
+fn is_stale_series_vendor_tarball(name: &str, version: &RustVersion, expected_name: &str) -> bool {
+    let short = version.short();
+    let prefix = format!("rustc-{short}_{version}+dfsg");
+    name.starts_with(&prefix) && name.ends_with(".orig-vendor.tar.xz") && name != expected_name
+}
+
+/// Remove any stale orig-vendor tarballs for `version` in `parent_dir` that
+/// would cause `debian/rules vendor-tarball-quick-check` to abort, then run
+/// `debian/rules vendor-tarball` and return the generated tarball path.
+///
+/// Stale tarballs arise when the same package was previously built for a
+/// different Ubuntu series (e.g. a `~22.04` tarball left over from a jammy
+/// build when we are now targeting focal `~20.04`). Cleanup only runs in
+/// series mode (non-empty `dfsg_suffix`) so plain update-style regeneration
+/// never deletes series-suffixed tarballs.
+pub async fn generate_vendor_tarball_clean(
+    repo_dir: &Path,
+    rust_bootstrap_dir: &Path,
+    version: &RustVersion,
+    dfsg_suffix: &str,
+) -> Result<PathBuf> {
+    let parent = repo_dir.parent().unwrap_or(repo_dir);
+
+    if !dfsg_suffix.is_empty() {
+        let short = version.short();
+        let expected_name = format!("rustc-{short}_{version}+dfsg{dfsg_suffix}.orig-vendor.tar.xz");
+        let stale: Vec<_> = std::fs::read_dir(parent)
+            .map_err(ThermiteError::Io)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| is_stale_series_vendor_tarball(n, version, &expected_name))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if !stale.is_empty() {
+            println!("  Removing stale vendor tarballs from previous series builds:");
+            for path in &stale {
+                println!("    {}", path.display());
+                std::fs::remove_file(path).map_err(ThermiteError::Io)?;
+            }
+        }
+    }
+
+    info!("generating vendor tarball");
+    generate_vendor_tarball(repo_dir, rust_bootstrap_dir, version, dfsg_suffix).await
+}
+
+/// Extract the top-level `vendor/` directory from `tarball` into `repo_dir`.
+///
+/// When `replace` is `true` the existing `vendor/` directory is removed first
+/// (clean replace per the backporting runbook § 3.3.3); otherwise the archive
+/// is extracted over the existing tree (merge).
+pub async fn overlay_vendor_dir(tarball: &Path, repo_dir: &Path, replace: bool) -> Result<()> {
+    let vendor_dir = repo_dir.join("vendor");
+    if replace && vendor_dir.is_dir() {
+        std::fs::remove_dir_all(&vendor_dir).map_err(ThermiteError::Io)?;
+    }
+
+    let tarball_str = tarball.to_string_lossy().to_string();
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    run_command(
+        "tar",
+        &["-xJf", &tarball_str, "-C", &repo_str],
+        repo_dir,
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::types::versions::RustVersion;
 
     /// Finding 6: the vendor tarball name is derived deterministically from the
@@ -112,5 +193,46 @@ mod tests {
         let short = version.short();
         let name = format!("rustc-{short}_{version}+dfsg.orig-vendor.tar.xz");
         assert_eq!(name, "rustc-1.85_1.85.0+dfsg.orig-vendor.tar.xz");
+    }
+
+    #[test]
+    fn stale_detection_flags_other_series_tarballs() {
+        let version = RustVersion::parse("1.85.0").unwrap();
+        let expected = "rustc-1.85_1.85.0+dfsg~20.04.orig-vendor.tar.xz";
+        assert!(is_stale_series_vendor_tarball(
+            "rustc-1.85_1.85.0+dfsg~22.04.orig-vendor.tar.xz",
+            &version,
+            expected
+        ));
+        assert!(is_stale_series_vendor_tarball(
+            "rustc-1.85_1.85.0+dfsg1~22.04.orig-vendor.tar.xz",
+            &version,
+            expected
+        ));
+    }
+
+    #[test]
+    fn stale_detection_keeps_expected_tarball() {
+        let version = RustVersion::parse("1.85.0").unwrap();
+        let expected = "rustc-1.85_1.85.0+dfsg~20.04.orig-vendor.tar.xz";
+        assert!(!is_stale_series_vendor_tarball(
+            expected, &version, expected
+        ));
+    }
+
+    #[test]
+    fn stale_detection_ignores_other_kinds_and_versions() {
+        let version = RustVersion::parse("1.85.0").unwrap();
+        let expected = "rustc-1.85_1.85.0+dfsg~20.04.orig-vendor.tar.xz";
+        assert!(!is_stale_series_vendor_tarball(
+            "rustc-1.85_1.85.0+dfsg~20.04.orig.tar.xz",
+            &version,
+            expected
+        ));
+        assert!(!is_stale_series_vendor_tarball(
+            "rustc-1.84_1.84.0+dfsg~22.04.orig-vendor.tar.xz",
+            &version,
+            expected
+        ));
     }
 }

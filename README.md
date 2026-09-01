@@ -102,6 +102,7 @@ Options:
 Commands:
   update    Package a new upstream Rust toolchain release for Ubuntu
   backport  Backport an existing Rust toolchain package to an older Ubuntu release
+  tarball   Download or regenerate the orig and orig-vendor source tarballs
   help      Print this message or the help of the given subcommand(s)
 ```
 
@@ -217,6 +218,67 @@ thermite -vv backport \
 Pass `-vv` to display a concise explanation of what each phase does and why,
 together with a link to the relevant section of the official docs.
 Pass `-v` (single) to print each external command without the explanations.
+
+### `thermite tarball`
+
+Standalone management of the two source tarballs outside the full update/backport
+workflows. Each tarball can either be **downloaded** (staging PPA first, then the
+Ubuntu primary archive via `rmadison`, with a manual-placement fallback) or
+**generated** (`uscan` for the orig tarball; `rustup` + `cargo-vendor-filterer` +
+`debian/rules vendor-tarball` for the vendor tarball).
+
+```
+thermite tarball download orig|vendor|all [OPTIONS]
+thermite tarball generate orig|vendor|all [OPTIONS]
+
+  -u, --rust-version   <X.Y.Z>  Full Rust version the tarballs are named after
+  --series             <NAME>   Ubuntu release adjective for backport-style names
+                                (e.g. noble → '+dfsg~26.04'). Omit for plain
+                                update naming ('+dfsg')
+  -d, --repo-dir       <PATH>   Debian source package root
+                                [default: current directory]
+
+generate only:
+  --force                       Overwrite a tarball that already exists in the
+                                parent directory (without it, generate refuses)
+
+vendor and all only:
+  --overlay                     Extract the vendor tarball's vendor/ directory
+                                into the repo dir after obtaining it [default]
+  --no-overlay                  Do not touch the working tree
+  --overlay-replace             Remove the existing vendor/ directory before
+                                overlaying (clean replace instead of merge)
+```
+
+Downloads are idempotent: an existing tarball is reused. Generation overwrites
+only with `--force`. The vendor tarball generation requires `rustup` and produces
+`../rustc-<X.Y>_<X.Y.Z>+dfsg[~<series>].orig-vendor.tar.xz`.
+
+#### Example: regenerate the orig tarball for a backport
+
+```sh
+cd ~/rustc/rustc
+thermite tarball generate orig \
+  --rust-version 1.85.0 \
+  --series       noble
+# produces ../rustc-1.85_1.85.0+dfsg~26.04.orig.tar.xz
+```
+
+#### Example: generate the vendor tarball and overlay it (clean replace)
+
+```sh
+thermite tarball generate vendor \
+  --rust-version   1.85.0 \
+  --series         noble \
+  --force \
+  --overlay-replace
+```
+
+#### Example: download both tarballs for a plain update naming scheme
+
+```sh
+thermite tarball download all --rust-version 1.85.1
+```
 
 ---
 
