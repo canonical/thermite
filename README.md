@@ -244,13 +244,6 @@ generate only:
   --force                       Overwrite a tarball that already exists in the
                                 parent directory (without it, generate refuses)
 
-vendor and all only (download/generate):
-  --overlay                     Extract the vendor tarball's vendor/ directory
-                                into the repo dir after obtaining it [default]
-  --no-overlay                  Do not touch the working tree
-  --overlay-replace             Remove the existing vendor/ directory before
-                                overlaying (clean replace instead of merge)
-
 vendor and all only (overlay):
   --replace                     Remove the existing vendor/ directory before
                                 extracting (clean replace instead of merge)
@@ -258,7 +251,9 @@ vendor and all only (overlay):
 
 Downloads are idempotent: an existing tarball is reused. Generation overwrites
 only with `--force`. The vendor tarball generation requires `rustup` and produces
-`../rustc-<X.Y>_<X.Y.Z>+dfsg[~<series>].orig-vendor.tar.xz`.
+`../rustc-<X.Y>_<X.Y.Z>+dfsg[~<series>].orig-vendor.tar.xz`. Neither download
+nor generate touches the working tree — run `thermite tarball overlay`
+afterwards to extract a tarball into the repo dir.
 
 Overlay never fetches or produces tarballs: the expected tarball must already
 exist in the parent directory (use download/generate first), otherwise the
@@ -278,14 +273,17 @@ thermite tarball generate orig \
 # produces ../rustc-1.85_1.85.0+dfsg~26.04.orig.tar.xz
 ```
 
-#### Example: generate the vendor tarball and overlay it (clean replace)
+#### Example: regenerate the vendor tarball and overlay it (clean replace)
 
 ```sh
 thermite tarball generate vendor \
-  --rust-version   1.85.0 \
-  --series         noble \
-  --force \
-  --overlay-replace
+  --rust-version 1.85.0 \
+  --series       noble \
+  --force
+thermite tarball overlay vendor \
+  --rust-version 1.85.0 \
+  --series       noble \
+  --replace
 ```
 
 #### Example: download both tarballs for a plain update naming scheme
