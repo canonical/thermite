@@ -157,29 +157,6 @@ pub async fn generate_vendor_tarball_clean(
     generate_vendor_tarball(repo_dir, rust_bootstrap_dir, version, dfsg_suffix).await
 }
 
-/// Extract the top-level `vendor/` directory from `tarball` into `repo_dir`.
-///
-/// When `replace` is `true` the existing `vendor/` directory is removed first
-/// (clean replace per the backporting runbook § 3.3.3); otherwise the archive
-/// is extracted over the existing tree (merge).
-pub async fn overlay_vendor_dir(tarball: &Path, repo_dir: &Path, replace: bool) -> Result<()> {
-    let vendor_dir = repo_dir.join("vendor");
-    if replace && vendor_dir.is_dir() {
-        std::fs::remove_dir_all(&vendor_dir).map_err(ThermiteError::Io)?;
-    }
-
-    let tarball_str = tarball.to_string_lossy().to_string();
-    let repo_str = repo_dir.to_string_lossy().to_string();
-    run_command(
-        "tar",
-        &["-xJf", &tarball_str, "-C", &repo_str],
-        repo_dir,
-        &[],
-    )
-    .await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -296,6 +296,8 @@ pub enum TarballAction {
     Download,
     /// Produce the tarball locally (uscan / `debian/rules vendor-tarball`).
     Generate,
+    /// Extract an existing tarball's contents into the repo directory.
+    Overlay,
 }
 
 /// Parameters for the `thermite tarball` command suite.
@@ -461,6 +463,15 @@ mod tarball_params_tests {
         assert_eq!(p.action, TarballAction::Generate);
         assert!(p.force);
         assert!(!p.overlay);
+        assert!(p.overlay_replace);
+    }
+
+    #[test]
+    fn overlay_action_is_stored() {
+        let p =
+            TarballParams::new(TarballAction::Overlay, "1.85.0", None, false, true, true).unwrap();
+        assert_eq!(p.action, TarballAction::Overlay);
+        assert!(p.overlay);
         assert!(p.overlay_replace);
     }
 }

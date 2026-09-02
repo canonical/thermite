@@ -7,6 +7,7 @@ pub mod copyright;
 pub mod gbp;
 pub mod git;
 pub mod lintian;
+pub mod overlay;
 pub mod patches;
 pub mod ppa;
 pub mod tarball_fetch;
