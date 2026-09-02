@@ -32,15 +32,18 @@ impl TarballKind {
     }
 }
 
-/// Build the exact backport tarball filename thermite expects in `dest_dir`.
-pub fn expected_backport_tarball_name(
+/// Build the exact tarball filename thermite expects in `dest_dir`.
+///
+/// `dfsg_suffix` is appended after `+dfsg`: `""` for plain update naming or
+/// `"~<series>"` (e.g. `"~26.04"`) for backport naming.
+pub fn expected_tarball_name(
     rust_short: &ShortRustVersion,
     rust_ver: &RustVersion,
-    target_series: &str,
+    dfsg_suffix: &str,
     kind: TarballKind,
 ) -> String {
     format!(
-        "rustc-{rust_short}_{rust_ver}+dfsg~{target_series}{}",
+        "rustc-{rust_short}_{rust_ver}+dfsg{dfsg_suffix}{}",
         kind.tail()
     )
 }
@@ -122,7 +125,7 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<()> {
     }
 }
 
-/// Attempt to fetch a backport source tarball automatically.
+/// Attempt to fetch a source tarball automatically.
 ///
 /// Candidate sources, in order:
 ///
@@ -131,17 +134,20 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<()> {
 /// 2. the primary Ubuntu archive, reusing the orig tarball published for the
 ///    same upstream version (located via `rmadison`).
 ///
+/// `dfsg_suffix` is appended after `+dfsg` in the expected filename: `""` for
+/// plain update naming or `"~<series>"` for backport naming.
+///
 /// Returns `Ok(Some(path))` when the tarball is available at the expected
 /// location (already present or downloaded), and `Ok(None)` when no candidate
 /// has it — the caller should fall back to manual placement.
-pub async fn fetch_backport_tarball(
+pub async fn fetch_tarball(
     rust_short: &ShortRustVersion,
     rust_ver: &RustVersion,
-    target_series: &str,
+    dfsg_suffix: &str,
     dest_dir: &Path,
     kind: TarballKind,
 ) -> Result<Option<PathBuf>> {
-    let name = expected_backport_tarball_name(rust_short, rust_ver, target_series, kind);
+    let name = expected_tarball_name(rust_short, rust_ver, dfsg_suffix, kind);
     let dest = dest_dir.join(&name);
     if dest.exists() {
         return Ok(Some(dest));
@@ -207,17 +213,20 @@ mod tests {
         let rust_ver = ver(0);
         let rust_short = rust_ver.short();
         assert_eq!(
-            expected_backport_tarball_name(&rust_short, &rust_ver, "26.04", TarballKind::Orig),
+            expected_tarball_name(&rust_short, &rust_ver, "~26.04", TarballKind::Orig),
             "rustc-1.96_1.96.0+dfsg~26.04.orig.tar.xz"
         );
         assert_eq!(
-            expected_backport_tarball_name(
-                &rust_short,
-                &rust_ver,
-                "26.04",
-                TarballKind::OrigVendor
-            ),
+            expected_tarball_name(&rust_short, &rust_ver, "~26.04", TarballKind::OrigVendor),
             "rustc-1.96_1.96.0+dfsg~26.04.orig-vendor.tar.xz"
+        );
+        assert_eq!(
+            expected_tarball_name(&rust_short, &rust_ver, "", TarballKind::Orig),
+            "rustc-1.96_1.96.0+dfsg.orig.tar.xz"
+        );
+        assert_eq!(
+            expected_tarball_name(&rust_short, &rust_ver, "", TarballKind::OrigVendor),
+            "rustc-1.96_1.96.0+dfsg.orig-vendor.tar.xz"
         );
     }
 

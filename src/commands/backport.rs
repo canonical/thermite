@@ -257,60 +257,6 @@ async fn handle_manual_self_build_removal() {
     }
 }
 
-/// Remove any stale orig-vendor tarballs for `version` in `parent_dir` that
-/// would cause `debian/rules vendor-tarball-quick-check` to abort, then run
-/// `debian/rules vendor-tarball` and return the generated tarball path.
-///
-/// Stale tarballs arise when the same package was previously built for a
-/// different Ubuntu series (e.g. a `~22.04` tarball left over from a jammy
-/// build when we are now targeting focal `~20.04`).
-async fn generate_vendor_tarball_for_backport(
-    repo_dir: &std::path::Path,
-    rust_bootstrap_dir: &std::path::Path,
-    version: &crate::types::versions::RustVersion,
-    target_series: &str,
-    parent_dir: &std::path::Path,
-) -> Result<std::path::PathBuf> {
-    let short = version.short();
-    let expected_name = format!("rustc-{short}_{version}+dfsg~{target_series}.orig-vendor.tar.xz");
-    let expected_path = parent_dir.join(&expected_name);
-
-    // Scan for tarballs that share the same version prefix but have a
-    // different series suffix — these will cause the quick-check to fail.
-    let stale: Vec<_> = std::fs::read_dir(parent_dir)
-        .map_err(crate::error::ThermiteError::Io)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| {
-                    n.starts_with(&format!("rustc-{short}_{version}+dfsg"))
-                        && n.ends_with(".orig-vendor.tar.xz")
-                        && *p != expected_path
-                })
-                .unwrap_or(false)
-        })
-        .collect();
-
-    if !stale.is_empty() {
-        println!("  Removing stale vendor tarballs from previous series builds:");
-        for path in &stale {
-            println!("    {}", path.display());
-            std::fs::remove_file(path).map_err(crate::error::ThermiteError::Io)?;
-        }
-    }
-
-    info!("generating vendor tarball");
-    vendor::generate_vendor_tarball(
-        repo_dir,
-        rust_bootstrap_dir,
-        version,
-        &format!("~{target_series}"),
-    )
-    .await
-}
-
 /// Pure decision logic for the source-branch resolver used in Phase 2.
 ///
 /// Given the two candidate branch names (`primary` = `<source_release>-X.Y`,
@@ -1030,10 +976,10 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         1 => {
             // Download: try to fetch automatically from the staging PPA or the
             // Ubuntu archive; fall back to manual placement.
-            let fetched = tarball_fetch::fetch_backport_tarball(
+            let fetched = tarball_fetch::fetch_tarball(
                 &rust_short,
                 rust_ver,
-                target_series,
+                &format!("~{target_series}"),
                 &parent_dir,
                 tarball_fetch::TarballKind::Orig,
             )
@@ -1148,10 +1094,10 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         1 => {
             // Download: try to fetch automatically from the staging PPA or the
             // Ubuntu archive; fall back to manual placement.
-            let fetched = tarball_fetch::fetch_backport_tarball(
+            let fetched = tarball_fetch::fetch_tarball(
                 &rust_short,
                 rust_ver,
-                target_series,
+                &format!("~{target_series}"),
                 &parent_dir,
                 tarball_fetch::TarballKind::OrigVendor,
             )
@@ -1193,12 +1139,11 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             }
             info!("installing Rust toolchain {rust_ver}");
             let rust_bootstrap_dir = vendor::rustup_install_toolchain(rust_ver).await?;
-            generate_vendor_tarball_for_backport(
+            vendor::generate_vendor_tarball_clean(
                 repo_dir,
                 &rust_bootstrap_dir,
                 rust_ver,
-                target_series,
-                &parent_dir,
+                &format!("~{target_series}"),
             )
             .await?
         }

@@ -289,6 +289,182 @@ mod backport_params_tests {
     }
 }
 
+/// The action requested from the `thermite tarball` command suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TarballAction {
+    /// Fetch the tarball from the staging PPA / Ubuntu archive when missing.
+    Download,
+    /// Produce the tarball locally (uscan / `debian/rules vendor-tarball`).
+    Generate,
+}
+
+/// Parameters for the `thermite tarball` command suite.
+///
+/// All values are validated on construction.
+#[derive(Debug, Clone)]
+pub struct TarballParams {
+    /// Action requested for the targeted tarballs.
+    pub action: TarballAction,
+    /// Full Rust version the tarballs are named after, e.g. `"1.85.0"`.
+    pub rust_version: RustVersion,
+    /// Target Ubuntu release adjective used for backport naming
+    /// (e.g. `noble` → `+dfsg~26.04` tarball names). `None` selects the
+    /// plain update naming (`+dfsg`, no series suffix).
+    pub series: Option<UbuntuRelease>,
+    /// When `true`, `generate` may overwrite tarballs that already exist in
+    /// the parent directory. Without it, `generate` refuses and points at the
+    /// existing file.
+    pub force: bool,
+    /// When `true`, the freshly obtained vendor tarball is extracted into the
+    /// repo directory after download or generation. Defaults to on at the CLI
+    /// level; only meaningful for vendor tarballs.
+    pub overlay: bool,
+    /// When `true`, overlaying first removes the existing `vendor/` directory
+    /// (clean replace per the runbook) instead of merging over it.
+    pub overlay_replace: bool,
+}
+
+impl TarballParams {
+    /// Construct and validate a new [`TarballParams`].
+    ///
+    /// `series` is an Ubuntu release adjective (e.g. `"noble"`) or `None` for
+    /// plain update naming.
+    pub fn new(
+        action: TarballAction,
+        rust_version: &str,
+        series: Option<&str>,
+        force: bool,
+        overlay: bool,
+        overlay_replace: bool,
+    ) -> Result<Self> {
+        let series = match series {
+            None => None,
+            Some(s) if s.eq_ignore_ascii_case("devel") => {
+                return Err(ThermiteError::InvalidBackportReleases(
+                    "cannot use 'devel' as --series; specify a concrete release \
+                     (e.g. 'resolute', 'noble')"
+                        .to_owned(),
+                ));
+            }
+            Some(s) => Some(UbuntuRelease::parse(s)?),
+        };
+        Ok(Self {
+            action,
+            rust_version: RustVersion::parse(rust_version)?,
+            series,
+            force,
+            overlay,
+            overlay_replace,
+        })
+    }
+
+    /// The `+dfsg` suffix component used in tarball filenames: `""` for plain
+    /// update naming or `"~<series>"` (e.g. `"~26.04"`) for backport naming.
+    pub fn dfsg_suffix(&self) -> String {
+        match &self.series {
+            None => String::new(),
+            Some(r) => format!("~{}", r.series_number()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tarball_params_tests {
+    use super::*;
+
+    fn valid_params() -> TarballParams {
+        TarballParams::new(TarballAction::Download, "1.85.0", None, false, true, false).unwrap()
+    }
+
+    #[test]
+    fn valid_tarball_params_constructs_successfully() {
+        let p = valid_params();
+        assert_eq!(p.rust_version, RustVersion::parse("1.85.0").unwrap());
+        assert_eq!(p.series, None);
+        assert_eq!(p.action, TarballAction::Download);
+        assert!(!p.force);
+        assert!(p.overlay);
+        assert!(!p.overlay_replace);
+    }
+
+    #[test]
+    fn dfsg_suffix_empty_without_series() {
+        assert_eq!(valid_params().dfsg_suffix(), "");
+    }
+
+    #[test]
+    fn dfsg_suffix_contains_series_number() {
+        let p = TarballParams::new(
+            TarballAction::Generate,
+            "1.85.0",
+            Some("noble"),
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(p.dfsg_suffix(), "~24.04");
+    }
+
+    #[test]
+    fn invalid_series_release_rejected() {
+        let result = TarballParams::new(
+            TarballAction::Generate,
+            "1.85.0",
+            Some("bogus"),
+            false,
+            true,
+            false,
+        );
+        assert!(
+            matches!(result, Err(ThermiteError::UnknownRelease(_))),
+            "expected UnknownRelease, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn devel_series_rejected() {
+        let result = TarballParams::new(
+            TarballAction::Generate,
+            "1.85.0",
+            Some("devel"),
+            false,
+            true,
+            false,
+        );
+        assert!(
+            matches!(result, Err(ThermiteError::InvalidBackportReleases(_))),
+            "expected InvalidBackportReleases, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_rust_version_rejected() {
+        let result = TarballParams::new(TarballAction::Generate, "1.85", None, false, true, false);
+        assert!(
+            matches!(result, Err(ThermiteError::InvalidRustVersion(_))),
+            "expected InvalidRustVersion, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn flags_are_stored() {
+        let p = TarballParams::new(
+            TarballAction::Generate,
+            "1.85.0",
+            Some("noble"),
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(p.action, TarballAction::Generate);
+        assert!(p.force);
+        assert!(!p.overlay);
+        assert!(p.overlay_replace);
+    }
+}
+
 /// Parameters for the `thermite update` command.
 ///
 /// All values are validated on construction. The short version fields are
