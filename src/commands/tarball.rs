@@ -141,10 +141,9 @@ async fn download_orig(
 /// file or by fetching it from the staging PPA / Ubuntu archive.
 ///
 /// Falls back to a manual-placement prompt when no candidate source has it.
-/// When `params.overlay` is set, the tarball is extracted into the repo dir.
 async fn download_vendor(
     params: &TarballParams,
-    repo_dir: &Path,
+    _repo_dir: &Path,
     parent_dir: &Path,
 ) -> Result<PathBuf> {
     let rust_ver = &params.rust_version;
@@ -161,7 +160,7 @@ async fn download_vendor(
 
     if expected.exists() {
         println!("  Vendor tarball already present: {}", expected.display());
-        return finish_vendor_download(params, repo_dir, expected).await;
+        return Ok(expected);
     }
 
     print_info_box(
@@ -215,21 +214,7 @@ async fn download_vendor(
             ),
         });
     }
-    finish_vendor_download(params, repo_dir, expected).await
-}
-
-/// Overlay a freshly downloaded vendor tarball into the repo dir when
-/// `params.overlay` is set.
-async fn finish_vendor_download(
-    params: &TarballParams,
-    repo_dir: &Path,
-    tarball: PathBuf,
-) -> Result<PathBuf> {
-    if params.overlay {
-        info!("overlaying vendor tarball into {}", repo_dir.display());
-        vendor_overlay(params, repo_dir, &tarball).await?;
-    }
-    Ok(tarball)
+    Ok(expected)
 }
 
 /// Regenerate the orig tarball by running uscan.
@@ -264,9 +249,6 @@ async fn generate_orig(
 
 /// Regenerate the vendor tarball: install the matching toolchain via rustup,
 /// install `cargo-vendor-filterer`, then run `debian/rules vendor-tarball`.
-///
-/// When `params.overlay` is set, the freshly generated tarball is extracted
-/// into the repo dir.
 async fn generate_vendor(
     params: &TarballParams,
     repo_dir: &Path,
@@ -298,10 +280,6 @@ async fn generate_vendor(
         vendor::generate_vendor_tarball_clean(repo_dir, &rust_bootstrap_dir, rust_ver, &suffix)
             .await?;
 
-    if params.overlay {
-        info!("overlaying vendor tarball into {}", repo_dir.display());
-        vendor_overlay(params, repo_dir, &tarball).await?;
-    }
     Ok(tarball)
 }
 
@@ -402,15 +380,16 @@ pub async fn run(params: &TarballParams, repo_dir: &Path, target: TarballTarget)
     if params.action == TarballAction::Generate {
         lines.push(format!("  Force        : {}", params.force));
     }
-    lines.push(format!("  Overlay      : {}", params.overlay));
-    lines.push(format!(
-        "  Overlay mode : {}",
-        if params.overlay_replace {
-            "clean replace"
-        } else {
-            "merge"
-        }
-    ));
+    if params.action == TarballAction::Overlay {
+        lines.push(format!(
+            "  Overlay mode : {}",
+            if params.overlay_replace {
+                "clean replace"
+            } else {
+                "merge"
+            }
+        ));
+    }
     let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
     print_info_box("Tarball parameters", &line_refs);
 
@@ -508,7 +487,7 @@ mod tests {
     fn overlay_locator_errors_when_tarball_missing() {
         let tmp = temp_dir("overlay-missing");
         let params =
-            TarballParams::new(TarballAction::Overlay, "1.85.0", None, false, true, false).unwrap();
+            TarballParams::new(TarballAction::Overlay, "1.85.0", None, false, false).unwrap();
 
         let err =
             locate_expected_tarball(&params, &tmp, tarball_fetch::TarballKind::Orig).unwrap_err();
@@ -533,7 +512,7 @@ mod tests {
         let tarball = tmp.join("rustc-1.85_1.85.0+dfsg.orig.tar.xz");
         fs::write(&tarball, b"tarball").unwrap();
         let params =
-            TarballParams::new(TarballAction::Overlay, "1.85.0", None, false, true, false).unwrap();
+            TarballParams::new(TarballAction::Overlay, "1.85.0", None, false, false).unwrap();
 
         let found = locate_expected_tarball(&params, &tmp, tarball_fetch::TarballKind::Orig)
             .expect("existing tarball should be located");
@@ -552,7 +531,6 @@ mod tests {
             "1.85.0",
             Some("noble"),
             false,
-            true,
             false,
         )
         .unwrap();
