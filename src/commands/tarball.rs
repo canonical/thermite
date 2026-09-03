@@ -57,26 +57,31 @@ async fn handle_existing_for_generate(tarball: &Path, force: bool) -> Result<()>
     })
 }
 
+/// Build the expected path of the `kind` tarball for `params` in `parent_dir`.
+fn expected_tarball_path(
+    params: &TarballParams,
+    parent_dir: &Path,
+    kind: tarball_fetch::TarballKind,
+) -> PathBuf {
+    let rust_ver = &params.rust_version;
+    let name = tarball_fetch::expected_tarball_name(
+        &rust_ver.short(),
+        rust_ver,
+        &params.dfsg_suffix(),
+        kind,
+    );
+    parent_dir.join(name)
+}
+
 /// Ensure the orig tarball exists locally, either by reusing an existing file
 /// or by fetching it from the staging PPA / Ubuntu archive.
 ///
 /// Falls back to a manual-placement prompt when no candidate source has it.
-async fn download_orig(
-    params: &TarballParams,
-    _repo_dir: &Path,
-    parent_dir: &Path,
-) -> Result<PathBuf> {
+async fn download_orig(params: &TarballParams, parent_dir: &Path) -> Result<PathBuf> {
     let rust_ver = &params.rust_version;
     let rust_short = rust_ver.short();
     let suffix = params.dfsg_suffix();
-
-    let name = tarball_fetch::expected_tarball_name(
-        &rust_short,
-        rust_ver,
-        &suffix,
-        tarball_fetch::TarballKind::Orig,
-    );
-    let expected = parent_dir.join(&name);
+    let expected = expected_tarball_path(params, parent_dir, tarball_fetch::TarballKind::Orig);
 
     if expected.exists() {
         println!("  Orig tarball already present: {}", expected.display());
@@ -90,10 +95,8 @@ async fn download_orig(
             "  1. the rust-toolchain staging PPA (previous backport uploads), and",
             "  2. the primary Ubuntu archive (candidates resolved via rmadison).",
             "",
-            "If neither source has it, you will be asked to place the file manually,",
-            "named exactly:",
-            &format!("  {name}"),
-            &format!("in: {}", parent_dir.display()),
+            "If neither source has it, you will be asked to place the file manually at:",
+            &format!("  {}", expected.display()),
         ],
     );
 
@@ -128,9 +131,8 @@ async fn download_orig(
             stdout: String::new(),
             stderr: format!(
                 "tarball not found: {}\n\
-                 Ensure the file is named exactly '{name}' and placed in '{}'.",
+                 Place the tarball at that exact path, then re-run.",
                 expected.display(),
-                parent_dir.display(),
             ),
         });
     }
@@ -141,22 +143,12 @@ async fn download_orig(
 /// file or by fetching it from the staging PPA / Ubuntu archive.
 ///
 /// Falls back to a manual-placement prompt when no candidate source has it.
-async fn download_vendor(
-    params: &TarballParams,
-    _repo_dir: &Path,
-    parent_dir: &Path,
-) -> Result<PathBuf> {
+async fn download_vendor(params: &TarballParams, parent_dir: &Path) -> Result<PathBuf> {
     let rust_ver = &params.rust_version;
     let rust_short = rust_ver.short();
     let suffix = params.dfsg_suffix();
-
-    let name = tarball_fetch::expected_tarball_name(
-        &rust_short,
-        rust_ver,
-        &suffix,
-        tarball_fetch::TarballKind::OrigVendor,
-    );
-    let expected = parent_dir.join(&name);
+    let expected =
+        expected_tarball_path(params, parent_dir, tarball_fetch::TarballKind::OrigVendor);
 
     if expected.exists() {
         println!("  Vendor tarball already present: {}", expected.display());
@@ -170,10 +162,8 @@ async fn download_vendor(
             "  1. the rust-toolchain staging PPA (previous backport uploads), and",
             "  2. the primary Ubuntu archive (candidates resolved via rmadison).",
             "",
-            "If neither source has it, you will be asked to place the file manually,",
-            "named exactly:",
-            &format!("  {name}"),
-            &format!("in: {}", parent_dir.display()),
+            "If neither source has it, you will be asked to place the file manually at:",
+            &format!("  {}", expected.display()),
         ],
     );
 
@@ -208,9 +198,8 @@ async fn download_vendor(
             stdout: String::new(),
             stderr: format!(
                 "vendor tarball not found: {}\n\
-                 Ensure the file is named exactly '{name}' and placed in '{}'.",
+                 Place the tarball at that exact path, then re-run.",
                 expected.display(),
-                parent_dir.display(),
             ),
         });
     }
@@ -224,16 +213,8 @@ async fn generate_orig(
     parent_dir: &Path,
 ) -> Result<PathBuf> {
     let rust_ver = &params.rust_version;
-    let rust_short = rust_ver.short();
     let suffix = params.dfsg_suffix();
-
-    let name = tarball_fetch::expected_tarball_name(
-        &rust_short,
-        rust_ver,
-        &suffix,
-        tarball_fetch::TarballKind::Orig,
-    );
-    let expected = parent_dir.join(&name);
+    let expected = expected_tarball_path(params, parent_dir, tarball_fetch::TarballKind::Orig);
     handle_existing_for_generate(&expected, params.force).await?;
 
     let uscan_log = parent_dir.join(format!("uscan-{rust_ver}-tarball.log"));
@@ -255,16 +236,9 @@ async fn generate_vendor(
     parent_dir: &Path,
 ) -> Result<PathBuf> {
     let rust_ver = &params.rust_version;
-    let rust_short = rust_ver.short();
     let suffix = params.dfsg_suffix();
-
-    let name = tarball_fetch::expected_tarball_name(
-        &rust_short,
-        rust_ver,
-        &suffix,
-        tarball_fetch::TarballKind::OrigVendor,
-    );
-    let expected = parent_dir.join(&name);
+    let expected =
+        expected_tarball_path(params, parent_dir, tarball_fetch::TarballKind::OrigVendor);
     handle_existing_for_generate(&expected, params.force).await?;
 
     info!("ensuring rustup is installed");
@@ -283,21 +257,6 @@ async fn generate_vendor(
     Ok(tarball)
 }
 
-/// Overlay the vendor tarball's `vendor/` directory into `repo_dir`,
-/// honouring `params.overlay_replace`.
-async fn vendor_overlay(params: &TarballParams, repo_dir: &Path, tarball: &Path) -> Result<()> {
-    let mode = if params.overlay_replace {
-        "clean replace"
-    } else {
-        "merge"
-    };
-    println!(
-        "  Overlaying vendor/ into {} ({mode}) …",
-        repo_dir.display()
-    );
-    overlay::overlay_vendor_dir(tarball, repo_dir, params.overlay_replace).await
-}
-
 /// Locate an already-obtained tarball in `parent_dir`.
 ///
 /// `overlay` never fetches or produces tarballs, so a missing file is an
@@ -307,12 +266,7 @@ fn locate_expected_tarball(
     parent_dir: &Path,
     kind: tarball_fetch::TarballKind,
 ) -> Result<PathBuf> {
-    let rust_ver = &params.rust_version;
-    let rust_short = rust_ver.short();
-    let suffix = params.dfsg_suffix();
-
-    let name = tarball_fetch::expected_tarball_name(&rust_short, rust_ver, &suffix, kind);
-    let expected = parent_dir.join(&name);
+    let expected = expected_tarball_path(params, parent_dir, kind);
 
     if !expected.exists() {
         return Err(ThermiteError::CommandFailed {
@@ -352,7 +306,16 @@ async fn overlay_vendor(
 ) -> Result<PathBuf> {
     let tarball =
         locate_expected_tarball(params, parent_dir, tarball_fetch::TarballKind::OrigVendor)?;
-    vendor_overlay(params, repo_dir, &tarball).await?;
+    let mode = if params.overlay_replace {
+        "clean replace"
+    } else {
+        "merge"
+    };
+    println!(
+        "  Overlaying vendor/ into {} ({mode}) …",
+        repo_dir.display()
+    );
+    overlay::overlay_vendor_dir(&tarball, repo_dir, params.overlay_replace).await?;
     Ok(tarball)
 }
 
@@ -396,7 +359,7 @@ pub async fn run(params: &TarballParams, repo_dir: &Path, target: TarballTarget)
     if target.wants_orig() {
         print_phase_header(0, "Orig Tarball");
         let tarball = match params.action {
-            TarballAction::Download => download_orig(params, repo_dir, &parent_dir).await?,
+            TarballAction::Download => download_orig(params, &parent_dir).await?,
             TarballAction::Generate => generate_orig(params, repo_dir, &parent_dir).await?,
             TarballAction::Overlay => overlay_orig(params, repo_dir, &parent_dir).await?,
         };
@@ -406,7 +369,7 @@ pub async fn run(params: &TarballParams, repo_dir: &Path, target: TarballTarget)
     if target.wants_vendor() {
         print_phase_header(1, "Vendor Tarball");
         let tarball = match params.action {
-            TarballAction::Download => download_vendor(params, repo_dir, &parent_dir).await?,
+            TarballAction::Download => download_vendor(params, &parent_dir).await?,
             TarballAction::Generate => generate_vendor(params, repo_dir, &parent_dir).await?,
             TarballAction::Overlay => overlay_vendor(params, repo_dir, &parent_dir).await?,
         };
