@@ -119,6 +119,11 @@ enum TarballCommands {
         #[command(subcommand)]
         target: GenerateTarget,
     },
+    /// Extract an already-obtained tarball's contents into the repo directory.
+    Overlay {
+        #[command(subcommand)]
+        target: OverlayTarget,
+    },
 }
 
 /// Arguments shared by every `tarball` leaf.
@@ -139,64 +144,31 @@ struct TarballCommonArgs {
     repo_dir: Option<PathBuf>,
 }
 
-/// Overlay flags for vendor tarballs.
-#[derive(Debug, Args)]
-struct OverlayArgs {
-    /// After obtaining the vendor tarball, extract its vendor/ directory
-    /// into the repo directory (default).
-    #[arg(long, overrides_with = "no_overlay")]
-    overlay: bool,
-
-    /// Do not extract the vendor tarball's vendor/ into the repo directory.
-    #[arg(long)]
-    no_overlay: bool,
-
-    /// Remove the existing vendor/ directory before overlaying (clean
-    /// replace) instead of merging the extraction over it.
-    #[arg(long)]
-    overlay_replace: bool,
-}
-
-impl OverlayArgs {
-    /// Whether overlaying is enabled (`--no-overlay` opts out of the default).
-    fn effective(&self) -> bool {
-        self.overlay || !self.no_overlay
-    }
-}
-
-/// Vendor-tarball download leaves (no `--force`: download reuses what exists).
+/// Download leaves (no `--force`: download reuses what exists, and the
+/// working tree is never touched — use `tarball overlay` for that).
 #[derive(Debug, Subcommand)]
 enum DownloadTarget {
     /// The orig tarball (filtered upstream Rust source).
     Orig(TarballCommonArgs),
     /// The orig-vendor tarball (vendored crate dependencies).
-    Vendor(TarballVendorDownloadArgs),
+    Vendor(TarballCommonArgs),
     /// Both tarballs, orig first.
-    All(TarballVendorDownloadArgs),
-}
-
-#[derive(Debug, Args)]
-struct TarballVendorDownloadArgs {
-    #[command(flatten)]
-    common: TarballCommonArgs,
-
-    #[command(flatten)]
-    overlay: OverlayArgs,
+    All(TarballCommonArgs),
 }
 
 /// Generate leaves (with `--force` to overwrite an existing tarball).
 #[derive(Debug, Subcommand)]
 enum GenerateTarget {
     /// The orig tarball (filtered upstream Rust source).
-    Orig(TarballOrigGenerateArgs),
+    Orig(TarballGenerateArgs),
     /// The orig-vendor tarball (vendored crate dependencies).
-    Vendor(TarballVendorGenerateArgs),
+    Vendor(TarballGenerateArgs),
     /// Both tarballs, orig first.
-    All(TarballVendorGenerateArgs),
+    All(TarballGenerateArgs),
 }
 
 #[derive(Debug, Args)]
-struct TarballOrigGenerateArgs {
+struct TarballGenerateArgs {
     #[command(flatten)]
     common: TarballCommonArgs,
 
@@ -205,17 +177,29 @@ struct TarballOrigGenerateArgs {
     force: bool,
 }
 
+/// Overlay leaves: extract a tarball that already exists in the parent
+/// directory into the repo dir. No `--force`: overlay never creates tarballs.
+#[derive(Debug, Subcommand)]
+enum OverlayTarget {
+    /// The orig tarball (filtered upstream Rust source), extracted with its
+    /// top-level source directory stripped.
+    Orig(TarballCommonArgs),
+    /// The orig-vendor tarball (vendored crate dependencies).
+    Vendor(TarballOverlayVendorArgs),
+    /// Both tarballs, orig first.
+    All(TarballOverlayVendorArgs),
+}
+
 #[derive(Debug, Args)]
-struct TarballVendorGenerateArgs {
+struct TarballOverlayVendorArgs {
     #[command(flatten)]
     common: TarballCommonArgs,
 
-    /// Overwrite the tarball if it already exists in the parent directory.
+    /// Remove the existing vendor/ directory before extracting the vendor
+    /// tarball (clean replace) instead of merging over it. Applies to the
+    /// vendor tarball only.
     #[arg(long)]
-    force: bool,
-
-    #[command(flatten)]
-    overlay: OverlayArgs,
+    replace: bool,
 }
 
 #[tokio::main]
@@ -246,41 +230,33 @@ fn resolve_repo_dir(repo_dir: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn tarball_download_params(
-    common: &TarballCommonArgs,
-    overlay: &OverlayArgs,
-) -> Result<TarballParams> {
+fn tarball_download_params(common: &TarballCommonArgs) -> Result<TarballParams> {
     TarballParams::new(
         TarballAction::Download,
         &common.rust_version,
         common.series.as_deref(),
         false,
-        overlay.effective(),
-        overlay.overlay_replace,
+        false,
     )
 }
 
-/// Overlay args for targets where overlaying does not apply (orig-only).
-fn no_overlay_args() -> OverlayArgs {
-    OverlayArgs {
-        overlay: false,
-        no_overlay: true,
-        overlay_replace: false,
-    }
-}
-
-fn tarball_generate_params(
-    common: &TarballCommonArgs,
-    force: bool,
-    overlay: Option<&OverlayArgs>,
-) -> Result<TarballParams> {
+fn tarball_generate_params(common: &TarballCommonArgs, force: bool) -> Result<TarballParams> {
     TarballParams::new(
         TarballAction::Generate,
         &common.rust_version,
         common.series.as_deref(),
         force,
-        overlay.is_some_and(OverlayArgs::effective),
-        overlay.is_some_and(|o| o.overlay_replace),
+        false,
+    )
+}
+
+fn tarball_overlay_params(common: &TarballCommonArgs, replace: bool) -> Result<TarballParams> {
+    TarballParams::new(
+        TarballAction::Overlay,
+        &common.rust_version,
+        common.series.as_deref(),
+        false,
+        replace,
     )
 }
 
@@ -340,36 +316,38 @@ async fn run() -> Result<()> {
 
         Commands::Tarball { action } => {
             let (params, repo_dir, target) = match action {
-                TarballCommands::Download { target } => match target {
-                    DownloadTarget::Orig(args) => {
-                        let params = tarball_download_params(&args, &no_overlay_args())?;
-                        (params, args.repo_dir, TarballTarget::Orig)
-                    }
-                    DownloadTarget::Vendor(args) => {
-                        let params = tarball_download_params(&args.common, &args.overlay)?;
-                        (params, args.common.repo_dir, TarballTarget::Vendor)
-                    }
-                    DownloadTarget::All(args) => {
-                        let params = tarball_download_params(&args.common, &args.overlay)?;
-                        (params, args.common.repo_dir, TarballTarget::All)
-                    }
-                },
-                TarballCommands::Generate { target } => match target {
-                    GenerateTarget::Orig(args) => {
-                        let params = tarball_generate_params(&args.common, args.force, None)?;
-                        (params, args.common.repo_dir, TarballTarget::Orig)
-                    }
-                    GenerateTarget::Vendor(args) => {
-                        let params =
-                            tarball_generate_params(&args.common, args.force, Some(&args.overlay))?;
-                        (params, args.common.repo_dir, TarballTarget::Vendor)
-                    }
-                    GenerateTarget::All(args) => {
-                        let params =
-                            tarball_generate_params(&args.common, args.force, Some(&args.overlay))?;
-                        (params, args.common.repo_dir, TarballTarget::All)
-                    }
-                },
+                TarballCommands::Download { target } => {
+                    let (common, target) = match target {
+                        DownloadTarget::Orig(args) => (args, TarballTarget::Orig),
+                        DownloadTarget::Vendor(args) => (args, TarballTarget::Vendor),
+                        DownloadTarget::All(args) => (args, TarballTarget::All),
+                    };
+                    (tarball_download_params(&common)?, common.repo_dir, target)
+                }
+                TarballCommands::Generate { target } => {
+                    let (common, force, target) = match target {
+                        GenerateTarget::Orig(args) => {
+                            (args.common, args.force, TarballTarget::Orig)
+                        }
+                        GenerateTarget::Vendor(args) => {
+                            (args.common, args.force, TarballTarget::Vendor)
+                        }
+                        GenerateTarget::All(args) => (args.common, args.force, TarballTarget::All),
+                    };
+                    let params = tarball_generate_params(&common, force)?;
+                    (params, common.repo_dir, target)
+                }
+                TarballCommands::Overlay { target } => {
+                    let (common, replace, target) = match target {
+                        OverlayTarget::Orig(args) => (args, false, TarballTarget::Orig),
+                        OverlayTarget::Vendor(args) => {
+                            (args.common, args.replace, TarballTarget::Vendor)
+                        }
+                        OverlayTarget::All(args) => (args.common, args.replace, TarballTarget::All),
+                    };
+                    let params = tarball_overlay_params(&common, replace)?;
+                    (params, common.repo_dir, target)
+                }
             };
 
             let repo_path = resolve_repo_dir(repo_dir)?;

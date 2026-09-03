@@ -296,6 +296,8 @@ pub enum TarballAction {
     Download,
     /// Produce the tarball locally (uscan / `debian/rules vendor-tarball`).
     Generate,
+    /// Extract an existing tarball's contents into the repo directory.
+    Overlay,
 }
 
 /// Parameters for the `thermite tarball` command suite.
@@ -315,12 +317,9 @@ pub struct TarballParams {
     /// the parent directory. Without it, `generate` refuses and points at the
     /// existing file.
     pub force: bool,
-    /// When `true`, the freshly obtained vendor tarball is extracted into the
-    /// repo directory after download or generation. Defaults to on at the CLI
-    /// level; only meaningful for vendor tarballs.
-    pub overlay: bool,
-    /// When `true`, overlaying first removes the existing `vendor/` directory
-    /// (clean replace per the runbook) instead of merging over it.
+    /// Only meaningful for the `Overlay` action: when `true`, overlaying the
+    /// vendor tarball first removes the existing `vendor/` directory (clean
+    /// replace per the runbook) instead of merging over it.
     pub overlay_replace: bool,
 }
 
@@ -334,7 +333,6 @@ impl TarballParams {
         rust_version: &str,
         series: Option<&str>,
         force: bool,
-        overlay: bool,
         overlay_replace: bool,
     ) -> Result<Self> {
         let series = match series {
@@ -353,7 +351,6 @@ impl TarballParams {
             rust_version: RustVersion::parse(rust_version)?,
             series,
             force,
-            overlay,
             overlay_replace,
         })
     }
@@ -373,7 +370,7 @@ mod tarball_params_tests {
     use super::*;
 
     fn valid_params() -> TarballParams {
-        TarballParams::new(TarballAction::Download, "1.85.0", None, false, true, false).unwrap()
+        TarballParams::new(TarballAction::Download, "1.85.0", None, false, false).unwrap()
     }
 
     #[test]
@@ -383,7 +380,6 @@ mod tarball_params_tests {
         assert_eq!(p.series, None);
         assert_eq!(p.action, TarballAction::Download);
         assert!(!p.force);
-        assert!(p.overlay);
         assert!(!p.overlay_replace);
     }
 
@@ -399,7 +395,6 @@ mod tarball_params_tests {
             "1.85.0",
             Some("noble"),
             false,
-            true,
             false,
         )
         .unwrap();
@@ -413,7 +408,6 @@ mod tarball_params_tests {
             "1.85.0",
             Some("bogus"),
             false,
-            true,
             false,
         );
         assert!(
@@ -429,7 +423,6 @@ mod tarball_params_tests {
             "1.85.0",
             Some("devel"),
             false,
-            true,
             false,
         );
         assert!(
@@ -440,7 +433,7 @@ mod tarball_params_tests {
 
     #[test]
     fn invalid_rust_version_rejected() {
-        let result = TarballParams::new(TarballAction::Generate, "1.85", None, false, true, false);
+        let result = TarballParams::new(TarballAction::Generate, "1.85", None, false, false);
         assert!(
             matches!(result, Err(ThermiteError::InvalidRustVersion(_))),
             "expected InvalidRustVersion, got: {result:?}"
@@ -449,18 +442,17 @@ mod tarball_params_tests {
 
     #[test]
     fn flags_are_stored() {
-        let p = TarballParams::new(
-            TarballAction::Generate,
-            "1.85.0",
-            Some("noble"),
-            true,
-            false,
-            true,
-        )
-        .unwrap();
+        let p = TarballParams::new(TarballAction::Generate, "1.85.0", Some("noble"), true, true)
+            .unwrap();
         assert_eq!(p.action, TarballAction::Generate);
         assert!(p.force);
-        assert!(!p.overlay);
+        assert!(p.overlay_replace);
+    }
+
+    #[test]
+    fn overlay_action_is_stored() {
+        let p = TarballParams::new(TarballAction::Overlay, "1.85.0", None, false, true).unwrap();
+        assert_eq!(p.action, TarballAction::Overlay);
         assert!(p.overlay_replace);
     }
 }

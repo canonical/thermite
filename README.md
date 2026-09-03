@@ -225,11 +225,13 @@ Standalone management of the two source tarballs outside the full update/backpor
 workflows. Each tarball can either be **downloaded** (staging PPA first, then the
 Ubuntu primary archive via `rmadison`, with a manual-placement fallback) or
 **generated** (`uscan` for the orig tarball; `rustup` + `cargo-vendor-filterer` +
-`debian/rules vendor-tarball` for the vendor tarball).
+`debian/rules vendor-tarball` for the vendor tarball). An already-obtained
+tarball can also be **overlaid** into the repo directory.
 
 ```
 thermite tarball download orig|vendor|all [OPTIONS]
 thermite tarball generate orig|vendor|all [OPTIONS]
+thermite tarball overlay   orig|vendor|all [OPTIONS]
 
   -u, --rust-version   <X.Y.Z>  Full Rust version the tarballs are named after
   --series             <NAME>   Ubuntu release adjective for backport-style names
@@ -242,17 +244,24 @@ generate only:
   --force                       Overwrite a tarball that already exists in the
                                 parent directory (without it, generate refuses)
 
-vendor and all only:
-  --overlay                     Extract the vendor tarball's vendor/ directory
-                                into the repo dir after obtaining it [default]
-  --no-overlay                  Do not touch the working tree
-  --overlay-replace             Remove the existing vendor/ directory before
-                                overlaying (clean replace instead of merge)
+vendor and all only (overlay):
+  --replace                     Remove the existing vendor/ directory before
+                                extracting (clean replace instead of merge)
 ```
 
 Downloads are idempotent: an existing tarball is reused. Generation overwrites
 only with `--force`. The vendor tarball generation requires `rustup` and produces
-`../rustc-<X.Y>_<X.Y.Z>+dfsg[~<series>].orig-vendor.tar.xz`.
+`../rustc-<X.Y>_<X.Y.Z>+dfsg[~<series>].orig-vendor.tar.xz`. Neither download
+nor generate touches the working tree — run `thermite tarball overlay`
+afterwards to extract a tarball into the repo dir.
+
+Overlay never fetches or produces tarballs: the expected tarball must already
+exist in the parent directory (use download/generate first), otherwise the
+command refuses. Overlaying the orig tarball extracts its full contents into
+the repo dir with the top-level `rustc-<X.Y.Z>-src/` directory stripped;
+overlaying the vendor tarball merges `vendor/` into the repo dir, or cleanly
+replaces it with `--replace`. With `all`, the orig tarball is overlaid first
+and `--replace` applies to the vendor part only.
 
 #### Example: regenerate the orig tarball for a backport
 
@@ -264,20 +273,32 @@ thermite tarball generate orig \
 # produces ../rustc-1.85_1.85.0+dfsg~26.04.orig.tar.xz
 ```
 
-#### Example: generate the vendor tarball and overlay it (clean replace)
+#### Example: regenerate the vendor tarball and overlay it (clean replace)
 
 ```sh
 thermite tarball generate vendor \
-  --rust-version   1.85.0 \
-  --series         noble \
-  --force \
-  --overlay-replace
+  --rust-version 1.85.0 \
+  --series       noble \
+  --force
+thermite tarball overlay vendor \
+  --rust-version 1.85.0 \
+  --series       noble \
+  --replace
 ```
 
 #### Example: download both tarballs for a plain update naming scheme
 
 ```sh
 thermite tarball download all --rust-version 1.85.1
+```
+
+#### Example: restore the working tree from existing tarballs after a git clean
+
+```sh
+cd ~/rustc/rustc
+thermite tarball overlay all \
+  --rust-version 1.85.0 \
+  --series       noble
 ```
 
 ---
@@ -360,6 +381,7 @@ src/
     gbp.rs              gbp import-orig
     git.rs              Git operations
     lintian.rs          lintian invocations
+    overlay.rs          Extracting tarball contents into the working tree
     patches.rs          quilt push/refresh
     ppa.rs              ppa-dev-tools, dput, and staging PPA helpers
     uscan.rs            uscan and orig tarball management
