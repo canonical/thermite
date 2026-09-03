@@ -316,48 +316,38 @@ async fn run() -> Result<()> {
 
         Commands::Tarball { action } => {
             let (params, repo_dir, target) = match action {
-                TarballCommands::Download { target } => match target {
-                    DownloadTarget::Orig(args) => {
-                        let params = tarball_download_params(&args)?;
-                        (params, args.repo_dir, TarballTarget::Orig)
-                    }
-                    DownloadTarget::Vendor(args) => {
-                        let params = tarball_download_params(&args)?;
-                        (params, args.repo_dir, TarballTarget::Vendor)
-                    }
-                    DownloadTarget::All(args) => {
-                        let params = tarball_download_params(&args)?;
-                        (params, args.repo_dir, TarballTarget::All)
-                    }
-                },
-                TarballCommands::Generate { target } => match target {
-                    GenerateTarget::Orig(args) => {
-                        let params = tarball_generate_params(&args.common, args.force)?;
-                        (params, args.common.repo_dir, TarballTarget::Orig)
-                    }
-                    GenerateTarget::Vendor(args) => {
-                        let params = tarball_generate_params(&args.common, args.force)?;
-                        (params, args.common.repo_dir, TarballTarget::Vendor)
-                    }
-                    GenerateTarget::All(args) => {
-                        let params = tarball_generate_params(&args.common, args.force)?;
-                        (params, args.common.repo_dir, TarballTarget::All)
-                    }
-                },
-                TarballCommands::Overlay { target } => match target {
-                    OverlayTarget::Orig(args) => {
-                        let params = tarball_overlay_params(&args, false)?;
-                        (params, args.repo_dir, TarballTarget::Orig)
-                    }
-                    OverlayTarget::Vendor(args) => {
-                        let params = tarball_overlay_params(&args.common, args.replace)?;
-                        (params, args.common.repo_dir, TarballTarget::Vendor)
-                    }
-                    OverlayTarget::All(args) => {
-                        let params = tarball_overlay_params(&args.common, args.replace)?;
-                        (params, args.common.repo_dir, TarballTarget::All)
-                    }
-                },
+                TarballCommands::Download { target } => {
+                    let (common, target) = match target {
+                        DownloadTarget::Orig(args) => (args, TarballTarget::Orig),
+                        DownloadTarget::Vendor(args) => (args, TarballTarget::Vendor),
+                        DownloadTarget::All(args) => (args, TarballTarget::All),
+                    };
+                    (tarball_download_params(&common)?, common.repo_dir, target)
+                }
+                TarballCommands::Generate { target } => {
+                    let (common, force, target) = match target {
+                        GenerateTarget::Orig(args) => {
+                            (args.common, args.force, TarballTarget::Orig)
+                        }
+                        GenerateTarget::Vendor(args) => {
+                            (args.common, args.force, TarballTarget::Vendor)
+                        }
+                        GenerateTarget::All(args) => (args.common, args.force, TarballTarget::All),
+                    };
+                    let params = tarball_generate_params(&common, force)?;
+                    (params, common.repo_dir, target)
+                }
+                TarballCommands::Overlay { target } => {
+                    let (common, replace, target) = match target {
+                        OverlayTarget::Orig(args) => (args, false, TarballTarget::Orig),
+                        OverlayTarget::Vendor(args) => {
+                            (args.common, args.replace, TarballTarget::Vendor)
+                        }
+                        OverlayTarget::All(args) => (args.common, args.replace, TarballTarget::All),
+                    };
+                    let params = tarball_overlay_params(&common, replace)?;
+                    (params, common.repo_dir, target)
+                }
             };
 
             let repo_path = resolve_repo_dir(repo_dir)?;
