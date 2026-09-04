@@ -324,16 +324,13 @@ fn is_word_boundary(b: u8) -> bool {
 ///
 /// The raw rmadison output is cached per query under the user cache directory
 /// (see [`crate::cache`]); repeated backports against the same query reuse the
-/// stored result instead of re-querying the archive.
+/// stored result instead of re-querying the archive. A cache hit needs no
+/// local `rmadison` binary, so the availability check only guards the
+/// network-fetch path.
 ///
 /// Returns the version string of the first matching entry, or `NotPublished`
 /// when no entry matches the release.
 pub async fn check_archive(package: &str, release: &str) -> ArchiveStatus {
-    if which("rmadison").is_err() {
-        return ArchiveStatus::CheckFailed(
-            "rmadison not installed (sudo apt install devscripts)".to_owned(),
-        );
-    }
     if let Some(hit) = cache::lookup_rmadison(package) {
         println!(
             "  rmadison: using cached result for {package} ({})",
@@ -343,6 +340,11 @@ pub async fn check_archive(package: &str, release: &str) -> ArchiveStatus {
             Some(v) => ArchiveStatus::Available(v),
             None => ArchiveStatus::NotPublished,
         };
+    }
+    if which("rmadison").is_err() {
+        return ArchiveStatus::CheckFailed(
+            "rmadison not installed (sudo apt install devscripts)".to_owned(),
+        );
     }
     let output =
         match run_command("rmadison", &["-u", "ubuntu", package], Path::new("."), &[]).await {

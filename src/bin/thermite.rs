@@ -25,19 +25,15 @@ struct Cli {
     verbose: u8,
 
     /// How to use the persistent rmadison result cache
-    /// (~/.cache/canonical/thermite/rmadison/):
-    ///
-    /// * on (default): reuse cached results; fetch and store on a miss.
-    /// * off: ignore the cache — always fetch, never read or write entries.
-    /// * update: always fetch fresh results and overwrite cached entries.
-    /// * clear: wipe the cached rmadison results first, then behave like on.
+    /// (~/.cache/canonical/thermite/rmadison/).
     #[arg(
         long,
         global = true,
-        value_parser = ["on", "off", "update", "clear"],
+        value_enum,
+        ignore_case = true,
         default_value = "on"
     )]
-    cache: String,
+    cache: CacheMode,
 
     #[command(subcommand)]
     command: Commands,
@@ -282,8 +278,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     shell::set_verbosity(cli.verbose);
-    let cache_mode = CacheMode::new(&cli.cache)?;
-    cache::activate(cache_mode);
+    cache::activate(cli.cache);
 
     match cli.command {
         Commands::Update {

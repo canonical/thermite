@@ -459,7 +459,9 @@ mod tarball_params_tests {
 
 /// How thermite uses its persistent on-disk caches (currently the `rmadison`
 /// result cache under `~/.cache/canonical/thermite/`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// The variants double as the accepted values of the global `--cache` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum CacheMode {
     /// Use cached results when present; fetch, store, and return on a miss.
     #[default]
@@ -468,57 +470,32 @@ pub enum CacheMode {
     Off,
     /// Always fetch fresh results and overwrite the cached entries.
     Update,
-    /// Delete the cache directory at startup, then behave like [`CacheMode::On`].
+    /// Delete the cache directory at startup, then behave like `on`.
     Clear,
-}
-
-impl CacheMode {
-    /// Construct and validate a [`CacheMode`] from a `--cache` flag value.
-    pub fn new(value: &str) -> Result<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "on" => Ok(Self::On),
-            "off" => Ok(Self::Off),
-            "update" => Ok(Self::Update),
-            "clear" => Ok(Self::Clear),
-            other => Err(ThermiteError::InvalidCacheMode(format!(
-                "'{other}' is not a valid --cache value; expected one of: on, off, update, clear"
-            ))),
-        }
-    }
 }
 
 #[cfg(test)]
 mod cache_mode_tests {
     use super::*;
+    use clap::ValueEnum as _;
 
     #[test]
-    fn cache_mode_parses_all_values() {
-        assert_eq!(CacheMode::new("on").unwrap(), CacheMode::On);
-        assert_eq!(CacheMode::new("off").unwrap(), CacheMode::Off);
-        assert_eq!(CacheMode::new("update").unwrap(), CacheMode::Update);
-        assert_eq!(CacheMode::new("clear").unwrap(), CacheMode::Clear);
-    }
-
-    #[test]
-    fn cache_mode_is_case_insensitive() {
-        assert_eq!(CacheMode::new("ON").unwrap(), CacheMode::On);
-        assert_eq!(CacheMode::new("Off").unwrap(), CacheMode::Off);
-        assert_eq!(CacheMode::new("UPDATE").unwrap(), CacheMode::Update);
-        assert_eq!(CacheMode::new("Clear").unwrap(), CacheMode::Clear);
+    fn cache_mode_cli_values_match_documented_surface() {
+        let names: Vec<String> = CacheMode::value_variants()
+            .iter()
+            .map(|m| {
+                m.to_possible_value()
+                    .expect("every variant has a possible value")
+                    .get_name()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(names, ["on", "off", "update", "clear"]);
     }
 
     #[test]
     fn cache_mode_default_is_on() {
         assert_eq!(CacheMode::default(), CacheMode::On);
-    }
-
-    #[test]
-    fn cache_mode_rejects_unknown_values() {
-        let result = CacheMode::new("sometimes");
-        assert!(
-            matches!(result, Err(ThermiteError::InvalidCacheMode(_))),
-            "expected InvalidCacheMode, got: {result:?}"
-        );
     }
 }
 

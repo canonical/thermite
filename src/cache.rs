@@ -93,7 +93,7 @@ fn valid_key(key: &str) -> bool {
         && !key.starts_with('.')
         && !key.contains(['/', '\\'])
         && !key.contains("..")
-        && key.bytes().all(|b| (0x20..=0x7e).contains(&b))
+        && key.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
 /// Look up `key` in the rmadison cache, honouring the process cache mode.
@@ -106,7 +106,7 @@ pub fn lookup_rmadison(key: &str) -> Option<CacheHit> {
 
 /// Like [`lookup_rmadison`] but against an explicit mode and cache base
 /// directory. The testable core.
-pub fn lookup_with_mode(mode: CacheMode, base: &Path, key: &str) -> Option<CacheHit> {
+fn lookup_with_mode(mode: CacheMode, base: &Path, key: &str) -> Option<CacheHit> {
     match mode {
         CacheMode::Off | CacheMode::Update => return None,
         CacheMode::On | CacheMode::Clear => {}
@@ -150,7 +150,7 @@ pub fn store_rmadison(key: &str, data: &str) {
 
 /// Like [`store_rmadison`] but against an explicit mode and cache base
 /// directory. The testable core.
-pub fn store_with_mode(mode: CacheMode, base: &Path, key: &str, data: &str) {
+fn store_with_mode(mode: CacheMode, base: &Path, key: &str, data: &str) {
     match mode {
         CacheMode::Off => return,
         CacheMode::On | CacheMode::Update | CacheMode::Clear => {}
@@ -191,7 +191,7 @@ pub fn clear_rmadison() {
 
 /// Like [`clear_rmadison`] but against an explicit mode and cache base
 /// directory. The testable core.
-pub fn clear_with_mode(mode: CacheMode, base: &Path) {
+fn clear_with_mode(mode: CacheMode, base: &Path) {
     if mode == CacheMode::Off {
         return;
     }
@@ -259,6 +259,7 @@ mod tests {
         assert!(!valid_key("a/b"));
         assert!(!valid_key("a\\b"));
         assert!(!valid_key("pkg\nname"));
+        assert!(!valid_key("pkg name"));
         assert!(!valid_key("pkg name\t"));
     }
 
