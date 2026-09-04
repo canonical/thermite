@@ -219,13 +219,7 @@ async fn generate_orig(
 
     let uscan_log = parent_dir.join(format!("uscan-{rust_ver}-tarball.log"));
     info!("running uscan --download-version {rust_ver}");
-    let t = uscan::run_uscan(repo_dir, rust_ver, &uscan_log).await?;
-
-    if suffix.is_empty() {
-        uscan::rename_tarball_to_canonical(&t)
-    } else {
-        uscan::rename_tarball_with_suffix(&t, &suffix)
-    }
+    uscan::run_uscan(repo_dir, rust_ver, &suffix, &uscan_log).await
 }
 
 /// Regenerate the vendor tarball: install the matching toolchain via rustup,

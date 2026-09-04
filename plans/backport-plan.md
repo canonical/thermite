@@ -194,8 +194,8 @@ Decision gate offering Reuse / Download / Regenerate / Abort:
   Both are served by Launchpad `+files` URLs and downloaded with `wget` (or `curl`).
   When no candidate has the file, fall back to a manual-placement prompt.
 - **Regenerate** — required when `Files-Excluded` changed in Phase 4:
-  `uscan::run_uscan(repo_dir, rust_ver, log)` (20–60 minutes), then
-  `uscan::rename_tarball_with_suffix()` to append the `~<series>` suffix.
+  `uscan::run_uscan(repo_dir, rust_ver, "~<series>", log)` (20–60 minutes) lands the
+  tarball directly as `rustc-<X.Y>_<X.Y.Z>+dfsg~<series>.orig.tar.xz`.
 - **Abort**.
 
 ### Phase 6 — Provide Orig-Vendor Tarball (Interactive)
