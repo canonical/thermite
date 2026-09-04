@@ -1013,11 +1013,10 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             expected_tarball
         }
         2 => {
-            // Regenerate: run uscan and rename to include the series suffix.
+            // Regenerate: run uscan with the series suffix baked into the name.
             let uscan_log = parent_dir.join(format!("uscan-{rust_ver}-backport.log"));
             info!("running uscan --download-version {rust_ver}");
-            let t = uscan::run_uscan(repo_dir, rust_ver, &uscan_log).await?;
-            uscan::rename_tarball_with_suffix(&t, &format!("~{target_series}"))?
+            uscan::run_uscan(repo_dir, rust_ver, &format!("~{target_series}"), &uscan_log).await?
         }
         _ => {
             // Abort
