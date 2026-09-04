@@ -47,6 +47,10 @@ pub enum ThermiteError {
     #[error("invalid backport releases: {0}")]
     InvalidBackportReleases(String),
 
+    /// The `--cache` flag was given an unknown value.
+    #[error("invalid cache mode: {0}")]
+    InvalidCacheMode(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

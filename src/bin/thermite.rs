@@ -3,11 +3,14 @@ use std::path::PathBuf;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use thermite::cache;
 use thermite::commands::tarball::TarballTarget;
 use thermite::commands::{backport, tarball, update};
 use thermite::error::{Result, ThermiteError};
 use thermite::shell;
-use thermite::types::params::{BackportParams, TarballAction, TarballParams, UpdateParams};
+use thermite::types::params::{
+    BackportParams, CacheMode, TarballAction, TarballParams, UpdateParams,
+};
 
 /// thermite — Ubuntu Rust toolchain packaging tool.
 #[derive(Debug, Parser)]
@@ -20,6 +23,21 @@ struct Cli {
     /// links at the start of every phase.
     #[arg(short = 'v', long, action = ArgAction::Count, global = true)]
     verbose: u8,
+
+    /// How to use the persistent rmadison result cache
+    /// (~/.cache/canonical/thermite/rmadison/):
+    ///
+    /// * on (default): reuse cached results; fetch and store on a miss.
+    /// * off: ignore the cache — always fetch, never read or write entries.
+    /// * update: always fetch fresh results and overwrite cached entries.
+    /// * clear: wipe the cached rmadison results first, then behave like on.
+    #[arg(
+        long,
+        global = true,
+        value_parser = ["on", "off", "update", "clear"],
+        default_value = "on"
+    )]
+    cache: String,
 
     #[command(subcommand)]
     command: Commands,
@@ -264,6 +282,8 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     shell::set_verbosity(cli.verbose);
+    let cache_mode = CacheMode::new(&cli.cache)?;
+    cache::activate(cache_mode);
 
     match cli.command {
         Commands::Update {
