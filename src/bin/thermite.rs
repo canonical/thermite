@@ -3,11 +3,14 @@ use std::path::PathBuf;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use thermite::cache;
 use thermite::commands::tarball::TarballTarget;
 use thermite::commands::{backport, tarball, update};
 use thermite::error::{Result, ThermiteError};
 use thermite::shell;
-use thermite::types::params::{BackportParams, TarballAction, TarballParams, UpdateParams};
+use thermite::types::params::{
+    BackportParams, CacheMode, TarballAction, TarballParams, UpdateParams,
+};
 
 /// thermite — Ubuntu Rust toolchain packaging tool.
 #[derive(Debug, Parser)]
@@ -20,6 +23,17 @@ struct Cli {
     /// links at the start of every phase.
     #[arg(short = 'v', long, action = ArgAction::Count, global = true)]
     verbose: u8,
+
+    /// How to use the persistent rmadison result cache
+    /// (~/.cache/canonical/thermite/rmadison/).
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        ignore_case = true,
+        default_value = "on"
+    )]
+    cache: CacheMode,
 
     #[command(subcommand)]
     command: Commands,
@@ -264,6 +278,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     shell::set_verbosity(cli.verbose);
+    cache::activate(cli.cache);
 
     match cli.command {
         Commands::Update {
