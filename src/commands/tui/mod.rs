@@ -6,8 +6,12 @@
 //! output sink installed in [`crate::shell`], so the alternate screen is
 //! never corrupted by stray writes.
 //!
+//! Cancellation: `q` (or Ctrl+C) while a command is running cancels it —
+//! the running child process is killed and a multi-step workflow aborts at
+//! the next step boundary.  A second `q` once idle quits the TUI.
+//!
 //! V1 limitations:
-//! - one external command at a time (no parallel runs, no abort);
+//! - one external command at a time (no parallel runs);
 //! - no interactive commands (`run_interactive_command` users) — the TUI only
 //!   invokes commands whose I/O flows through the output sink.
 
@@ -39,6 +43,10 @@ pub async fn run(repo_dir: &Path) -> Result<()> {
     shell::set_output_sink(log_tx.clone());
     install_tracing_sink(log_tx.clone());
 
+    // 1b. Install the cancellation token so `q`/Ctrl+C can kill the running
+    //     child process.
+    shell::install_cancellation();
+
     // 2. Terminal setup with a panic hook that always restores the terminal.
     install_panic_restore_hook();
     let mut terminal = match setup_terminal() {
@@ -58,6 +66,7 @@ pub async fn run(repo_dir: &Path) -> Result<()> {
 
     restore_terminal(&mut terminal);
     shell::clear_output_sink();
+    shell::clear_cancellation();
     let _ = std::panic::take_hook(); // uninstall the restore hook
     result
 }
@@ -177,24 +186,33 @@ async fn event_loop(
                     if key.kind == KeyEventKind::Release {
                         continue;
                     }
-                    // Ctrl+C always quits.
+                    // Ctrl+C cancels a running command, otherwise quits.
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
-                        if app.busy.is_some() {
-                            app.push_log(
-                                "  ctrl-c while a command is running is ignored in v1 (no abort support); wait for the command to finish",
-                            );
-                            continue;
+                        match app.busy.clone() {
+                            Some(desc) => {
+                                shell::cancel();
+                                app.push_log(&format!("  cancelling {desc} ..."));
+                            }
+                            None => {
+                                app.should_quit = true;
+                                return Ok(());
+                            }
                         }
-                        app.should_quit = true;
-                        return Ok(());
+                        continue;
                     }
                     match app.handle_key(key) {
                         AppAction::None => {}
                         AppAction::Quit => {
                             app.should_quit = true;
                             return Ok(());
+                        }
+                        AppAction::Cancel => {
+                            if let Some(desc) = app.busy.clone() {
+                                shell::cancel();
+                                app.push_log(&format!("  cancelling {desc} ..."));
+                            }
                         }
                         AppAction::Run { description, command } => {
                             spawn_command(app, done_tx.clone(), description, command);
@@ -224,6 +242,8 @@ fn spawn_command(
 ) {
     app.busy = Some(description.clone());
     app.push_log(&format!("== started: {description}"));
+    // Start fresh: a previous command may have left the token cancelled.
+    shell::reset_cancellation();
     let repo_dir = app.repo_dir.clone();
     tokio::spawn(async move {
         let outcome = execute(&command, &repo_dir).await;

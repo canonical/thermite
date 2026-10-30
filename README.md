@@ -407,13 +407,17 @@ thermite tui [--repo-dir <DIR>]
 | `t` | Open the tarball menu (download / generate / overlay × orig / vendor / all) |
 | `g` | `git fetch --all` |
 | `R` | Refresh the repo info panel (branch, version, tarballs, etc.) |
-| `q` / Ctrl+C | Quit (disabled while a command is running) |
+| `q` / Ctrl+C | Cancel the running command while busy (`q` again when idle to quit) |
 
 The command output of each action is captured and shown in a scrollable log
 pane (PageUp/PageDown), so several commands can be inspected in order after
 they finish. The same `git fetch`, `sbuild`, `lintian`, `tarball`, and version
 machinery as the CLI subcommands is reused; only the invocation surface
 differs.
+
+While a command is running, `q` (or Ctrl+C) cancels it: the running child
+process is killed and a multi-step workflow (e.g. a tarball generate) aborts
+at the next step boundary. Once idle, `q` quits the TUI.
 
 ---
 

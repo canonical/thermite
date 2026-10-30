@@ -58,6 +58,13 @@ pub enum ThermiteError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A command was cancelled by the user (e.g. `q`/Ctrl+C in the TUI).
+    ///
+    /// The child process was killed and the enclosing workflow should stop;
+    /// multi-step workflows see this from the next step's pre-spawn check.
+    #[error("command cancelled")]
+    Cancelled,
 }
 
 /// Convenience alias used throughout the crate.

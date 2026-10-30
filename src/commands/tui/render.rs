@@ -71,11 +71,19 @@ const COMMANDS: &[(&str, &str)] = &[
     ("q", "quit"),
 ];
 
+/// Sidebar label for `q` while a command is running (cancels instead of quit).
+const BUSY_Q_LABEL: &str = "cancel running";
+
 /// Sidebar width: the widest command label plus the `key + label` padding.
+/// Accounts for the busy-state `q` label ("cancel running"), which is longer
+/// than any idle label.
 fn max_command_width() -> u16 {
     COMMANDS
         .iter()
         .map(|(key, label)| key.chars().count() + label.chars().count() + 3)
+        .chain(std::iter::once(
+            "q".chars().count() + BUSY_Q_LABEL.len() + 3,
+        ))
         .max()
         .unwrap_or(20) as u16
 }
@@ -127,21 +135,23 @@ fn draw_log(f: &mut Frame, area: Rect, app: &App) {
 fn draw_command_menu(f: &mut Frame, area: Rect, app: &App) {
     let dim = Style::default().fg(Color::DarkGray);
     let bold = Style::default().add_modifier(Modifier::BOLD);
+    let busy = app.busy.is_some();
     let lines: Vec<Line> = COMMANDS
         .iter()
         .map(|(key, label)| {
-            let key_style = if app.busy.is_some() { dim } else { bold };
+            // `q` cancels while a command is running, quits when idle.
+            let (key, label) = if busy && *key == "q" {
+                (*key, BUSY_Q_LABEL)
+            } else {
+                (*key, *label)
+            };
+            // While busy, only `q` is actionable; the rest are dimmed.
+            let actionable = !busy || key == "q";
+            let key_style = if actionable { bold } else { dim };
             Line::from(vec![
                 Span::styled(format!(" {key} "), key_style),
                 Span::raw(" "),
-                Span::styled(
-                    *label,
-                    if app.busy.is_some() {
-                        dim
-                    } else {
-                        Style::default()
-                    },
-                ),
+                Span::styled(label, if actionable { Style::default() } else { dim }),
             ])
         })
         .collect();
@@ -161,7 +171,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
     match &app.busy {
         Some(desc) => {
             spans.push(Span::styled(
-                format!(" running: {desc} (output below) "),
+                format!(" running: {desc} (q: cancel) "),
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ));
         }

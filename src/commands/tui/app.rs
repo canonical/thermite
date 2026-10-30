@@ -28,6 +28,8 @@ pub enum AppAction {
     None,
     /// Quit the TUI.
     Quit,
+    /// Cancel the running command (busy state).
+    Cancel,
     /// Spawn a command. `description` is shown in the busy bar.
     Run {
         description: String,
@@ -379,12 +381,11 @@ impl App {
             _ => {}
         }
 
-        // Command keys only when idle.
+        // Command keys only when idle.  `q` while busy cancels the running
+        // command instead of quitting (a second `q` when idle quits).
         if self.busy.is_some() {
             if key.code == KeyCode::Char('q') {
-                self.push_log(
-                    "  a command is still running — wait for it to finish before quitting",
-                );
+                return AppAction::Cancel;
             }
             return AppAction::None;
         }
@@ -777,10 +778,17 @@ impl App {
 
     /// Record a completed command.
     pub fn on_command_done(&mut self, description: &str, result: Result<String>) {
+        // The command is finished: release the busy slot so the sidebar
+        // re-enables and `q` quits again.
+        self.busy = None;
         match result {
             Ok(summary) => {
                 self.last_status = Some(format!("{description}: {summary}"));
                 self.push_log(&format!("== {description}: {summary}"));
+            }
+            Err(crate::error::ThermiteError::Cancelled) => {
+                self.last_status = Some(format!("{description} cancelled"));
+                self.push_log(&format!("== {description} cancelled"));
             }
             Err(e) => {
                 self.last_status = Some(format!("{description} FAILED"));
@@ -976,15 +984,49 @@ mod tests {
     }
 
     #[test]
-    fn q_blocked_while_busy() {
+    fn q_cancels_while_busy() {
+        let mut app = scratch_app();
+        app.busy = Some("sbuild (noble)".to_owned());
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('q'))),
+            AppAction::Cancel
+        ));
+        assert!(!app.should_quit, "busy `q` must cancel, not quit");
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('b'))),
+            AppAction::None
+        ));
+    }
+
+    #[test]
+    fn on_command_done_cancelled_message() {
+        let mut app = scratch_app();
+        app.busy = Some("sbuild (noble)".to_owned());
+        app.on_command_done(
+            "sbuild (noble)",
+            Err(crate::error::ThermiteError::Cancelled),
+        );
+        assert_eq!(app.last_status.as_deref(), Some("sbuild (noble) cancelled"));
+        assert!(app.log.iter().any(|l| l == "== sbuild (noble) cancelled"));
+        // The busy slot is released: the sidebar re-enables and `q` quits.
+        assert!(app.busy.is_none());
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('q'))),
+            AppAction::Quit
+        ));
+    }
+
+    #[test]
+    fn command_keys_ignored_while_busy() {
         let mut app = scratch_app();
         // Give the log some content so PageUp has room to scroll.
         for i in 0..30 {
             app.push_log(&format!("line {i}"));
         }
         app.busy = Some("sbuild (noble)".to_owned());
+        // Non-`q` command keys stay ignored while busy.
         assert!(matches!(
-            app.handle_key(key(KeyCode::Char('q'))),
+            app.handle_key(key(KeyCode::Char('b'))),
             AppAction::None
         ));
         assert!(!app.should_quit);
