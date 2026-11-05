@@ -1,9 +1,11 @@
 use std::fmt;
 
+use serde::Serialize;
+
 use crate::error::{Result, ThermiteError};
 
 /// A full Rust version in `X.Y.Z` format.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RustVersion {
     pub major: u32,
     pub minor: u32,
