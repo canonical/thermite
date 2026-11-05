@@ -5,7 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 use thermite::cache;
 use thermite::commands::tarball::TarballTarget;
-use thermite::commands::{backport, tarball, update};
+use thermite::commands::{backport, tarball, update, version};
 use thermite::error::{Result, ThermiteError};
 use thermite::shell;
 use thermite::types::params::{
@@ -114,10 +114,215 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Parse, explain, format, or bump Ubuntu rustc package version strings.
+    Version {
+        #[command(subcommand)]
+        subcommand: VersionCommands,
+    },
+
     /// Download or regenerate the orig and orig-vendor source tarballs.
     Tarball {
         #[command(subcommand)]
         action: TarballCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum VersionCommands {
+    /// Parse a version string and display its components.
+    ///
+    /// INPUT can be a version string, a path to a directory containing
+    /// debian/changelog, or a path to a changelog file.
+    /// When omitted, uses the current directory.
+    Parse {
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Explain each component of a version string with documentation.
+    ///
+    /// INPUT can be a version string, a path to a directory containing
+    /// debian/changelog, or a path to a changelog file.
+    /// When omitted, uses the current directory.
+    Explain {
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+    },
+
+    /// Construct a version string from individual components.
+    Format {
+        /// Upstream Rust version in X.Y.Z format (required).
+        #[arg(long)]
+        upstream: String,
+
+        /// Repack number (the N in +dfsgN). Omit for bare +dfsg.
+        #[arg(long)]
+        repack: Option<u32>,
+
+        /// Target series number for backports (e.g. "24.04").
+        /// Mutually exclusive with --release.
+        #[arg(long)]
+        series: Option<String>,
+
+        /// Target Ubuntu release adjective (e.g. "noble").
+        /// Resolves to the series number automatically.
+        /// Mutually exclusive with --series.
+        #[arg(long)]
+        release: Option<String>,
+
+        /// Backport repack number (requires --series or --release).
+        #[arg(long)]
+        backport_repack: Option<u32>,
+
+        /// Mark as stage0 bootstrap (requires --series or --release).
+        #[arg(long)]
+        stage0: bool,
+
+        /// Ubuntu revision number (default: 1).
+        #[arg(long, default_value = "1")]
+        ubuntu_revision: u32,
+
+        /// Backport revision number (default: 1 when series is set).
+        #[arg(long)]
+        backport_revision: Option<u32>,
+
+        /// PPA upload number. Omit for non-PPA (final archive) versions.
+        #[arg(long)]
+        ppa: Option<u32>,
+    },
+
+    /// Bump a version string according to a specified operation.
+    Bump {
+        #[command(subcommand)]
+        operation: BumpOperationCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BumpOperationCmd {
+    /// New upstream patch release: resets all fields.
+    PatchRelease {
+        /// The new upstream version (e.g. "1.95.1").
+        #[arg(long)]
+        upstream: String,
+
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+
+        /// Output the bumped version as JSON (includes all parsed fields).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Increment the Ubuntu revision number.
+    UbuntuRevision {
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+
+        /// Output the bumped version as JSON (includes all parsed fields).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Increment the repack number (resets Ubuntu revision to 1).
+    Repack {
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+
+        /// Output the bumped version as JSON (includes all parsed fields).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Generate a backport version (adds series, sets backport_revision=1).
+    Backport {
+        /// Target series number (e.g. "24.04").
+        #[arg(long)]
+        series: Option<String>,
+
+        /// Target Ubuntu release adjective (e.g. "noble").
+        #[arg(long)]
+        release: Option<String>,
+
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+
+        /// Output the bumped version as JSON (includes all parsed fields).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Increment the backport revision.
+    BackportRevision {
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+
+        /// Output the bumped version as JSON (includes all parsed fields).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Increment the backport repack (resets backport revision to 1).
+    BackportRepack {
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+
+        /// Output the bumped version as JSON (includes all parsed fields).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Retarget a backport to a different series.
+    Retarget {
+        /// New target series number (e.g. "22.04").
+        #[arg(long)]
+        series: Option<String>,
+
+        /// New target Ubuntu release adjective (e.g. "jammy").
+        #[arg(long)]
+        release: Option<String>,
+
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+
+        /// Output the bumped version as JSON (includes all parsed fields).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Increment the PPA number (for iterating on PPA builds).
+    Ppa {
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+
+        /// Output the bumped version as JSON (includes all parsed fields).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove the PPA suffix (for final archive upload).
+    ClearPpa {
+        /// Version string, path to a package directory, or path to a
+        /// debian/changelog file. Defaults to the current directory.
+        input: Option<String>,
+
+        /// Output the bumped version as JSON (includes all parsed fields).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -329,6 +534,10 @@ async fn run() -> Result<()> {
             backport::run(&params, &repo_path).await?;
         }
 
+        Commands::Version { subcommand } => {
+            dispatch_version(subcommand)?;
+        }
+
         Commands::Tarball { action } => {
             let (params, repo_dir, target) = match action {
                 TarballCommands::Download { target } => {
@@ -372,4 +581,148 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Dispatch the `thermite version` subcommands.
+///
+/// These are all synchronous (no async I/O needed), so we handle them
+/// directly without awaiting.
+fn dispatch_version(cmd: VersionCommands) -> Result<()> {
+    match cmd {
+        VersionCommands::Parse { input, json } => {
+            version::run_parse(input.as_deref(), json)?;
+        }
+
+        VersionCommands::Explain { input } => {
+            version::run_explain(input.as_deref())?;
+        }
+
+        VersionCommands::Format {
+            upstream,
+            repack,
+            series,
+            release,
+            backport_repack,
+            stage0,
+            ubuntu_revision,
+            backport_revision,
+            ppa,
+        } => {
+            version::run_format(&version::FormatParams {
+                upstream: &upstream,
+                repack_number: repack,
+                series: series.as_deref(),
+                release: release.as_deref(),
+                backport_repack,
+                stage0,
+                ubuntu_revision,
+                backport_revision,
+                ppa,
+            })?;
+        }
+
+        VersionCommands::Bump { operation } => {
+            let (input, json, op) = convert_bump_operation(operation);
+            version::run_bump(input.as_deref(), &op, json)?;
+        }
+    }
+    Ok(())
+}
+
+/// Convert the CLI bump operation enum into the library's `BumpOperation`,
+/// also returning the input source and JSON flag extracted from the variant.
+fn convert_bump_operation(cmd: BumpOperationCmd) -> (Option<String>, bool, version::BumpOperation) {
+    match cmd {
+        BumpOperationCmd::PatchRelease {
+            upstream,
+            input,
+            json,
+        } => (
+            input,
+            json,
+            version::BumpOperation::PatchRelease { upstream },
+        ),
+        BumpOperationCmd::UbuntuRevision { input, json } => {
+            (input, json, version::BumpOperation::UbuntuRevision)
+        }
+        BumpOperationCmd::Repack { input, json } => (input, json, version::BumpOperation::Repack),
+        BumpOperationCmd::Backport {
+            series,
+            release,
+            input,
+            json,
+        } => (
+            input,
+            json,
+            version::BumpOperation::Backport { series, release },
+        ),
+        BumpOperationCmd::BackportRevision { input, json } => {
+            (input, json, version::BumpOperation::BackportRevision)
+        }
+        BumpOperationCmd::BackportRepack { input, json } => {
+            (input, json, version::BumpOperation::BackportRepack)
+        }
+        BumpOperationCmd::Retarget {
+            series,
+            release,
+            input,
+            json,
+        } => (
+            input,
+            json,
+            version::BumpOperation::Retarget { series, release },
+        ),
+        BumpOperationCmd::Ppa { input, json } => (input, json, version::BumpOperation::Ppa),
+        BumpOperationCmd::ClearPpa { input, json } => {
+            (input, json, version::BumpOperation::ClearPpa)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bump_operation_precedes_the_input_argument() {
+        // Documented order: `thermite version bump <operation> [INPUT]`.
+        assert!(
+            Cli::try_parse_from([
+                "thermite",
+                "version",
+                "bump",
+                "ubuntu-revision",
+                "1.95.0+dfsg-0ubuntu1",
+            ])
+            .is_ok()
+        );
+        // The version string is not a subcommand name.
+        assert!(
+            Cli::try_parse_from([
+                "thermite",
+                "version",
+                "bump",
+                "1.95.0+dfsg-0ubuntu1",
+                "ubuntu-revision",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn changelog_input_is_positional_not_a_flag() {
+        // INPUT defaults to the current directory; there is no --from-changelog.
+        assert!(Cli::try_parse_from(["thermite", "version", "parse"]).is_ok());
+        assert!(Cli::try_parse_from(["thermite", "version", "parse", "--from-changelog"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "thermite",
+                "version",
+                "bump",
+                "ubuntu-revision",
+                "--from-changelog",
+            ])
+            .is_err()
+        );
+    }
 }
