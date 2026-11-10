@@ -88,14 +88,19 @@ pub fn clear_cancellation() {
 /// reset).  No-op when no token is installed.
 pub fn cancel() {
     if let Some(tx) = CANCEL.lock().expect("CANCEL mutex poisoned").as_ref() {
-        let _ = tx.send(true);
+        // send() silently drops the value when no receiver is alive (e.g.
+        // between two steps), leaving the token stale — send_replace always
+        // stores it.
+        tx.send_replace(true);
     }
 }
 
 /// Reset the token to "not cancelled" — called when a new TUI command starts.
 pub fn reset_cancellation() {
     if let Some(tx) = CANCEL.lock().expect("CANCEL mutex poisoned").as_ref() {
-        let _ = tx.send(false);
+        // See cancel(): send() fails with zero receivers, which wedged the
+        // token at "cancelled" and killed every subsequent TUI command.
+        tx.send_replace(false);
     }
 }
 
@@ -526,5 +531,19 @@ mod tests {
         .await;
         let out = result.expect("echo should succeed");
         assert!(out.stdout.contains("hello"));
+    }
+
+    /// Regression: `cancel`/`reset_cancellation` must store the token value
+    /// even when no receiver is alive (the window between two TUI commands).
+    /// `watch::Sender::send` silently fails in that window, which wedged the
+    /// token at "cancelled" and made every later TUI command refuse to spawn.
+    #[test]
+    fn cancel_and_reset_store_value_without_receivers() {
+        install_cancellation();
+        cancel();
+        assert!(*cancellation_receiver().unwrap().borrow());
+        reset_cancellation();
+        assert!(!*cancellation_receiver().unwrap().borrow());
+        clear_cancellation();
     }
 }
