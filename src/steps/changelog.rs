@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::error::Result;
 use crate::shell::run_command;
-use crate::types::package_version::RustcPackageVersion;
+use crate::types::package_version::{BumpOperation, RustcPackageVersion, apply_bump_operation};
 use crate::types::versions::RustVersion;
 
 /// Run `dch -v <version_str>` to open a new changelog entry.
@@ -92,7 +92,15 @@ pub fn debian_version_string(version: &RustVersion) -> String {
 ///
 /// Returns an error if the file cannot be read or the format is unexpected.
 pub fn read_current_version(changelog_path: &Path) -> Result<String> {
-    let content = std::fs::read_to_string(changelog_path)?;
+    let content = std::fs::read_to_string(changelog_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            // Missing changelog almost always means "not a Debian source
+            // package" — say that instead of a bare IO error.
+            crate::error::ThermiteError::MissingChangelog(changelog_path.display().to_string())
+        } else {
+            crate::error::ThermiteError::Io(e)
+        }
+    })?;
     let first_line = content.lines().next().unwrap_or("");
     // Extract the version between the first `(` and `)`.
     let version = first_line
@@ -240,6 +248,72 @@ pub fn update_backport_changelog_entry(
     Ok(())
 }
 
+/// Rewrite the version in the first line of `debian/changelog` with the
+/// result of applying `operation` to the current top-entry version.
+///
+/// The top entry is edited **in place** (no new entry is created) — this is
+/// what the TUI's "bump version" action means: e.g. bumping the Ubuntu
+/// revision before a rebuild should not add a new changelog entry.
+///
+/// Returns the new version string.
+///
+/// # Errors
+/// - `read_current_version` errors (unreadable/unparsable changelog).
+/// - The current version does not parse as a [`RustcPackageVersion`].
+/// - `apply_bump_operation` rejects the operation (e.g. backport without a
+///   series).
+pub fn apply_version_bump(changelog_path: &Path, operation: &BumpOperation) -> Result<String> {
+    let current = read_current_version(changelog_path)?;
+    let mut v = RustcPackageVersion::parse(&current)?;
+    apply_bump_operation(&mut v, operation)?;
+    let new_version = v.to_string();
+    rewrite_top_entry_version(changelog_path, &current, &new_version)?;
+    Ok(new_version)
+}
+
+/// Rewrite the version in the first line of `debian/changelog` to
+/// `version_str` (the TUI's "set version" action).
+///
+/// The version string is validated with [`RustcPackageVersion::parse`]
+/// before the file is touched.  Returns the version actually written.
+pub fn set_changelog_version(changelog_path: &Path, version_str: &str) -> Result<String> {
+    let current = read_current_version(changelog_path)?;
+    // Validate before touching the file.
+    RustcPackageVersion::parse(version_str)?;
+    rewrite_top_entry_version(changelog_path, &current, version_str)?;
+    Ok(version_str.to_owned())
+}
+
+/// Replace the `(old_version)` token in the first line of the changelog with
+/// `(new_version)`.
+///
+/// Both strings are matched literally against the first line, which avoids
+/// any regex dependency.  The file is left untouched when the old version
+/// cannot be found (defensive; `read_current_version` already guarantees the
+/// first line contains a parenthesised version).
+fn rewrite_top_entry_version(
+    changelog_path: &Path,
+    old_version: &str,
+    new_version: &str,
+) -> Result<()> {
+    let content = std::fs::read_to_string(changelog_path)?;
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_owned()).collect();
+
+    if lines.is_empty() {
+        return Ok(());
+    }
+
+    let token = format!("({old_version})");
+    let replacement = format!("({new_version})");
+    if let Some(pos) = lines[0].find(&token) {
+        lines[0].replace_range(pos..pos + token.len(), &replacement);
+    }
+
+    let new_content = lines.join("\n") + "\n";
+    std::fs::write(changelog_path, new_content)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod backport_changelog_tests {
     use super::*;
@@ -320,5 +394,160 @@ mod backport_changelog_tests {
         assert!(!is_series_like(""));
         assert!(!is_series_like("alpha"));
         assert!(!is_series_like("24.04-foo"));
+    }
+
+    // ------------------------------------------------------------------
+    // apply_version_bump / set_changelog_version (TUI helpers)
+    // ------------------------------------------------------------------
+
+    const SAMPLE_CHANGELOG: &str = "\
+rustc-1.95 (1.95.0+dfsg-0ubuntu1) plucky; urgency=medium
+
+  * New upstream version 1.95.0
+
+ -- Jane Doe <jane@example.com>  Mon, 01 Jan 2026 00:00:00 +0000
+";
+
+    /// Create a uniquely named scratch directory (project convention: no
+    /// tempfile dev-dependency).
+    fn make_scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "thermite-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_sample_changelog(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("changelog");
+        std::fs::write(&path, SAMPLE_CHANGELOG).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_current_version_missing_changelog_is_clear() {
+        // Not a Debian source package → the error must say so, not surface a
+        // bare "No such file or directory (os error 2)".
+        let dir = make_scratch_dir("missing-changelog");
+        let path = dir.join("debian/changelog");
+        let err = read_current_version(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::ThermiteError::MissingChangelog(_)
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a Debian source package") && msg.contains("missing debian/changelog"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_version_bump_ubuntu_revision() {
+        let dir = make_scratch_dir("bump-ubuntu-rev");
+        let path = write_sample_changelog(&dir);
+
+        let new_version = apply_version_bump(&path, &BumpOperation::UbuntuRevision).unwrap();
+        assert_eq!(new_version, "1.95.0+dfsg-0ubuntu2");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("rustc-1.95 (1.95.0+dfsg-0ubuntu2) plucky; urgency=medium"));
+        // The rest of the entry must be untouched.
+        assert!(content.contains("  * New upstream version 1.95.0"));
+        assert!(content.contains(" -- Jane Doe <jane@example.com>"));
+    }
+
+    #[test]
+    fn apply_version_bump_backport_with_release_adjective() {
+        let dir = make_scratch_dir("bump-test");
+        let path = write_sample_changelog(&dir);
+
+        let new_version = apply_version_bump(
+            &path,
+            &BumpOperation::Backport {
+                series: None,
+                release: Some("noble".to_owned()),
+            },
+        )
+        .unwrap();
+        assert_eq!(new_version, "1.95.0+dfsg~24.04-0ubuntu1~24.04.1");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("rustc-1.95 (1.95.0+dfsg~24.04-0ubuntu1~24.04.1) plucky;")
+        );
+    }
+
+    #[test]
+    fn apply_version_bump_requires_series_for_backport() {
+        let dir = make_scratch_dir("bump-test");
+        let path = write_sample_changelog(&dir);
+
+        let result = apply_version_bump(
+            &path,
+            &BumpOperation::Backport {
+                series: None,
+                release: None,
+            },
+        );
+        assert!(result.is_err());
+        // The file must be untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE_CHANGELOG);
+    }
+
+    #[test]
+    fn apply_version_bump_patch_release_resets_fields() {
+        let dir = make_scratch_dir("bump-test");
+        let path = write_sample_changelog(&dir);
+
+        let new_version = apply_version_bump(
+            &path,
+            &BumpOperation::PatchRelease {
+                upstream: "1.95.1".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(new_version, "1.95.1+dfsg-0ubuntu1");
+    }
+
+    #[test]
+    fn set_changelog_version_validates_before_writing() {
+        let dir = make_scratch_dir("bump-test");
+        let path = write_sample_changelog(&dir);
+
+        // Invalid version → error, file untouched.
+        let result = set_changelog_version(&path, "1.95.0-0ubuntu1");
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE_CHANGELOG);
+
+        // Valid version → written.
+        let written = set_changelog_version(&path, "1.96.0+dfsg-0ubuntu1").unwrap();
+        assert_eq!(written, "1.96.0+dfsg-0ubuntu1");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("rustc-1.95 (1.96.0+dfsg-0ubuntu1) plucky;")
+        );
+    }
+
+    #[test]
+    fn rewrite_preserves_unreleased_distribution() {
+        let dir = make_scratch_dir("bump-unreleased");
+        let path = dir.join("changelog");
+        std::fs::write(
+            &path,
+            "\
+rustc-1.95 (1.95.0+dfsg-0ubuntu1) UNRELEASED; urgency=medium
+",
+        )
+        .unwrap();
+
+        apply_version_bump(&path, &BumpOperation::UbuntuRevision).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("rustc-1.95 (1.95.0+dfsg-0ubuntu2) UNRELEASED;"));
     }
 }

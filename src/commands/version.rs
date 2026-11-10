@@ -208,38 +208,7 @@ pub fn resolve_version_input(input: Option<&str>) -> Result<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bump operation enum (used by bin/thermite.rs CLI)
-// ---------------------------------------------------------------------------
-
-/// The bump operation to perform.
-#[derive(Debug, Clone)]
-pub enum BumpOperation {
-    /// New upstream patch release — resets all fields.
-    PatchRelease { upstream: String },
-    /// Increment the Ubuntu revision.
-    UbuntuRevision,
-    /// Increment the repack number (resets Ubuntu revision).
-    Repack,
-    /// Generate a backport version (sets series, backport_revision=1).
-    Backport {
-        series: Option<String>,
-        release: Option<String>,
-    },
-    /// Increment the backport revision.
-    BackportRevision,
-    /// Increment the backport repack (resets backport revision).
-    BackportRepack,
-    /// Retarget a backport to a different series.
-    Retarget {
-        series: Option<String>,
-        release: Option<String>,
-    },
-    /// Increment the PPA number (for PPA upload iteration).
-    Ppa,
-    /// Remove the PPA suffix (for final archive upload).
-    ClearPpa,
-}
+pub use crate::types::package_version::BumpOperation;
 
 // ---------------------------------------------------------------------------
 // Internal helpers

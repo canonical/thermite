@@ -161,10 +161,10 @@ pub async fn fetch_tarball(
     let rmadison_query = format!("rustc-{rust_short}");
     let rmadison_stdout = match cache::lookup_rmadison(&rmadison_query) {
         Some(hit) => {
-            println!(
+            crate::shell::out_line(&format!(
                 "  rmadison: using cached result for {rmadison_query} ({})",
                 cache::format_age(hit.age_secs)
-            );
+            ));
             hit.data
         }
         None => match run_command(
@@ -180,7 +180,7 @@ pub async fn fetch_tarball(
                 output.stdout
             }
             Err(_) => {
-                println!("  rmadison failed — skipping Ubuntu archive candidates");
+                crate::shell::out_line("  rmadison failed — skipping Ubuntu archive candidates");
                 String::new()
             }
         },
@@ -194,7 +194,7 @@ pub async fn fetch_tarball(
     }
 
     for (url, label) in &candidates {
-        println!("  Trying {label} …");
+        crate::shell::out_line(&format!("  Trying {label} …"));
         match download_to_file(url, &dest).await {
             Ok(()) => {
                 if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 0) {
@@ -203,7 +203,9 @@ pub async fn fetch_tarball(
                 let _ = std::fs::remove_file(&dest);
             }
             Err(ThermiteError::CommandNotFound(_)) => {
-                println!("  Neither wget nor curl found — cannot download automatically.");
+                crate::shell::out_line(
+                    "  Neither wget nor curl found — cannot download automatically.",
+                );
                 break;
             }
             Err(_) => {

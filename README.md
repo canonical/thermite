@@ -82,8 +82,12 @@ git clone https://github.com/your-org/thermite.git
 cd thermite
 cargo build --release
 # Optionally install to ~/.cargo/bin
-cargo install --path .
+cargo install --path . --features tui
 ```
+
+The `thermite tui` interactive terminal UI is feature-gated: pass
+`--features tui` to `cargo build`/`cargo install` to include it (this pulls in
+the ratatui and crossterm dependencies).
 
 ---
 
@@ -108,6 +112,7 @@ Commands:
   backport  Backport an existing Rust toolchain package to an older Ubuntu release
   version   Parse, explain, format, or bump Ubuntu rustc package version strings
   tarball   Download or regenerate the orig and orig-vendor source tarballs
+  tui       Interactive terminal UI over the packaging commands (feature-gated)
   help      Print this message or the help of the given subcommand(s)
 ```
 
@@ -385,6 +390,40 @@ thermite tarball overlay all \
   --series       noble
 ```
 
+### `thermite tui`
+
+An interactive terminal UI (built with ratatui) that exposes the standalone
+packaging commands as keyboard shortcuts over the current repo directory.
+Because it is behind a feature flag, it requires building thermite with
+`--features tui` (or installing from a source build with that feature
+enabled).
+
+```sh
+thermite tui [--repo-dir <DIR>]
+```
+
+| Key | Action |
+|-----|--------|
+| `b` | Build with `sbuild` (prompts for the Ubuntu release adjective, e.g. noble) |
+| `S` | Source build with `dpkg-buildpackage -S -I -i -nc -d -sa` |
+| `l` | Run `lintian` on the repo directory |
+| `v` | Open the version bump menu (bump upstream / series / patch / dfsg / ubuntu rev …) |
+| `V` | Set the changelog version to an explicit string |
+| `t` | Open the tarball menu (download / generate / overlay × orig / vendor / all) |
+| `g` | `git fetch --all` |
+| `R` | Refresh the repo info panel (branch, version, tarballs, etc.) |
+| `q` / Ctrl+C | Cancel the running command while busy (`q` again when idle to quit) |
+
+The command output of each action is captured and shown in a scrollable log
+pane (PageUp/PageDown), so several commands can be inspected in order after
+they finish. The same `git fetch`, `sbuild`, `lintian`, `tarball`, and version
+machinery as the CLI subcommands is reused; only the invocation surface
+differs.
+
+While a command is running, `q` (or Ctrl+C) cancels it: the running child
+process is killed and a multi-step workflow (e.g. a tarball generate) aborts
+at the next step boundary. Once idle, `q` quits the TUI.
+
 ---
 
 ## Workflow Phases (update command)
@@ -457,6 +496,11 @@ src/
     update.rs           Orchestrates the full update workflow
     backport.rs         Orchestrates the full backport workflow
     version.rs          Version string utilities (parse, explain, format, bump)
+    tarball.rs          Download/generate/overlay the source tarballs
+    tui/                Interactive terminal UI (feature-gated; ratatui)
+      mod.rs            Terminal setup/teardown and the event loop
+      app.rs            UI state, key handling, and command resolution
+      render.rs         ratatui rendering (panes, modals, status bar)
   steps/
     autopkgtest.rs      autopkgtest invocations
     build.rs            dpkg-buildpackage, sbuild, and debian/tests/control editing
