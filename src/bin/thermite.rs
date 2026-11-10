@@ -135,7 +135,36 @@ enum Commands {
         /// current working directory).
         #[arg(short = 'd', long)]
         repo_dir: Option<PathBuf>,
+
+        /// Border/visual style: accessible (no borders, screen-reader
+        /// friendly), ascii (plain + - |), or polished (rounded Unicode).
+        /// Defaults to auto-detection from the environment.
+        #[arg(short, long, value_enum, default_value = None)]
+        style: Option<TuiStyleArg>,
     },
+}
+
+/// CLI value for `thermite tui --style`.
+#[cfg(feature = "tui")]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TuiStyleArg {
+    /// No borders; pane titles are plain text.
+    Accessible,
+    /// Plain `+ - |` borders.
+    Ascii,
+    /// Rounded Unicode box-drawing borders.
+    Polished,
+}
+
+#[cfg(feature = "tui")]
+impl TuiStyleArg {
+    fn into_ui_style(self) -> tui::UiStyle {
+        match self {
+            TuiStyleArg::Accessible => tui::UiStyle::Accessible,
+            TuiStyleArg::Ascii => tui::UiStyle::Ascii,
+            TuiStyleArg::Polished => tui::UiStyle::Polished,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -607,9 +636,9 @@ async fn run() -> Result<()> {
         }
 
         #[cfg(feature = "tui")]
-        Commands::Tui { repo_dir } => {
+        Commands::Tui { repo_dir, style } => {
             let repo_path = resolve_repo_dir(repo_dir)?;
-            tui::run(&repo_path).await?;
+            tui::run(&repo_path, style.map(TuiStyleArg::into_ui_style)).await?;
         }
     }
 
@@ -757,5 +786,15 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn tui_style_flag_parses() {
+        assert!(Cli::try_parse_from(["thermite", "tui"]).is_ok());
+        assert!(Cli::try_parse_from(["thermite", "tui", "--style", "accessible"]).is_ok());
+        assert!(Cli::try_parse_from(["thermite", "tui", "--style", "ascii"]).is_ok());
+        assert!(Cli::try_parse_from(["thermite", "tui", "--style", "polished"]).is_ok());
+        assert!(Cli::try_parse_from(["thermite", "tui", "--style", "bogus"]).is_err());
     }
 }

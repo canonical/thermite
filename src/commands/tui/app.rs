@@ -10,6 +10,69 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+// ---------------------------------------------------------------------------
+// UI style
+// ---------------------------------------------------------------------------
+
+/// Border/visual style of the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiStyle {
+    /// No borders at all: pane titles are plain text, so screen readers get
+    /// pure prose with no decorative glyphs.
+    Accessible,
+    /// Plain `+ - |` borders: readable, UTF-8-free, screen-reader friendly.
+    Ascii,
+    /// Rounded Unicode box-drawing borders (polished look).
+    Polished,
+}
+
+impl UiStyle {
+    /// All style values, in CLI order.
+    pub const ALL: [UiStyle; 3] = [UiStyle::Accessible, UiStyle::Ascii, UiStyle::Polished];
+
+    /// Lowercase name used in the CLI (`--style <name>`) and menus.
+    pub const fn name(self) -> &'static str {
+        match self {
+            UiStyle::Accessible => "accessible",
+            UiStyle::Ascii => "ascii",
+            UiStyle::Polished => "polished",
+        }
+    }
+
+    /// Parse a style name (case-insensitive); `None` when unknown.
+    pub fn from_name(name: &str) -> Option<UiStyle> {
+        let name = name.to_ascii_lowercase();
+        Self::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    /// Pick the default style from the environment.
+    ///
+    /// `TERM=dumb` (or unset) means a plain terminal — no box-drawing.  A
+    /// UTF-8 locale gets the polished rounded borders; anything else falls
+    /// back to ASCII.
+    pub fn from_env() -> UiStyle {
+        let term = std::env::var("TERM").unwrap_or_default();
+        let locale = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_CTYPE"))
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_default();
+        Self::detect(&term, &locale)
+    }
+
+    /// Style selection logic for [`UiStyle::from_env`], on injected values.
+    fn detect(term: &str, locale: &str) -> UiStyle {
+        if term.is_empty() || term == "dumb" {
+            return UiStyle::Accessible;
+        }
+        let locale = locale.to_ascii_lowercase();
+        if locale.contains("utf-8") || locale.contains("utf8") {
+            UiStyle::Polished
+        } else {
+            UiStyle::Ascii
+        }
+    }
+}
+
 use crate::error::Result;
 use crate::types::package_version::BumpOperation;
 use crate::types::package_version::RustcPackageVersion;
@@ -60,6 +123,34 @@ pub enum ResolvedCommand {
     GitFetch,
 }
 
+impl ResolvedCommand {
+    /// Human description of the command, shown in the busy bar and the
+    /// accessible REPL.
+    pub fn description(&self) -> String {
+        match self {
+            ResolvedCommand::Build { release } => format!("sbuild ({release})"),
+            ResolvedCommand::SourceBuild => "source build".to_owned(),
+            ResolvedCommand::Lintian => "lintian".to_owned(),
+            ResolvedCommand::Bump { .. } => "bump version".to_owned(),
+            ResolvedCommand::SetVersion { .. } => "set version".to_owned(),
+            ResolvedCommand::Tarball { params, target } => {
+                let action = match params.action {
+                    crate::types::params::TarballAction::Download => "download",
+                    crate::types::params::TarballAction::Generate => "generate",
+                    crate::types::params::TarballAction::Overlay => "overlay",
+                };
+                let target = match target {
+                    crate::commands::tarball::TarballTarget::Orig => "orig",
+                    crate::commands::tarball::TarballTarget::Vendor => "vendor",
+                    crate::commands::tarball::TarballTarget::All => "all",
+                };
+                format!("tarball {action} {target}")
+            }
+            ResolvedCommand::GitFetch => "git fetch --all".to_owned(),
+        }
+    }
+}
+
 /// Tarball target(s), TUI-local mirror of
 /// `commands::tarball::TarballTarget`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +162,7 @@ pub enum TarballTarget {
 
 impl TarballTarget {
     /// Label used in menu entries.
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             TarballTarget::Orig => "orig",
             TarballTarget::Vendor => "vendor",
@@ -239,6 +330,8 @@ impl InfoPane {
 pub struct App {
     /// Repo directory.
     pub repo_dir: PathBuf,
+    /// Border/visual style.
+    pub style: UiStyle,
     /// Info-pane contents.
     pub info: InfoPane,
     /// Log lines (oldest first, capped).
@@ -265,9 +358,10 @@ pub const LOG_SCROLL_STEP: usize = 10;
 
 impl App {
     /// Create the app and read the initial info pane.
-    pub fn new(repo_dir: &Path) -> Self {
+    pub fn new(repo_dir: &Path, style: UiStyle) -> Self {
         let mut app = Self {
             repo_dir: repo_dir.to_path_buf(),
+            style,
             info: InfoPane::default(),
             log: Vec::new(),
             log_scroll: 0,
@@ -304,37 +398,7 @@ impl App {
 
     /// Re-read the changelog and git branch into the info pane.
     pub fn refresh(&mut self) {
-        let changelog = self.repo_dir.join("debian/changelog");
-        let mut info = InfoPane {
-            repo_dir: self.repo_dir.clone(),
-            ..InfoPane::default()
-        };
-
-        match crate::steps::changelog::read_current_version(&changelog) {
-            Ok(version) => {
-                info.version = Some(version.clone());
-                match RustcPackageVersion::parse(&version) {
-                    Ok(v) => {
-                        // Package name: strip the version from the first line.
-                        let first_line = std::fs::read_to_string(&changelog)
-                            .ok()
-                            .and_then(|c| c.lines().next().map(str::to_owned))
-                            .unwrap_or_default();
-                        info.package = first_line
-                            .split_once(' ')
-                            .map(|(name, _)| name.trim().to_owned());
-                        info.upstream = Some(v.upstream.to_string());
-                        info.series = v.series.clone();
-                        info.ubuntu_revision = Some(v.ubuntu_revision);
-                        info.ppa = v.ppa;
-                    }
-                    Err(e) => info.error = Some(e.to_string()),
-                }
-            }
-            Err(e) => info.error = Some(e.to_string()),
-        }
-        info.branch = git_branch(&self.repo_dir);
-        self.info = info;
+        self.info = read_info(&self.repo_dir);
     }
 
     /// Handle a key press. Returns the action the event loop should take.
@@ -883,7 +947,7 @@ pub fn build_tarball_params(
 }
 
 /// Convert the TUI-local tarball target to the command-layer enum.
-fn tarball_target_to_command(target: TarballTarget) -> crate::commands::tarball::TarballTarget {
+pub fn tarball_target_to_command(target: TarballTarget) -> crate::commands::tarball::TarballTarget {
     match target {
         TarballTarget::Orig => crate::commands::tarball::TarballTarget::Orig,
         TarballTarget::Vendor => crate::commands::tarball::TarballTarget::Vendor,
@@ -894,6 +958,41 @@ fn tarball_target_to_command(target: TarballTarget) -> crate::commands::tarball:
 /// Best-effort release adjective for a numeric series (`"24.04"` → `"noble"`).
 fn release_from_series(series: &str) -> Option<String> {
     UbuntuRelease::release_from_series(series).map(str::to_owned)
+}
+
+/// Re-read the changelog and git branch into a fresh info pane.
+pub fn read_info(repo_dir: &Path) -> InfoPane {
+    let changelog = repo_dir.join("debian/changelog");
+    let mut info = InfoPane {
+        repo_dir: repo_dir.to_path_buf(),
+        ..InfoPane::default()
+    };
+
+    match crate::steps::changelog::read_current_version(&changelog) {
+        Ok(version) => {
+            info.version = Some(version.clone());
+            match RustcPackageVersion::parse(&version) {
+                Ok(v) => {
+                    // Package name: strip the version from the first line.
+                    let first_line = std::fs::read_to_string(&changelog)
+                        .ok()
+                        .and_then(|c| c.lines().next().map(str::to_owned))
+                        .unwrap_or_default();
+                    info.package = first_line
+                        .split_once(' ')
+                        .map(|(name, _)| name.trim().to_owned());
+                    info.upstream = Some(v.upstream.to_string());
+                    info.series = v.series.clone();
+                    info.ubuntu_revision = Some(v.ubuntu_revision);
+                    info.ppa = v.ppa;
+                }
+                Err(e) => info.error = Some(e.to_string()),
+            }
+        }
+        Err(e) => info.error = Some(e.to_string()),
+    }
+    info.branch = git_branch(repo_dir);
+    info
 }
 
 /// Current git branch name, or `None` when git fails.
@@ -943,12 +1042,12 @@ mod tests {
             "rustc-1.95 (1.95.0+dfsg-0ubuntu1) plucky; urgency=medium\n\n  * test\n\n -- T <t@t>  Mon, 01 Jan 2026 00:00:00 +0000\n",
         )
         .unwrap();
-        App::new(&dir)
+        App::new(&dir, UiStyle::Ascii)
     }
 
     #[test]
     fn push_log_splits_and_caps() {
-        let mut app = App::new(Path::new("/nonexistent"));
+        let mut app = App::new(Path::new("/nonexistent"), UiStyle::Ascii);
         app.push_log("one\n\ntwo");
         assert_eq!(app.log, vec!["one", "two"]);
         assert_eq!(app.log_scroll, 0);
@@ -956,7 +1055,7 @@ mod tests {
 
     #[test]
     fn log_scroll_follows_and_pins() {
-        let mut app = App::new(Path::new("/nonexistent"));
+        let mut app = App::new(Path::new("/nonexistent"), UiStyle::Ascii);
         for i in 0..30 {
             app.push_log(&format!("line {i}"));
         }
@@ -1334,6 +1433,25 @@ mod tests {
         assert!(m.value.ends_with("1.9"));
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn style_names_parse() {
+        for style in UiStyle::ALL {
+            assert_eq!(UiStyle::from_name(style.name()), Some(style));
+        }
+        assert_eq!(UiStyle::from_name("Polished"), Some(UiStyle::Polished));
+        assert_eq!(UiStyle::from_name("bogus"), None);
+    }
+
+    #[test]
+    fn style_detection() {
+        assert_eq!(UiStyle::detect("", "en_US.UTF-8"), UiStyle::Accessible);
+        assert_eq!(UiStyle::detect("dumb", "en_US.UTF-8"), UiStyle::Accessible);
+        assert_eq!(UiStyle::detect("xterm", "en_US.UTF-8"), UiStyle::Polished);
+        assert_eq!(UiStyle::detect("xterm", "C.UTF-8"), UiStyle::Polished);
+        assert_eq!(UiStyle::detect("xterm", "C"), UiStyle::Ascii);
+        assert_eq!(UiStyle::detect("xterm", ""), UiStyle::Ascii);
     }
 
     #[test]

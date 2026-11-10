@@ -10,13 +10,12 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::app::{App, Mode};
+use super::app::{App, Mode, UiStyle};
 
 /// ASCII border set.
 ///
-/// The project avoids decorative box-drawing characters (see `ui.rs`), so the
-/// TUI uses plain `+ - |` borders, which screen readers enumerate as one word
-/// instead of a run of lookalike glyphs.
+/// Plain `+ - |` borders: no UTF-8 required, and screen readers enumerate a
+/// run of identical dashes/pipes as one word instead of lookalike glyphs.
 const ASCII_BORDER: border::Set<'static> = border::Set {
     top_left: "+",
     top_right: "+",
@@ -27,6 +26,28 @@ const ASCII_BORDER: border::Set<'static> = border::Set {
     horizontal_top: "-",
     horizontal_bottom: "-",
 };
+
+/// Build a bordered, titled block for the given UI style.
+///
+/// - `Ascii`: the `+ - |` set.
+/// - `Polished`: rounded Unicode box-drawing borders in a dimmed style.
+///
+/// The accessible style never reaches the ratatui loop: it is a linear
+/// plain-text REPL (see [`super::repl`]).
+fn block_for(style: UiStyle, title: &str) -> Block<'static> {
+    match style {
+        UiStyle::Ascii => Block::default()
+            .title(title.to_owned())
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER),
+        UiStyle::Polished => Block::default()
+            .title(title.to_owned())
+            .borders(Borders::ALL)
+            .border_set(border::ROUNDED)
+            .border_style(Style::default().fg(Color::DarkGray)),
+        UiStyle::Accessible => unreachable!("accessible style runs the REPL, not the ratatui loop"),
+    }
+}
 
 /// Draw one frame.
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -53,8 +74,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match &app.mode {
         Mode::Normal => {}
-        Mode::Menu(menu) => draw_menu_modal(f, f.area(), menu.title.as_str(), menu),
-        Mode::Input(input) => draw_input_modal(f, f.area(), input),
+        Mode::Menu(menu) => draw_menu_modal(f, f.area(), app.style, menu.title.as_str(), menu),
+        Mode::Input(input) => draw_input_modal(f, f.area(), app.style, input),
     }
 }
 
@@ -95,10 +116,7 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, info_lines: &[String]) {
     } else {
         " Package info "
     };
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_set(ASCII_BORDER);
+    let block = block_for(app.style, title);
     let lines: Vec<Line> = info_lines.iter().map(|l| Line::from(l.as_str())).collect();
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -109,10 +127,7 @@ fn draw_log(f: &mut Frame, area: Rect, app: &App) {
         0 => " Output ".to_owned(),
         n => format!(" Output (scrolled back {n} lines, End to follow) "),
     };
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_set(ASCII_BORDER);
+    let block = block_for(app.style, &title);
 
     let height = area.height.saturating_sub(2) as usize;
     let end = app.log.len().saturating_sub(app.log_scroll);
@@ -155,10 +170,7 @@ fn draw_command_menu(f: &mut Frame, area: Rect, app: &App) {
             ])
         })
         .collect();
-    let block = Block::default()
-        .title(" Commands ")
-        .borders(Borders::ALL)
-        .border_set(ASCII_BORDER);
+    let block = block_for(app.style, " Commands ");
     f.render_widget(
         List::new(lines.iter().cloned().map(ListItem::new)).block(block),
         area,
@@ -195,7 +207,13 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Popup for a selection menu.
-fn draw_menu_modal(f: &mut Frame, area: Rect, title: &str, menu: &super::app::MenuModal) {
+fn draw_menu_modal(
+    f: &mut Frame,
+    area: Rect,
+    style: UiStyle,
+    title: &str,
+    menu: &super::app::MenuModal,
+) {
     let width = menu
         .options
         .iter()
@@ -207,10 +225,10 @@ fn draw_menu_modal(f: &mut Frame, area: Rect, title: &str, menu: &super::app::Me
     let modal = centered_rect(width + 4, height, area);
 
     f.render_widget(Clear, modal);
-    let block = Block::default()
-        .title(format!(" {title} (up/down, Enter to run, Esc to cancel) "))
-        .borders(Borders::ALL)
-        .border_set(ASCII_BORDER);
+    let block = block_for(
+        style,
+        &format!(" {title} (up/down, Enter to run, Esc to cancel) "),
+    );
     let items: Vec<ListItem> = menu
         .options
         .iter()
@@ -226,16 +244,13 @@ fn draw_menu_modal(f: &mut Frame, area: Rect, title: &str, menu: &super::app::Me
 }
 
 /// Popup for a single-line text input.
-fn draw_input_modal(f: &mut Frame, area: Rect, input: &super::app::InputModal) {
+fn draw_input_modal(f: &mut Frame, area: Rect, style: UiStyle, input: &super::app::InputModal) {
     let width = (input.title.chars().count() + input.value.chars().count() + 8)
         .min(area.width.saturating_sub(4) as usize) as u16;
     let modal = centered_rect(width, 6, area);
 
     f.render_widget(Clear, modal);
-    let block = Block::default()
-        .title(format!(" {} ", input.title))
-        .borders(Borders::ALL)
-        .border_set(ASCII_BORDER);
+    let block = block_for(style, &format!(" {} ", input.title));
 
     let mut lines = vec![Line::from(vec![
         Span::raw("> "),
@@ -275,5 +290,45 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         y,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Widget;
+
+    /// Render a block into a 10x3 buffer and return its corner symbols.
+    fn render_block(style: UiStyle, title: &str) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        block_for(style, title).render(Rect::new(0, 0, 10, 3), &mut buf);
+        buf
+    }
+
+    #[test]
+    fn ascii_style_renders_plus_minus_borders() {
+        let buf = render_block(UiStyle::Ascii, " t ");
+        assert_eq!(buf[(0, 0)].symbol(), "+");
+        assert_eq!(buf[(9, 0)].symbol(), "+");
+        assert_eq!(buf[(0, 2)].symbol(), "+");
+        assert_eq!(buf[(9, 2)].symbol(), "+");
+        assert_eq!(buf[(5, 0)].symbol(), "-");
+    }
+
+    #[test]
+    fn polished_style_renders_rounded_borders() {
+        let buf = render_block(UiStyle::Polished, " t ");
+        assert_eq!(buf[(0, 0)].symbol(), "╭");
+        assert_eq!(buf[(9, 0)].symbol(), "╮");
+        assert_eq!(buf[(0, 2)].symbol(), "╰");
+        assert_eq!(buf[(9, 2)].symbol(), "╯");
+        assert_eq!(buf[(5, 0)].symbol(), "─");
+    }
+
+    #[test]
+    fn ascii_style_title_is_rendered() {
+        let buf = render_block(UiStyle::Ascii, " t ");
+        assert!(buf.content().iter().any(|c| c.symbol() == "t"));
     }
 }
