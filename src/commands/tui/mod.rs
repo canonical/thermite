@@ -2,9 +2,12 @@
 //!
 //! A terminal user interface that wraps the packaging step commands: build,
 //! source build, lintian, version bumps, tarball operations, and git fetch.
-//! External command output is streamed into an on-screen log pane via the
-//! output sink installed in [`crate::shell`], so the alternate screen is
-//! never corrupted by stray writes.
+//!
+//! Two interaction modes:
+//! - `accessible` style: a linear plain-text REPL (no alternate screen, no
+//!   raw mode, numbered menus) — see the `repl` submodule.
+//! - `ascii`/`polished` styles: a ratatui TUI over the alternate screen with
+//!   an output sink and cancellation token.
 //!
 //! Cancellation: `q` (or Ctrl+C) while a command is running cancels it —
 //! the running child process is killed and a multi-step workflow aborts at
@@ -17,6 +20,9 @@
 
 mod app;
 mod render;
+mod repl;
+
+pub use app::UiStyle;
 
 use std::io;
 use std::path::Path;
@@ -35,7 +41,17 @@ use app::{App, AppAction};
 type Completion = (String, Result<String>);
 
 /// Run the TUI over the package rooted at `repo_dir`.
-pub async fn run(repo_dir: &Path) -> Result<()> {
+///
+/// `style` selects the border/visual style; `None` auto-detects from the
+/// environment (`TERM=dumb` → accessible, UTF-8 locale → polished, else
+/// ASCII).
+pub async fn run(repo_dir: &Path, style: Option<UiStyle>) -> Result<()> {
+    let style = style.unwrap_or_else(UiStyle::from_env);
+    // The accessible style never runs the ratatui loop: it is a linear
+    // plain-text REPL, so screen readers can follow the output linearly.
+    if style == UiStyle::Accessible {
+        return repl::run(repo_dir).await;
+    }
     // 1. Install the output sink: every line printed by `shell::run_command`,
     //    `ui::print_*`, and tracing events flows into this channel and is
     //    rendered in the TUI log pane.
@@ -57,9 +73,11 @@ pub async fn run(repo_dir: &Path) -> Result<()> {
         }
     };
 
-    let mut app = App::new(repo_dir);
-    app.push_log("thermite tui — press a command key from the sidebar; q quits");
-
+    let mut app = App::new(repo_dir, style);
+    app.push_log(&format!(
+        "thermite tui ({}) — press a command key from the sidebar; q quits",
+        style.name()
+    ));
     let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel::<Completion>();
 
     let result = event_loop(&mut terminal, &mut app, log_rx, done_tx, done_rx).await;

@@ -393,15 +393,31 @@ thermite tarball overlay all \
 
 ### `thermite tui`
 
-An interactive terminal UI (built with ratatui) that exposes the standalone
-packaging commands as keyboard shortcuts over the current repo directory.
-Because it is behind a feature flag, it requires building thermite with
-`--features tui` (or installing from a source build with that feature
-enabled).
+An interactive command surface that exposes the standalone packaging commands
+over the current repo directory. Because it is behind a feature flag, it
+requires building thermite with `--features tui` (or installing from a source
+build with that feature enabled).
 
 ```sh
-thermite tui [--repo-dir <DIR>]
+thermite tui [--repo-dir <DIR>] [--style accessible|ascii|polished]
 ```
+
+The `--style` flag selects the interaction mode:
+
+| Style | Description |
+|-------|-------------|
+| `accessible` | A linear plain-text REPL: no alternate screen, no raw mode, numbered menus. Every command runs in the normal terminal scrollback with its output streamed plain, so screen readers can follow the session linearly. Menus are numbered lists and selections are typed numbers. |
+| `ascii` | The ratatui TUI with plain `+`, `-`, `|` borders — no UTF-8 required |
+| `polished` | The ratatui TUI with rounded Unicode box-drawing borders (╭ ╮ ╰ ╯) |
+
+When `--style` is omitted, the style is auto-detected from the environment:
+`TERM=dumb` (or unset) selects `accessible`, a UTF-8 locale selects `polished`,
+and anything else falls back to `ascii`.
+
+#### The ratatui TUI (`ascii` and `polished` styles)
+
+Side-by-side panes render the package info, a scrollable output log, and the
+command menu:
 
 | Key | Action |
 |-----|--------|
@@ -415,15 +431,47 @@ thermite tui [--repo-dir <DIR>]
 | `R` | Refresh the repo info panel (branch, version, tarballs, etc.) |
 | `q` / Ctrl+C | Cancel the running command while busy (`q` again when idle to quit) |
 
-The command output of each action is captured and shown in a scrollable log
-pane (PageUp/PageDown), so several commands can be inspected in order after
-they finish. The same `git fetch`, `sbuild`, `lintian`, `tarball`, and version
+Command output is captured and shown in a scrollable log pane
+(PageUp/PageDown), so several commands can be inspected in order after they
+finish. The same `git fetch`, `sbuild`, `lintian`, `tarball`, and version
 machinery as the CLI subcommands is reused; only the invocation surface
 differs.
 
 While a command is running, `q` (or Ctrl+C) cancels it: the running child
 process is killed and a multi-step workflow (e.g. a tarball generate) aborts
 at the next step boundary. Once idle, `q` quits the TUI.
+
+#### The accessible REPL (`accessible` style)
+
+The REPL prints the package info, then a numbered command menu:
+
+```
+Package info:
+  repo: …
+  package: rustc-1.95
+  version: 1.95.0+dfsg-0ubuntu1
+
+Commands:
+  1. build (sbuild)
+  2. source build
+  3. lintian
+  4. bump version
+  5. set version
+  6. tarballs
+  7. git fetch
+  8. refresh info
+  9. quit
+
+Enter a number:
+```
+
+Select a command by typing its number; sub-prompts are plain read-a-line
+questions (empty input picks up a prefilled default where one exists). The
+command's output streams plain, then a completion line is printed
+(`== sbuild (noble): sbuild completed successfully`), and the package info is
+re-printed after commands that change the changelog (bump, set version,
+tarball). `q`, `quit`, an empty line, or EOF exits. Ctrl+C kills the running
+child process, as in any cooked-mode terminal.
 
 ---
 
