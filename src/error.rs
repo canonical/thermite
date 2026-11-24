@@ -9,6 +9,13 @@ pub enum ThermiteError {
     #[error("unknown Ubuntu release '{0}'")]
     UnknownRelease(String),
 
+    /// A real Ubuntu release that is older than the packaging workflow's
+    /// minimum supported series (Focal, 20.04). Kept in sync with
+    /// `MIN_SUPPORTED_VERSION` in `src/types/ubuntu.rs`; bump the message
+    /// when the floor moves.
+    #[error("release '{0}' is not supported: thermite targets Ubuntu 20.04 (Focal) and later")]
+    UnsupportedRelease(String),
+
     /// A child process exited with a non-zero status.
     ///
     /// Both `stdout` and `stderr` are captured so that callers can
