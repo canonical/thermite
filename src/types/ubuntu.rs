@@ -14,13 +14,7 @@ const MIN_SUPPORTED_VERSION: u32 = 20;
 /// packaging workflow only cares about modern series, so the floor is
 /// applied here once and reused by every lookup below.
 fn supported_series() -> impl Iterator<Item = &'static SeriesInfo> {
-    SeriesInfo::all().filter(|s| {
-        s.version
-            .split('.')
-            .next()
-            .and_then(|year| year.parse::<u32>().ok())
-            .is_some_and(|year| year >= MIN_SUPPORTED_VERSION)
-    })
+    SeriesInfo::all().filter(|s| is_supported(s))
 }
 
 /// Whether `s` is the series number of a supported Ubuntu release (e.g. `"24.04"`).
@@ -106,7 +100,7 @@ impl UbuntuRelease {
     /// non-devel releases are excluded — backports normally go one LTS at a
     /// time.
     ///
-    /// Example (as of the 26.10 cycle): `["tenacious", "resolute", "noble",
+    /// Example (as of the 27.04 cycle): `["tenacious", "resolute", "noble",
     /// "jammy", "focal"]`.
     pub fn backport_chain() -> Vec<&'static str> {
         let mut chain: Vec<&'static str> = supported_series()
@@ -172,6 +166,26 @@ mod tests {
     #[test]
     fn parse_normalizes_case() {
         assert_eq!(UbuntuRelease::parse("Noble").unwrap().as_str(), "noble");
+    }
+
+    #[test]
+    fn parse_accepts_devel_alias() {
+        assert_eq!(
+            UbuntuRelease::parse("devel").unwrap(),
+            UbuntuRelease::devel_release()
+        );
+        assert_eq!(
+            UbuntuRelease::parse("Devel").unwrap(),
+            UbuntuRelease::devel_release()
+        );
+    }
+
+    #[test]
+    fn parse_accepts_full_code_name() {
+        assert_eq!(
+            UbuntuRelease::parse("Noble Numbat").unwrap().as_str(),
+            "noble"
+        );
     }
 
     #[test]
