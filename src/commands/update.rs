@@ -114,7 +114,7 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
     git::fetch_all(repo_dir).await?;
 
     info!("checking out {old_merge_branch}");
-    git::checkout_branch(repo_dir, &old_merge_branch).await?;
+    git::checkout_remote_branch(repo_dir, git_remote, &old_merge_branch).await?;
 
     info!("creating and pushing branch {merge_branch}");
     git::create_and_push_branch(repo_dir, &merge_branch, lpuser).await?;
@@ -234,7 +234,7 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
     let _ = git::create_branch(repo_dir, "backup").await;
 
     // Create import-new branch from old merge branch.
-    git::checkout_branch(repo_dir, &old_merge_branch).await?;
+    git::checkout_remote_branch(repo_dir, git_remote, &old_merge_branch).await?;
     git::create_and_push_branch(repo_dir, &import_new_branch, lpuser).await?;
 
     // Cherry-pick the changelog entry commit.
@@ -254,7 +254,7 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
     .await?;
 
     // Switch back and rebase.
-    git::checkout_branch(repo_dir, &merge_branch).await?;
+    git::checkout_remote_branch(repo_dir, git_remote, &merge_branch).await?;
     print_info_box(
         "Manual step: interactive rebase required",
         &[
