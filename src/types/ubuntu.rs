@@ -36,10 +36,19 @@ impl UbuntuRelease {
     ///
     /// Matching is ASCII case-insensitive (`"Noble"` parses to `"noble"`),
     /// matching [`ubuntu_info_rust::SeriesInfo::from_code_name`].
+    ///
+    /// Two distinct failure modes: a string that names no Ubuntu release
+    /// yields [`ThermiteError::UnknownRelease`]; a real release below the
+    /// `MIN_SUPPORTED_VERSION` floor yields [`ThermiteError::UnsupportedRelease`].
     pub fn parse(s: &str) -> Result<Self> {
         match SeriesInfo::from_code_name(s) {
             Some(info) if is_supported(info) => Ok(Self(*info)),
-            _ => Err(ThermiteError::UnknownRelease(s.to_owned())),
+            Some(info) => Err(ThermiteError::UnsupportedRelease(format!(
+                "release '{s}' (series {}) is not supported: thermite targets \
+                 Ubuntu 20.04 (Focal) and later",
+                info.version
+            ))),
+            None => Err(ThermiteError::UnknownRelease(s.to_owned())),
         }
     }
 
@@ -188,14 +197,25 @@ mod tests {
 
     #[test]
     fn reject_unknown_release() {
-        assert!(UbuntuRelease::parse("foobar").is_err());
-        assert!(UbuntuRelease::parse("").is_err());
+        for input in ["foobar", ""] {
+            let err = UbuntuRelease::parse(input).unwrap_err();
+            assert!(
+                matches!(err, ThermiteError::UnknownRelease(_)),
+                "'{input}' should be UnknownRelease, got: {err:?}"
+            );
+        }
     }
 
     #[test]
     fn reject_pre_floor_release() {
-        // Bionic (18.04) is a real Ubuntu release but below the packaging floor.
-        assert!(UbuntuRelease::parse("bionic").is_err());
+        // Bionic (18.04) is a real Ubuntu release but below the packaging
+        // floor: it is UnsupportedRelease, not UnknownRelease.
+        let err = UbuntuRelease::parse("bionic").unwrap_err();
+        assert!(
+            matches!(err, ThermiteError::UnsupportedRelease(_)),
+            "bionic should be UnsupportedRelease, got: {err:?}"
+        );
+        assert!(err.to_string().contains("18.04"), "{err}");
     }
 
     #[test]
