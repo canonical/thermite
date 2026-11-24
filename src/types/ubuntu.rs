@@ -22,9 +22,14 @@ pub fn is_known_series(s: &str) -> bool {
     supported_series().any(|info| info.version == s)
 }
 
-/// A validated Ubuntu release adjective (e.g. `"noble"`).
+/// A validated Ubuntu release adjective (e.g. `"noble"`), backed by the
+/// release's [`ubuntu_info_rust::SeriesInfo`].
+///
+/// Validation invariants (known series, at or above the `MIN_SUPPORTED_VERSION`
+/// floor) are established once at construction; every accessor is a field
+/// read instead of a re-lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UbuntuRelease(String);
+pub struct UbuntuRelease(SeriesInfo);
 
 impl UbuntuRelease {
     /// Parse and validate a release adjective string.
@@ -33,24 +38,19 @@ impl UbuntuRelease {
     /// matching [`ubuntu_info_rust::SeriesInfo::from_code_name`].
     pub fn parse(s: &str) -> Result<Self> {
         match SeriesInfo::from_code_name(s) {
-            Some(info) if is_supported(info) => Ok(Self(info.code_name_short.to_owned())),
+            Some(info) if is_supported(info) => Ok(Self(*info)),
             _ => Err(ThermiteError::UnknownRelease(s.to_owned())),
         }
     }
 
     /// Return the release adjective as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn as_str(&self) -> &'static str {
+        self.0.code_name_short
     }
 
     /// Return the numeric series identifier for this release (e.g. `"22.04"`).
-    ///
-    /// Panics if the release was somehow constructed with an unknown adjective,
-    /// which cannot happen through the public [`Self::parse`] constructor.
     pub fn series_number(&self) -> &'static str {
-        SeriesInfo::from_code_name(&self.0)
-            .map(|info| info.version)
-            .expect("UbuntuRelease invariant: adjective is always a supported series")
+        self.0.version
     }
 
     /// Return the adjective of the current Ubuntu development release.
@@ -68,7 +68,7 @@ impl UbuntuRelease {
     /// but infallible, since [`devel`](Self::devel) always returns a known
     /// adjective.
     pub fn devel_release() -> Self {
-        Self(Self::devel().to_owned())
+        Self(*SeriesInfo::devel())
     }
 
     /// Return `true` when this release is the current Ubuntu development
@@ -81,7 +81,7 @@ impl UbuntuRelease {
     /// treat this as a hint for messaging only, not as the source of truth
     /// for branch-name decisions.
     pub fn is_devel(&self) -> bool {
-        self.0 == Self::devel()
+        self.0 == *SeriesInfo::devel()
     }
 
     /// Return `true` when this release is an Ubuntu Long-Term Support release.
@@ -89,7 +89,7 @@ impl UbuntuRelease {
     /// Sourced from [`ubuntu_info_rust::SeriesInfo::is_lts`], which is derived
     /// from the upstream `ubuntu.csv` data rather than a YY.04 heuristic.
     pub fn is_lts(&self) -> bool {
-        SeriesInfo::from_code_name(&self.0).is_some_and(|info| info.is_lts)
+        self.0.is_lts
     }
 
     /// Return the ordered chain of releases that backports traverse, from the
@@ -102,17 +102,15 @@ impl UbuntuRelease {
     ///
     /// Example (as of the 27.04 cycle): `["tenacious", "resolute", "noble",
     /// "jammy", "focal"]`.
-    pub fn backport_chain() -> Vec<&'static str> {
-        let mut chain: Vec<&'static str> = supported_series()
-            .filter(|info| info.is_lts)
-            .map(|info| info.code_name_short)
-            .collect();
+    pub fn backport_chain() -> Vec<&'static SeriesInfo> {
+        let mut chain: Vec<&'static SeriesInfo> =
+            supported_series().filter(|info| info.is_lts).collect();
         // `all()` yields oldest-to-newest; the chain wants newest-to-oldest.
         chain.reverse();
         // Head is the current devel release.
-        chain.insert(0, Self::devel());
-        // `devel()` may itself be an LTS release (e.g. a 26.04 devel before
-        // release); dedup so it appears only once, at the head.
+        chain.insert(0, SeriesInfo::devel());
+        // The devel release may itself be an LTS release (e.g. a 26.04 devel
+        // before release); dedup so it appears only once, at the head.
         chain.dedup();
         chain
     }
@@ -123,7 +121,7 @@ impl UbuntuRelease {
     pub fn chain_position(&self) -> Option<usize> {
         Self::backport_chain()
             .iter()
-            .position(|name| *name == self.0.as_str())
+            .position(|info| **info == self.0)
     }
 
     /// Reverse lookup: the release adjective for a numeric series
@@ -149,7 +147,7 @@ fn is_supported(info: &SeriesInfo) -> bool {
 
 impl std::fmt::Display for UbuntuRelease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.0.code_name_short)
     }
 }
 
@@ -274,17 +272,17 @@ mod tests {
         let chain = UbuntuRelease::backport_chain();
         assert!(!chain.is_empty(), "chain should be non-empty");
         // Head is always the current devel release.
-        assert_eq!(chain[0], UbuntuRelease::devel());
+        assert_eq!(chain[0], SeriesInfo::devel());
         // Every subsequent entry is an LTS release, newest-first.
-        for name in &chain[1..] {
-            let r = UbuntuRelease::parse(name).unwrap();
-            assert!(r.is_lts(), "{name} in chain should be LTS");
+        for info in &chain[1..] {
+            assert!(
+                info.is_lts,
+                "{} in chain should be LTS",
+                info.code_name_short
+            );
         }
         // LTS entries are in descending series-number order.
-        let lts_series: Vec<&str> = chain[1..]
-            .iter()
-            .map(|name| UbuntuRelease::parse(name).unwrap().series_number())
-            .collect();
+        let lts_series: Vec<&str> = chain[1..].iter().map(|info| info.version).collect();
         let mut sorted = lts_series.clone();
         sorted.sort_by(|a, b| b.cmp(a));
         assert_eq!(lts_series, sorted, "LTS entries should be newest-first");
@@ -293,12 +291,13 @@ mod tests {
     #[test]
     fn chain_position_returns_index_for_chain_members() {
         let chain = UbuntuRelease::backport_chain();
-        for (idx, name) in chain.iter().enumerate() {
-            let r = UbuntuRelease::parse(name).unwrap();
+        for (idx, info) in chain.iter().enumerate() {
+            let r = UbuntuRelease::parse(info.code_name_short).unwrap();
             assert_eq!(
                 r.chain_position(),
                 Some(idx),
-                "{name} should be at position {idx}"
+                "{} should be at position {idx}",
+                info.code_name_short
             );
         }
     }
@@ -314,11 +313,14 @@ mod tests {
     fn backport_chain_includes_lts_releases_above_floor() {
         let chain = UbuntuRelease::backport_chain();
         for expected in ["resolute", "noble", "jammy", "focal"] {
-            assert!(chain.contains(&expected), "chain should contain {expected}");
+            assert!(
+                chain.iter().any(|info| info.code_name_short == expected),
+                "chain should contain {expected}"
+            );
         }
         for excluded in ["bionic", "xenial", "trusty"] {
             assert!(
-                !chain.contains(&excluded),
+                !chain.iter().any(|info| info.code_name_short == excluded),
                 "chain should not contain {excluded}"
             );
         }

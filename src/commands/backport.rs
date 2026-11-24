@@ -390,12 +390,18 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
                 let chain = crate::types::ubuntu::UbuntuRelease::backport_chain();
                 let skipped: Vec<String> = chain[lower + 1..upper]
                     .iter()
-                    .map(|name| {
-                        let r = crate::types::ubuntu::UbuntuRelease::parse(name)
-                            .expect("chain entries are valid releases");
-                        let series = r.series_number();
-                        let kind = if r.is_devel() { "devel" } else { "LTS" };
-                        format!("  - {name} (series {series}, {kind})")
+                    .map(|info| {
+                        let kind = if info.code_name_short
+                            == crate::types::ubuntu::UbuntuRelease::devel()
+                        {
+                            "devel"
+                        } else {
+                            "LTS"
+                        };
+                        format!(
+                            "  - {} (series {}, {kind})",
+                            info.code_name_short, info.version
+                        )
                     })
                     .collect();
                 let skipped_block = skipped.join("\n");
