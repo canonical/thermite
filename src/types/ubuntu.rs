@@ -1,73 +1,74 @@
 use crate::error::{Result, ThermiteError};
+use ubuntu_info_rust::SeriesInfo;
 
-/// The set of known Ubuntu release adjectives paired with their series numbers.
+/// The oldest Ubuntu release version covered by the Rust toolchain packaging
+/// workflow. Series older than this (Warty through Disco) are excluded from
+/// validation and from the backport chain, matching the manually maintained
+/// release list this replaces. Bump when the packaging floor moves.
+const MIN_SUPPORTED_VERSION: u32 = 20;
+
+/// Return every known Ubuntu series with a major version at or above
+/// [`MIN_SUPPORTED_VERSION`], oldest first.
 ///
-/// This list covers all Ubuntu releases from Focal onwards. Add new entries
-/// here as new Ubuntu releases are announced.
-const KNOWN_RELEASES: &[(&str, &str)] = &[
-    ("focal", "20.04"),    // 20.04 LTS
-    ("groovy", "20.10"),   // 20.10
-    ("hirsute", "21.04"),  // 21.04
-    ("impish", "21.10"),   // 21.10
-    ("jammy", "22.04"),    // 22.04 LTS
-    ("kinetic", "22.10"),  // 22.10
-    ("lunar", "23.04"),    // 23.04
-    ("mantic", "23.10"),   // 23.10
-    ("noble", "24.04"),    // 24.04 LTS
-    ("oracular", "24.10"), // 24.10
-    ("plucky", "25.04"),   // 25.04
-    ("questing", "25.10"), // 25.10
-    ("resolute", "26.04"), // 26.04 LTS
-    ("stonking", "26.10"), // 26.10
-];
-
-/// Whether `s` is the series number of a known Ubuntu release (e.g. `"24.04"`).
-pub fn is_known_series(s: &str) -> bool {
-    KNOWN_RELEASES.iter().any(|(_, series)| *series == s)
+/// `SeriesInfo::all()` covers the whole Ubuntu history; the toolchain
+/// packaging workflow only cares about modern series, so the floor is
+/// applied here once and reused by every lookup below.
+fn supported_series() -> impl Iterator<Item = &'static SeriesInfo> {
+    SeriesInfo::all().filter(|s| is_supported(s))
 }
 
-/// A validated Ubuntu release adjective (e.g. `"noble"`).
+/// Whether `s` is the series number of a supported Ubuntu release (e.g. `"24.04"`).
+pub fn is_known_series(s: &str) -> bool {
+    supported_series().any(|info| info.version == s)
+}
+
+/// A validated Ubuntu release adjective (e.g. `"noble"`), backed by the
+/// release's [`ubuntu_info_rust::SeriesInfo`].
+///
+/// Validation invariants (known series, at or above the `MIN_SUPPORTED_VERSION`
+/// floor) are established once at construction; every accessor is a field
+/// read instead of a re-lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UbuntuRelease(String);
+pub struct UbuntuRelease(SeriesInfo);
 
 impl UbuntuRelease {
     /// Parse and validate a release adjective string.
+    ///
+    /// Matching is ASCII case-insensitive (`"Noble"` parses to `"noble"`),
+    /// matching [`ubuntu_info_rust::SeriesInfo::from_code_name`].
+    ///
+    /// Two distinct failure modes: a string that names no Ubuntu release
+    /// yields [`ThermiteError::UnknownRelease`]; a real release below the
+    /// `MIN_SUPPORTED_VERSION` floor yields [`ThermiteError::UnsupportedRelease`].
     pub fn parse(s: &str) -> Result<Self> {
-        if KNOWN_RELEASES.iter().any(|(name, _)| *name == s) {
-            Ok(Self(s.to_owned()))
-        } else {
-            Err(ThermiteError::UnknownRelease(s.to_owned()))
+        match SeriesInfo::from_code_name(s) {
+            Some(info) if is_supported(info) => Ok(Self(*info)),
+            Some(info) => Err(ThermiteError::UnsupportedRelease(format!(
+                "release '{s}' (series {}) is not supported: thermite targets \
+                 Ubuntu 20.04 (Focal) and later",
+                info.version
+            ))),
+            None => Err(ThermiteError::UnknownRelease(s.to_owned())),
         }
     }
 
     /// Return the release adjective as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn as_str(&self) -> &'static str {
+        self.0.code_name_short
     }
 
     /// Return the numeric series identifier for this release (e.g. `"22.04"`).
-    ///
-    /// Panics if the release was somehow constructed with an unknown adjective,
-    /// which cannot happen through the public [`Self::parse`] constructor.
     pub fn series_number(&self) -> &'static str {
-        KNOWN_RELEASES
-            .iter()
-            .find(|(name, _)| *name == self.0.as_str())
-            .map(|(_, series)| *series)
-            .expect("UbuntuRelease invariant: adjective is always in KNOWN_RELEASES")
+        self.0.version
     }
 
     /// Return the adjective of the current Ubuntu development release.
     ///
-    /// The devel release is defined as the **last** entry in `KNOWN_RELEASES`.
-    /// This list is appended to as new Ubuntu releases are announced, so the
-    /// value returned here tracks the current devel release as long as the
-    /// list is kept up to date.
+    /// Sourced from [`ubuntu_info_rust::SeriesInfo::devel`], which resolves
+    /// the unreleased series with the earliest release date — no manual
+    /// list appending required when a new cycle opens.
     pub fn devel() -> &'static str {
-        KNOWN_RELEASES
-            .last()
-            .map(|(name, _)| *name)
-            .expect("KNOWN_RELEASES is non-empty by construction")
+        SeriesInfo::devel().code_name_short
     }
 
     /// Construct the [`UbuntuRelease`] for the current devel release.
@@ -76,54 +77,49 @@ impl UbuntuRelease {
     /// but infallible, since [`devel`](Self::devel) always returns a known
     /// adjective.
     pub fn devel_release() -> Self {
-        Self(Self::devel().to_owned())
+        Self(*SeriesInfo::devel())
     }
 
     /// Return `true` when this release is the current Ubuntu development
-    /// release (i.e. the last entry in `KNOWN_RELEASES`).
+    /// release.
     ///
-    /// This is a **static** heuristic: it is correct only as long as
-    /// `KNOWN_RELEASES` is kept up to date with the release cadence. Callers
-    /// that need to be robust against the devel→stable transition should treat
-    /// this as a hint for messaging only, not as the source of truth for
-    /// branch-name decisions.
+    /// This is a **static** heuristic: it is correct only as long as the
+    /// `ubuntu-info-rust` data is kept up to date with the release cadence
+    /// (the crate's data is generated from `distro-info-data`). Callers
+    /// that need to be robust against the devel→stable transition should
+    /// treat this as a hint for messaging only, not as the source of truth
+    /// for branch-name decisions.
     pub fn is_devel(&self) -> bool {
-        self.0 == Self::devel()
+        self.0 == *SeriesInfo::devel()
     }
 
     /// Return `true` when this release is an Ubuntu Long-Term Support release.
     ///
-    /// LTS releases fall on even-numbered years in April (`YY.04`). This is
-    /// derived from [`series_number()`](Self::series_number) rather than a
-    /// static list so that it stays correct as new LTS releases are appended
-    /// to `KNOWN_RELEASES`.
+    /// Sourced from [`ubuntu_info_rust::SeriesInfo::is_lts`], which is derived
+    /// from the upstream `ubuntu.csv` data rather than a YY.04 heuristic.
     pub fn is_lts(&self) -> bool {
-        let series = self.series_number();
-        let (year, month) = series
-            .split_once('.')
-            .expect("series_number always has the form YY.MM");
-        let year: u32 = year.parse().expect("year component is numeric");
-        year.is_multiple_of(2) && month == "04"
+        self.0.is_lts
     }
 
     /// Return the ordered chain of releases that backports traverse, from the
     /// current devel release down to the oldest supported LTS.
     ///
-    /// The chain consists of the current devel release (the last entry in
-    /// `KNOWN_RELEASES`) followed by every LTS release in `KNOWN_RELEASES`,
-    /// newest-first. Non-LTS, non-devel releases are excluded — backports
-    /// normally go one LTS at a time.
+    /// The chain consists of the current devel release followed by every LTS
+    /// release at or above the `MIN_SUPPORTED_VERSION` floor, newest-first. Non-LTS,
+    /// non-devel releases are excluded — backports normally go one LTS at a
+    /// time.
     ///
-    /// Example (today): `["stonking", "resolute", "noble", "jammy", "focal"]`.
-    pub fn backport_chain() -> Vec<&'static str> {
-        let mut chain: Vec<&'static str> = KNOWN_RELEASES
-            .iter()
-            .rev()
-            .filter(|(name, series)| *name == Self::devel() || Self::series_is_lts(series))
-            .map(|(name, _)| *name)
-            .collect();
-        // `devel()` may itself be an LTS release (e.g. a 26.04 devel before
-        // release); dedup so it appears only once, at the head.
+    /// Example (as of the 27.04 cycle): `["tenacious", "resolute", "noble",
+    /// "jammy", "focal"]`.
+    pub fn backport_chain() -> Vec<&'static SeriesInfo> {
+        let mut chain: Vec<&'static SeriesInfo> =
+            supported_series().filter(|info| info.is_lts).collect();
+        // `all()` yields oldest-to-newest; the chain wants newest-to-oldest.
+        chain.reverse();
+        // Head is the current devel release.
+        chain.insert(0, SeriesInfo::devel());
+        // The devel release may itself be an LTS release (e.g. a 26.04 devel
+        // before release); dedup so it appears only once, at the head.
         chain.dedup();
         chain
     }
@@ -134,36 +130,33 @@ impl UbuntuRelease {
     pub fn chain_position(&self) -> Option<usize> {
         Self::backport_chain()
             .iter()
-            .position(|name| *name == self.0.as_str())
-    }
-
-    /// Return `true` when `series` (a `"YY.MM"` string) is an LTS series.
-    ///
-    /// Helper for [`Self::backport_chain`] / [`Self::is_lts`] so the LTS test
-    /// lives in one place.
-    fn series_is_lts(series: &str) -> bool {
-        let Some((year, month)) = series.split_once('.') else {
-            return false;
-        };
-        let Ok(year) = year.parse::<u32>() else {
-            return false;
-        };
-        year.is_multiple_of(2) && month == "04"
+            .position(|info| **info == self.0)
     }
 
     /// Reverse lookup: the release adjective for a numeric series
     /// (`"24.04"` → `"noble"`), or `None` for an unknown series.
+    ///
+    /// Delegates to [`ubuntu_info_rust::SeriesInfo::from_version`], which also
+    /// accepts LTS suffixes and point releases (`"24.04.1 LTS"` → `"noble"`).
     pub fn release_from_series(series: &str) -> Option<&'static str> {
-        KNOWN_RELEASES
-            .iter()
-            .find(|(_, s)| *s == series)
-            .map(|(name, _)| *name)
+        SeriesInfo::from_version(series)
+            .filter(|info| is_supported(info))
+            .map(|info| info.code_name_short)
     }
+}
+
+/// Whether `info` is at or above the [`MIN_SUPPORTED_VERSION`] floor.
+fn is_supported(info: &SeriesInfo) -> bool {
+    info.version
+        .split('.')
+        .next()
+        .and_then(|year| year.parse::<u32>().ok())
+        .is_some_and(|year| year >= MIN_SUPPORTED_VERSION)
 }
 
 impl std::fmt::Display for UbuntuRelease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.0.code_name_short)
     }
 }
 
@@ -178,9 +171,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_normalizes_case() {
+        assert_eq!(UbuntuRelease::parse("Noble").unwrap().as_str(), "noble");
+    }
+
+    #[test]
+    fn parse_accepts_devel_alias() {
+        assert_eq!(
+            UbuntuRelease::parse("devel").unwrap(),
+            UbuntuRelease::devel_release()
+        );
+        assert_eq!(
+            UbuntuRelease::parse("Devel").unwrap(),
+            UbuntuRelease::devel_release()
+        );
+    }
+
+    #[test]
+    fn parse_accepts_full_code_name() {
+        assert_eq!(
+            UbuntuRelease::parse("Noble Numbat").unwrap().as_str(),
+            "noble"
+        );
+    }
+
+    #[test]
     fn reject_unknown_release() {
-        assert!(UbuntuRelease::parse("foobar").is_err());
-        assert!(UbuntuRelease::parse("").is_err());
+        for input in ["foobar", ""] {
+            let err = UbuntuRelease::parse(input).unwrap_err();
+            assert!(
+                matches!(err, ThermiteError::UnknownRelease(_)),
+                "'{input}' should be UnknownRelease, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_pre_floor_release() {
+        // Bionic (18.04) is a real Ubuntu release but below the packaging
+        // floor: it is UnsupportedRelease, not UnknownRelease.
+        let err = UbuntuRelease::parse("bionic").unwrap_err();
+        assert!(
+            matches!(err, ThermiteError::UnsupportedRelease(_)),
+            "bionic should be UnsupportedRelease, got: {err:?}"
+        );
+        assert!(err.to_string().contains("18.04"), "{err}");
     }
 
     #[test]
@@ -204,23 +239,21 @@ mod tests {
     }
 
     #[test]
-    fn devel_returns_last_known_release_adjective() {
-        let last = KNOWN_RELEASES.last().expect("KNOWN_RELEASES is non-empty");
-        assert_eq!(UbuntuRelease::devel(), last.0);
+    fn devel_matches_series_info_devel() {
+        assert_eq!(UbuntuRelease::devel(), SeriesInfo::devel().code_name_short);
     }
 
     #[test]
-    fn is_devel_true_for_last_known_release() {
-        let last = KNOWN_RELEASES.last().expect("KNOWN_RELEASES is non-empty");
-        let r = UbuntuRelease::parse(last.0).unwrap();
-        assert!(r.is_devel(), "{} should be devel", last.0);
+    fn is_devel_true_for_series_info_devel() {
+        let r = UbuntuRelease::devel_release();
+        assert!(r.is_devel(), "{} should be devel", r);
     }
 
     #[test]
-    fn is_devel_false_for_non_last_release() {
+    fn is_devel_false_for_non_devel_release() {
         let r = UbuntuRelease::parse("noble").unwrap();
-        // `noble` is only the devel release if it happens to be the last entry
-        // in KNOWN_RELEASES; assert against the known devel adjective instead.
+        // `noble` is only the devel release if it happens to be the current
+        // devel; assert against the known devel adjective instead.
         if UbuntuRelease::devel() != "noble" {
             assert!(!r.is_devel());
         }
@@ -246,8 +279,8 @@ mod tests {
     fn is_lts_false_for_non_lts_releases() {
         for name in ["groovy", "oracular", "questing", "stonking"] {
             let r = UbuntuRelease::parse(name).unwrap();
-            // `stonking` (26.10) is the current devel; if a future LTS is
-            // appended it stays non-LTS. Guard against the devel being LTS.
+            // `stonking` (26.10) is a recent non-LTS release; if a future LTS
+            // is appended it stays non-LTS. Guard against the devel being LTS.
             if !r.is_devel() {
                 assert!(!r.is_lts(), "{name} should not be LTS");
             }
@@ -259,17 +292,17 @@ mod tests {
         let chain = UbuntuRelease::backport_chain();
         assert!(!chain.is_empty(), "chain should be non-empty");
         // Head is always the current devel release.
-        assert_eq!(chain[0], UbuntuRelease::devel());
+        assert_eq!(chain[0], SeriesInfo::devel());
         // Every subsequent entry is an LTS release, newest-first.
-        for name in &chain[1..] {
-            let r = UbuntuRelease::parse(name).unwrap();
-            assert!(r.is_lts(), "{name} in chain should be LTS");
+        for info in &chain[1..] {
+            assert!(
+                info.is_lts,
+                "{} in chain should be LTS",
+                info.code_name_short
+            );
         }
         // LTS entries are in descending series-number order.
-        let lts_series: Vec<&str> = chain[1..]
-            .iter()
-            .map(|name| UbuntuRelease::parse(name).unwrap().series_number())
-            .collect();
+        let lts_series: Vec<&str> = chain[1..].iter().map(|info| info.version).collect();
         let mut sorted = lts_series.clone();
         sorted.sort_by(|a, b| b.cmp(a));
         assert_eq!(lts_series, sorted, "LTS entries should be newest-first");
@@ -278,12 +311,13 @@ mod tests {
     #[test]
     fn chain_position_returns_index_for_chain_members() {
         let chain = UbuntuRelease::backport_chain();
-        for (idx, name) in chain.iter().enumerate() {
-            let r = UbuntuRelease::parse(name).unwrap();
+        for (idx, info) in chain.iter().enumerate() {
+            let r = UbuntuRelease::parse(info.code_name_short).unwrap();
             assert_eq!(
                 r.chain_position(),
                 Some(idx),
-                "{name} should be at position {idx}"
+                "{} should be at position {idx}",
+                info.code_name_short
             );
         }
     }
@@ -296,22 +330,42 @@ mod tests {
     }
 
     #[test]
-    fn backport_chain_today_matches_expected() {
-        // Snapshot test for the current KNOWN_RELEASES. Update when new
-        // releases are appended.
-        assert_eq!(
-            UbuntuRelease::backport_chain(),
-            vec!["stonking", "resolute", "noble", "jammy", "focal"]
-        );
+    fn backport_chain_includes_lts_releases_above_floor() {
+        let chain = UbuntuRelease::backport_chain();
+        for expected in ["resolute", "noble", "jammy", "focal"] {
+            assert!(
+                chain.iter().any(|info| info.code_name_short == expected),
+                "chain should contain {expected}"
+            );
+        }
+        for excluded in ["bionic", "xenial", "trusty"] {
+            assert!(
+                !chain.iter().any(|info| info.code_name_short == excluded),
+                "chain should not contain {excluded}"
+            );
+        }
     }
 
     #[test]
-    fn is_known_series_matches_known_releases() {
+    fn is_known_series_matches_supported_releases() {
         assert!(is_known_series("24.04"));
         assert!(is_known_series("20.04"));
         assert!(is_known_series("26.10"));
         assert!(!is_known_series("banana"));
         assert!(!is_known_series("20.4"));
         assert!(!is_known_series(""));
+        assert!(!is_known_series("18.04"), "bionic is below the floor");
+    }
+
+    #[test]
+    fn release_from_series_resolves_supported_series() {
+        assert_eq!(UbuntuRelease::release_from_series("24.04"), Some("noble"));
+        assert_eq!(UbuntuRelease::release_from_series("20.04"), Some("focal"));
+        assert_eq!(UbuntuRelease::release_from_series("banana"), None);
+        assert_eq!(
+            UbuntuRelease::release_from_series("18.04"),
+            None,
+            "bionic is below the floor"
+        );
     }
 }

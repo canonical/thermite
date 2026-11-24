@@ -130,7 +130,9 @@ fn resolve_command(
             } else {
                 value.trim().to_owned()
             };
-            UbuntuRelease::parse(&value)?;
+            // Normalize so mixed-case input ("Noble") and aliases ("devel")
+            // do not leak into the sbuild command line or the default.
+            let value = UbuntuRelease::parse(&value)?.to_string();
             *last_release = Some(value.clone());
             Some(ResolvedCommand::Build { release: value })
         }
