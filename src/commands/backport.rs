@@ -390,12 +390,18 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
                 let chain = crate::types::ubuntu::UbuntuRelease::backport_chain();
                 let skipped: Vec<String> = chain[lower + 1..upper]
                     .iter()
-                    .map(|name| {
-                        let r = crate::types::ubuntu::UbuntuRelease::parse(name)
-                            .expect("chain entries are valid releases");
-                        let series = r.series_number();
-                        let kind = if r.is_devel() { "devel" } else { "LTS" };
-                        format!("  - {name} (series {series}, {kind})")
+                    .map(|info| {
+                        let kind = if info.code_name_short
+                            == crate::types::ubuntu::UbuntuRelease::devel()
+                        {
+                            "devel"
+                        } else {
+                            "LTS"
+                        };
+                        format!(
+                            "  - {} (series {}, {kind})",
+                            info.code_name_short, info.version
+                        )
                     })
                     .collect();
                 let skipped_block = skipped.join("\n");
@@ -605,6 +611,9 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         let has_fallback =
             git::remote_branch_exists(repo_dir, git_remote, &fallback_source_branch).await?;
 
+        // Whether the branch was resolved from `git_remote` (as opposed to
+        // entered manually, which may name a purely local branch).
+        let mut source_from_remote = false;
         let resolved_source_branch: String = match resolve_source_branch_name(
             &primary_source_branch,
             &fallback_source_branch,
@@ -612,6 +621,7 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
             has_fallback,
         ) {
             Some(branch) => {
+                source_from_remote = true;
                 if branch == fallback_source_branch {
                     // We're falling back to `merge-X.Y`. Explain why.
                     if is_devel_source {
@@ -679,7 +689,14 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
         };
 
         info!("checking out {resolved_source_branch}");
-        git::checkout_branch(repo_dir, &resolved_source_branch).await?;
+        if source_from_remote {
+            // The branch was probed on `git_remote`; name it explicitly so the
+            // checkout stays unambiguous when another remote (e.g. the user's
+            // Launchpad fork) carries a branch of the same name.
+            git::checkout_remote_branch(repo_dir, git_remote, &resolved_source_branch).await?;
+        } else {
+            git::checkout_branch(repo_dir, &resolved_source_branch).await?;
+        }
 
         info!("creating branch {target_branch}");
         crate::shell::run_command("git", &["checkout", "-b", &target_branch], repo_dir, &[])

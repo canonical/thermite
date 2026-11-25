@@ -164,7 +164,8 @@ pub async fn fetch_tarball(
 /// backport chain.
 async fn primary_archive_upstreams(rust_ver: &RustVersion, source: &str) -> Result<Vec<String>> {
     let mut series_list = launchpad::cached_active_series().await?;
-    for series in crate::types::ubuntu::UbuntuRelease::backport_chain() {
+    for info in crate::types::ubuntu::UbuntuRelease::backport_chain() {
+        let series = info.code_name_short;
         if !series_list.iter().any(|s| s == series) {
             series_list.push(series.to_owned());
         }

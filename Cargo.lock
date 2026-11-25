@@ -3459,6 +3459,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ubuntu-info-rust",
 ]
 
 [[package]]

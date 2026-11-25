@@ -67,6 +67,26 @@ pub async fn checkout_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check out `branch` from `remote`, creating or resetting the local branch to
+/// the remote-tracking tip.
+///
+/// A bare `git checkout <branch>` resolves the name with DWIM rules and fails
+/// when more than one remote has a branch of the same name ("matched multiple
+/// (2) remote tracking branches"); naming the remote explicitly is
+/// unambiguous.  `-B` also makes reruns idempotent: an existing local branch
+/// is reset to the just-fetched remote tip instead of failing with "already
+/// exists".
+pub async fn checkout_remote_branch(repo_dir: &Path, remote: &str, branch: &str) -> Result<()> {
+    run_command(
+        "git",
+        &["checkout", "-B", branch, &format!("{remote}/{branch}")],
+        repo_dir,
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Create a new branch from the current HEAD and push it to `remote`.
 pub async fn create_and_push_branch(repo_dir: &Path, branch: &str, remote: &str) -> Result<()> {
     run_command("git", &["checkout", "-b", branch], repo_dir, &[]).await?;
@@ -308,6 +328,131 @@ mod tests {
                 .unwrap(),
             "stonking-1.85 should be reported as absent on origin"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// `checkout_remote_branch` must succeed where a bare `git checkout` fails:
+    /// when the same branch name exists on more than one remote, DWIM
+    /// resolution refuses with "matched multiple (2) remote tracking
+    /// branches".  We build a working repo with two remotes (`origin` and
+    /// `other`) that both carry `noble-1.85`, no local branch of that name,
+    /// and remote-tracking refs for both; the qualified checkout must create
+    /// and check out the local branch, and must stay idempotent on reruns.
+    #[tokio::test]
+    async fn checkout_remote_branch_resolves_ambiguity_between_remotes() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!(
+            "thermite-checkout-remote-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Two bare remotes that will both carry the same branch name.
+        for name in ["origin.git", "other.git"] {
+            run_command("git", &["init", "--bare", name], &tmp, &[])
+                .await
+                .unwrap();
+        }
+
+        let work = tmp.join("work");
+        run_command("git", &["init", work.to_str().unwrap()], &tmp, &[])
+            .await
+            .unwrap();
+        run_command("git", &["config", "user.email", "t@t"], &work, &[])
+            .await
+            .unwrap();
+        run_command("git", &["config", "user.name", "t"], &work, &[])
+            .await
+            .unwrap();
+        // Repo-local override of a global `commit.gpgsign=true` (e.g. 1Password
+        // SSH signing) so test commits never require the signing agent to be
+        // unlocked.
+        run_command("git", &["config", "commit.gpgsign", "false"], &work, &[])
+            .await
+            .unwrap();
+        run_command(
+            "git",
+            &["commit", "-m", "init", "--allow-empty"],
+            &work,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Publish `noble-1.85` to both remotes, then drop the local branch so
+        // only remote-tracking refs remain — the DWIM-ambiguous state.
+        run_command("git", &["branch", "noble-1.85"], &work, &[])
+            .await
+            .unwrap();
+        run_command(
+            "git",
+            &[
+                "remote",
+                "add",
+                "origin",
+                tmp.join("origin.git").to_str().unwrap(),
+            ],
+            &work,
+            &[],
+        )
+        .await
+        .unwrap();
+        run_command(
+            "git",
+            &[
+                "remote",
+                "add",
+                "other",
+                tmp.join("other.git").to_str().unwrap(),
+            ],
+            &work,
+            &[],
+        )
+        .await
+        .unwrap();
+        run_command("git", &["push", "origin", "noble-1.85"], &work, &[])
+            .await
+            .unwrap();
+        run_command("git", &["push", "other", "noble-1.85"], &work, &[])
+            .await
+            .unwrap();
+        run_command("git", &["branch", "-D", "noble-1.85"], &work, &[])
+            .await
+            .unwrap();
+        run_command("git", &["fetch", "--all"], &work, &[])
+            .await
+            .unwrap();
+
+        // Sanity check of the premise: a bare checkout must be ambiguous.
+        assert!(
+            run_command("git", &["checkout", "noble-1.85"], &work, &[])
+                .await
+                .is_err(),
+            "bare 'git checkout noble-1.85' should fail with two matching remotes"
+        );
+
+        // The qualified checkout must succeed and leave HEAD on the branch.
+        checkout_remote_branch(&work, "origin", "noble-1.85")
+            .await
+            .unwrap();
+        assert!(
+            branch_exists(&work, "noble-1.85").await.unwrap(),
+            "noble-1.85 should exist locally after the qualified checkout"
+        );
+        let head = run_command("git", &["branch", "--show-current"], &work, &[])
+            .await
+            .unwrap();
+        assert_eq!(head.stdout.trim(), "noble-1.85");
+
+        // Rerunning must reset the branch to the remote tip, not fail with
+        // "branch already exists".
+        checkout_remote_branch(&work, "origin", "noble-1.85")
+            .await
+            .unwrap();
 
         let _ = fs::remove_dir_all(&tmp);
     }

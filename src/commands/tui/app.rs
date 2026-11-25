@@ -756,16 +756,22 @@ impl App {
     fn submit_input(&mut self, spec: InputSpec, value: String) -> AppAction {
         match spec {
             InputSpec::SbuildRelease => {
-                if let Err(e) = UbuntuRelease::parse(&value) {
-                    self.set_input_error(&e.to_string());
-                    return AppAction::None;
-                }
+                // Normalize so mixed-case input ("Noble") and aliases
+                // ("devel") do not leak into the sbuild command line or
+                // the default.
+                let release = match UbuntuRelease::parse(&value) {
+                    Ok(release) => release.to_string(),
+                    Err(e) => {
+                        self.set_input_error(&e.to_string());
+                        return AppAction::None;
+                    }
+                };
                 self.mode = Mode::Normal;
-                self.last_release = Some(value.clone());
-                self.push_log(&format!("running sbuild -Ad{value} ..."));
+                self.last_release = Some(release.clone());
+                self.push_log(&format!("running sbuild -Ad{release} ..."));
                 AppAction::Run {
-                    description: format!("sbuild ({value})"),
-                    command: ResolvedCommand::Build { release: value },
+                    description: format!("sbuild ({release})"),
+                    command: ResolvedCommand::Build { release },
                 }
             }
             InputSpec::SetVersion => {

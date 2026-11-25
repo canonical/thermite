@@ -169,7 +169,7 @@ Build a table of the form:
 | Jammy            | `rustc-1.83`                       | `rustc-1.86`      |
 | Noble            | `rustc-1.83`                       | `rustc-1.86`      |
 | Plucky           | `rustc-1.85`                       | `rustc-1.86`      |
-| Questing (devel) | `rustc-1.86`                       | (already present) |
+| Devel series     | `rustc-1.86`                       | (already present) |
 
 ### 1.3 Derive the Ordered Work Plan
 
@@ -179,7 +179,7 @@ Using the table from § 1.2, derive the complete ordered list of `(X.Y, source_r
 then each LTS release newest-to-oldest. Today the chain is:
 
 ```
-Stonking (devel) → Resolute (26.04 LTS) → Noble (24.04 LTS) → Jammy (22.04 LTS) → Focal (20.04 LTS)
+Tenacious (devel) → Resolute (26.04 LTS) → Noble (24.04 LTS) → Jammy (22.04 LTS) → Focal (20.04 LTS)
 ```
 
 Backports go **one release at a time** along this chain so that release-specific failures are
@@ -200,7 +200,7 @@ Questing) are not on the chain; thermite warns when a backport involves a non-LT
 
 | Step | X.Y    | source_release | release |
 | ---- | ------ | -------------- | ------- |
-| 1    | `1.86` | Stonking (devel) | Resolute |
+| 1    | `1.86` | Tenacious (devel) | Resolute |
 | 2    | `1.86` | Resolute       | Noble   |
 | 3    | `1.86` | Noble          | Jammy   |
 
@@ -282,7 +282,7 @@ Foundations remote and picks the correct branch automatically; the commands
 below show the stable-release case.
 
 `--source-release devel` is accepted as a shorthand for the current development
-release (resolved to its concrete adjective, e.g. `stonking`). The target
+release (resolved to its concrete adjective, e.g. `tenacious`). The target
 release (`--release`) must always be a concrete adjective — `devel` is not a
 valid backport target.
 
@@ -299,11 +299,11 @@ git checkout noble-1.85
 git checkout -b jammy-1.85
 ```
 
-**Example** — backporting `rustc-1.85` to Resolute from Stonking (devel source):
+**Example** — backporting `rustc-1.85` to Resolute from Tenacious (devel source):
 
 ```shell
-# No 'stonking-1.85' branch exists yet; use 'merge-1.85' instead.
-# `thermite backport -s devel -r resolute -u 1.85.0` resolves 'devel' to 'stonking'.
+# No 'tenacious-1.85' branch exists yet; use 'merge-1.85' instead.
+# `thermite backport -s devel -r resolute -u 1.85.0` resolves 'devel' to 'tenacious'.
 git checkout merge-1.85
 git checkout -b resolute-1.85
 ```
