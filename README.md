@@ -521,7 +521,7 @@ start of each phase.
 | 1 | Create a Launchpad bug report (optional for proactive backports) | Interactive |
 | 2 | Set up Git branch (`<release>-X.Y` from `<source_release>-X.Y`, or `merge-X.Y` when the source is the devel release) | Automated |
 | 3 | Compute and apply backport version string; update `debian/changelog` | Automated |
-| 4 | Compatibility checks — LLVM, libgit2, dh-cargo, pkgconf, cmake, debhelper-compat against the target release | Interactive |
+| 4 | Compatibility checks — LLVM, libgit2, dh-cargo, pkgconf, cmake, debhelper-compat against the target release; recognizes fixes already applied (vendored LLVM/libgit2, disabled dh-cargo, pkg-config fallback, cmake-mozilla alternative) | Interactive |
 | 5 | Provide orig tarball — reuse locally, download automatically from the staging PPA / Ubuntu archive, or regenerate with `uscan` | Interactive |
 | 6 | Provide orig-vendor tarball — reuse, download, or regenerate with `debian/rules vendor-tarball` | Interactive |
 | 7 | Disable autopkgtest self-build test in `debian/tests/control` | Automated |

@@ -172,13 +172,27 @@ staging PPA autopkgtests.
 ### Phase 4 — Compatibility Checks (Interactive)
 
 - `compat::run_all_checks(repo_dir, release)` — for each of LLVM, libgit2, dh-cargo,
-  pkgconf, cmake, and debhelper-compat, infer the version the source package needs and
-  check whether the target release's archive can satisfy it (via `rmadison -u ubuntu` and
-  `dpkg --compare-versions`).
-- Print a per-gate table (`OK` / `Needs change` / `Could not infer` / `Check failed`) and
-  guide the user through applying any required changes manually.
+  pkgconf, cmake, and debhelper-compat, determine how the source package satisfies the
+  requirement and report one outcome with its evidence:
+  - satisfied from the archive (required package/version published, via
+    `rmadison -u ubuntu` and `dpkg --compare-versions`);
+  - satisfied by the packaging — a common backporting fix already applied (vendored
+    LLVM via `src/llvm-project` + `Files-Excluded` + bootstrap config, vendored libgit2
+    via `vendor/libgit2-sys-*/libgit2` + removed Build-Depends + preserved
+    `vendored-libgit2` feature, disabled dh-cargo, pkg-config fallback with the
+    `PKG_CONFIG` export, a satisfying cmake-mozilla alternative);
+  - needs attention — a demonstrated problem, with the remaining edit named (including
+    half-applied fixes, e.g. dh-cargo removed from Build-Depends but still invoked in
+    `debian/rules`, or a vendored source still listed in `Files-Excluded`);
+  - could not infer automatically — evidence missing or contradictory; both sides are
+    reported so the maintainer can investigate.
+- Checks satisfied by the packaging skip the archive lookup; the summary counts each
+  check once (`N/M checks satisfied (A from the archive, B already handled by the
+  packaging); ...`).
 - The outcome (especially LLVM or libgit2 vendoring, which change `Files-Excluded` in
-  `debian/copyright`) determines the tarball decisions in Phases 5 and 6.
+  `debian/copyright`) determines the tarball decisions in Phases 5 and 6; when attention
+  is needed for a fix touching `Files-Excluded`, the report reminds that the orig
+  tarball must be regenerated.
 
 ### Phase 5 — Provide Orig Tarball (Interactive)
 
