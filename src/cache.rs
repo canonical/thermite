@@ -1,8 +1,11 @@
 //! Persistent on-disk caches for external-query results.
 //!
-//! Currently caches `rmadison -u ubuntu <query>` stdout under
-//! `$XDG_CACHE_HOME/canonical/thermite/rmadison/` (defaulting to
-//! `~/.cache/canonical/thermite/rmadison/`), one file per query. Cached
+//! Persistent on-disk caches for external-query results.
+//!
+//! Currently caches Launchpad archive query results (publication
+//! pocket/version pairs as JSON) under
+//! `$XDG_CACHE_HOME/canonical/thermite/launchpad/` (defaulting to
+//! `~/.cache/canonical/thermite/launchpad/`), one file per query. Cached
 //! entries make repeated runs fast: a package that was once absent from a
 //! release's archive (e.g. a new LLVM in an older LTS) will never appear
 //! there, so re-fetching the same "not published" answer adds latency without
@@ -19,9 +22,9 @@ use tracing::{debug, warn};
 
 use crate::types::params::CacheMode;
 
-/// Namespace directory below the thermite cache base holding rmadison
-/// results.
-pub const RMADISON_NAMESPACE: &str = "rmadison";
+/// Namespace directory below the thermite cache base holding Launchpad
+/// archive query results.
+pub const LAUNCHPAD_NAMESPACE: &str = "launchpad";
 
 /// Process-global cache mode, mirroring [`crate::shell`]'s verbosity
 /// precedent: set once at startup, read anywhere.
@@ -42,7 +45,7 @@ pub fn cache_mode() -> CacheMode {
 
 /// Activate the CLI `--cache` mode.
 ///
-/// [`CacheMode::Clear`] first wipes the rmadison cache directory, then the
+/// [`CacheMode::Clear`] first wipes the launchpad cache directory, then the
 /// effective mode for the rest of the run becomes [`CacheMode::On`]; every
 /// other mode is stored as-is.
 pub fn activate(mode: CacheMode) {
@@ -76,17 +79,17 @@ fn base_dir() -> Option<PathBuf> {
     }
 }
 
-/// A cached rmadison result.
+/// A cached Launchpad query result.
 #[derive(Debug, Clone)]
 pub struct CacheHit {
-    /// The cached stdout of the original `rmadison` invocation.
+    /// The cached data payload (JSON publication pairs).
     pub data: String,
     /// Age of the cache entry in seconds, when its mtime could be read.
     pub age_secs: Option<u64>,
 }
 
-/// Validate a cache key (an rmadison query such as `libgit2` or
-/// `rustc-1.85`). Keys must be non-empty, free of path separators and
+/// Validate a cache key (a `"<series>_<package>"` query such as
+/// `noble_libgit2`). Keys must be non-empty, free of path separators and
 /// traversal segments, and printable ASCII.
 fn valid_key(key: &str) -> bool {
     !key.is_empty()
@@ -96,15 +99,15 @@ fn valid_key(key: &str) -> bool {
         && key.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
-/// Look up `key` in the rmadison cache, honouring the process cache mode.
+/// Look up `key` in the launchpad cache, honouring the process cache mode.
 ///
 /// Returns `None` on [`CacheMode::Off`] and [`CacheMode::Update`] (which
 /// always refetch), on a cache miss, and on any read error.
-pub fn lookup_rmadison(key: &str) -> Option<CacheHit> {
+pub fn lookup(key: &str) -> Option<CacheHit> {
     lookup_with_mode(cache_mode(), &base_dir()?, key)
 }
 
-/// Like [`lookup_rmadison`] but against an explicit mode and cache base
+/// Like [`lookup`] but against an explicit mode and cache base
 /// directory. The testable core.
 fn lookup_with_mode(mode: CacheMode, base: &Path, key: &str) -> Option<CacheHit> {
     match mode {
@@ -112,7 +115,7 @@ fn lookup_with_mode(mode: CacheMode, base: &Path, key: &str) -> Option<CacheHit>
         CacheMode::On | CacheMode::Clear => {}
     }
     if !valid_key(key) {
-        debug!("rmadison cache: refusing to look up invalid key {key:?}");
+        debug!("launchpad cache: refusing to look up invalid key {key:?}");
         return None;
     }
     let path = entry_path(base, key);
@@ -121,7 +124,7 @@ fn lookup_with_mode(mode: CacheMode, base: &Path, key: &str) -> Option<CacheHit>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             debug!(
-                "rmadison cache: ignoring unreadable entry {}: {e}",
+                "launchpad cache: ignoring unreadable entry {}: {e}",
                 path.display()
             );
             return None;
@@ -132,23 +135,23 @@ fn lookup_with_mode(mode: CacheMode, base: &Path, key: &str) -> Option<CacheHit>
         .ok()
         .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
         .map(|d| d.as_secs());
-    debug!("rmadison cache: hit for {key} ({})", format_age(age_secs));
+    debug!("launchpad cache: hit for {key} ({})", format_age(age_secs));
     Some(CacheHit { data, age_secs })
 }
 
-/// Store `data` as the rmadison result for `key`, honouring the process cache
+/// Store `data` as the Launchpad query result for `key`, honouring the process cache
 /// mode.
 ///
 /// [`CacheMode::Off`] never writes. All other modes write, atomically
 /// (temp file + rename). Storage failures are logged and swallowed.
-pub fn store_rmadison(key: &str, data: &str) {
+pub fn store(key: &str, data: &str) {
     let Some(base) = base_dir() else {
         return;
     };
     store_with_mode(cache_mode(), &base, key, data);
 }
 
-/// Like [`store_rmadison`] but against an explicit mode and cache base
+/// Like [`store`] but against an explicit mode and cache base
 /// directory. The testable core.
 fn store_with_mode(mode: CacheMode, base: &Path, key: &str, data: &str) {
     match mode {
@@ -156,32 +159,32 @@ fn store_with_mode(mode: CacheMode, base: &Path, key: &str, data: &str) {
         CacheMode::On | CacheMode::Update | CacheMode::Clear => {}
     }
     if !valid_key(key) {
-        debug!("rmadison cache: refusing to store invalid key {key:?}");
+        debug!("launchpad cache: refusing to store invalid key {key:?}");
         return;
     }
     let path = entry_path(base, key);
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        warn!("rmadison cache: cannot create {}: {e}", parent.display());
+        warn!("launchpad cache: cannot create {}: {e}", parent.display());
         return;
     }
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     if let Err(e) = std::fs::write(&tmp, data) {
-        warn!("rmadison cache: cannot write {}: {e}", tmp.display());
+        warn!("launchpad cache: cannot write {}: {e}", tmp.display());
         return;
     }
     if let Err(e) = std::fs::rename(&tmp, &path) {
-        warn!("rmadison cache: cannot finalize {}: {e}", path.display());
+        warn!("launchpad cache: cannot finalize {}: {e}", path.display());
         let _ = std::fs::remove_file(&tmp);
         return;
     }
-    debug!("rmadison cache: stored {key}");
+    debug!("launchpad cache: stored {key}");
 }
 
-/// Delete the rmadison cache directory, honouring the process cache mode
+/// Delete the launchpad cache directory, honouring the process cache mode
 /// ([`CacheMode::Off`] leaves the cache untouched).
-pub fn clear_rmadison() {
+pub fn clear() {
     let Some(base) = base_dir() else {
         warn!("cannot clear cache: neither XDG_CACHE_HOME nor HOME is set");
         return;
@@ -189,7 +192,7 @@ pub fn clear_rmadison() {
     clear_with_mode(cache_mode(), &base);
 }
 
-/// Like [`clear_rmadison`] but against an explicit mode and cache base
+/// Like [`clear`] but against an explicit mode and cache base
 /// directory. The testable core.
 fn clear_with_mode(mode: CacheMode, base: &Path) {
     if mode == CacheMode::Off {
@@ -197,9 +200,9 @@ fn clear_with_mode(mode: CacheMode, base: &Path) {
     }
     let dir = namespace_dir(base);
     match std::fs::remove_dir_all(&dir) {
-        Ok(()) => println!("  Cleared rmadison cache: {}", dir.display()),
+        Ok(()) => println!("  Cleared launchpad cache: {}", dir.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!("rmadison cache: cannot clear {}: {e}", dir.display()),
+        Err(e) => warn!("launchpad cache: cannot clear {}: {e}", dir.display()),
     }
 }
 
@@ -208,9 +211,9 @@ fn entry_path(base: &Path, key: &str) -> PathBuf {
     namespace_dir(base).join(format!("{key}.txt"))
 }
 
-/// Path of the rmadison namespace directory under `base`.
+/// Path of the Launchpad namespace directory under `base`.
 fn namespace_dir(base: &Path) -> PathBuf {
-    base.join(RMADISON_NAMESPACE)
+    base.join(LAUNCHPAD_NAMESPACE)
 }
 
 /// Format a cache-entry age for the "using cached result" notice.

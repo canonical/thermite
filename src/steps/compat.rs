@@ -13,9 +13,9 @@
 
 use std::path::Path;
 
-use crate::cache;
 use crate::error::ThermiteError;
-use crate::shell::{run_command, which};
+use crate::shell::run_command;
+use crate::steps::launchpad;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -51,7 +51,7 @@ pub enum ArchiveStatus {
     TooOld { available: String, required: String },
     /// The package is not published in the archive at all.
     NotPublished,
-    /// The archive check itself failed (e.g. `rmadison` not installed,
+    /// The archive check itself failed (e.g. network error,
     /// network error).
     CheckFailed(String),
 }
@@ -320,94 +320,47 @@ fn is_word_boundary(b: u8) -> bool {
 // ── Archive check ─────────────────────────────────────────────────────────────
 
 /// Check whether `package` is published in the `release` suite of the Ubuntu
-/// archive using `rmadison -u ubuntu <package>`.
+/// archive via the Launchpad REST API (through the `lpcli` library).
 ///
-/// The raw rmadison output is cached per query under the user cache directory
-/// (see [`crate::cache`]); repeated backports against the same query reuse the
-/// stored result instead of re-querying the archive. A cache hit needs no
-/// local `rmadison` binary, so the availability check only guards the
-/// network-fetch path.
+/// Results (publication pocket/version pairs) are cached under the
+/// `<release>_<package>` key in the user cache directory (see
+/// [`crate::cache`]); repeated runs against the same query reuse the stored
+/// result instead of re-querying Launchpad.
 ///
-/// Returns the version string of the first matching entry, or `NotPublished`
-/// when no entry matches the release.
+/// Among the published pockets, the newest Debian version wins (compared with
+/// `dpkg --compare-versions`), so a publication in the `Updates` or
+/// `Security` pocket satisfies the check even when the `Release` pocket
+/// carries an older version. Returns [`ArchiveStatus::NotPublished`] when the
+/// package has no published entry in the release, and
+/// [`ArchiveStatus::CheckFailed`] when the Launchpad query itself fails
+/// (e.g. network error).
 pub async fn check_archive(package: &str, release: &str) -> ArchiveStatus {
-    if let Some(hit) = cache::lookup_rmadison(package) {
-        println!(
-            "  rmadison: using cached result for {package} ({})",
-            cache::format_age(hit.age_secs)
-        );
-        return match parse_rmadison_version(&hit.data, release) {
-            Some(v) => ArchiveStatus::Available(v),
-            None => ArchiveStatus::NotPublished,
-        };
-    }
-    if which("rmadison").is_err() {
-        return ArchiveStatus::CheckFailed(
-            "rmadison not installed (sudo apt install devscripts)".to_owned(),
-        );
-    }
-    let output =
-        match run_command("rmadison", &["-u", "ubuntu", package], Path::new("."), &[]).await {
-            Ok(o) => o,
-            Err(ThermiteError::CommandFailed { stdout, stderr, .. }) => {
-                // rmadison exits non-zero on network failure; surface a hint.
-                let detail = if !stderr.trim().is_empty() {
-                    stderr.trim().to_owned()
-                } else if !stdout.trim().is_empty() {
-                    stdout.trim().to_owned()
-                } else {
-                    "rmadison exited non-zero".to_owned()
-                };
-                return ArchiveStatus::CheckFailed(detail);
-            }
-            Err(e) => return ArchiveStatus::CheckFailed(e.to_string()),
-        };
-    cache::store_rmadison(package, &output.stdout);
-    match parse_rmadison_version(&output.stdout, release) {
-        Some(v) => ArchiveStatus::Available(v),
-        None => ArchiveStatus::NotPublished,
-    }
+    let publications = match launchpad::cached_publications(release, package).await {
+        Ok(pubs) => pubs,
+        Err(e) => return ArchiveStatus::CheckFailed(e.to_string()),
+    };
+    newest_version(&publications)
+        .await
+        .map_or(ArchiveStatus::NotPublished, ArchiveStatus::Available)
 }
 
-/// Parse `rmadison -u ubuntu <package>` output and return the version string
-/// of the first entry whose suite matches `release`.
-///
-/// rmadison output format (one source per line, pipe-separated):
-/// ```text
-///   rustc | 1.85.0+dfsg1~24.04-0ubuntu1~24.04.1 | noble-security | source
-///   rustc | 1.85.0+dfsg1~24.04-0ubuntu1~24.04.1 | noble-updates   | source
-///   rustc | 1.85.0+dfsg1-0ubuntu1               | noble           | source
-/// ```
-///
-/// The suite field is emitted as `<suite>` or `<suite>/<component>`
-/// (e.g. `noble` or `resolute/universe`), and may carry a pocket suffix
-/// (e.g. `noble-security`, `noble-updates`, `resolute-proposed/universe`).
-///
-/// We accept entries whose suite equals `release`, starts with
-/// `<release>-` (e.g. `jammy-security`, `jammy-updates`), or starts with
-/// `<release>/` (e.g. `resolute/universe`). Iteration preserves rmadison's
-/// output order, so the first matching line wins — callers that need the
-/// newest version across pockets should pre-sort the input.
-pub fn parse_rmadison_version(stdout: &str, release: &str) -> Option<String> {
-    let with_hyphen = format!("{release}-");
-    let with_slash = format!("{release}/");
-    for line in stdout.lines() {
-        // Skip blank lines, warnings, and headers.
-        if line.trim().is_empty() || !line.contains('|') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split('|').map(|p| p.trim()).collect();
-        if parts.len() < 4 {
-            continue;
-        }
-        // parts[0] = package, parts[1] = version, parts[2] = suite, parts[3+] = archs
-        let version = parts[1];
-        let suite = parts[2];
-        if suite == release || suite.starts_with(&with_hyphen) || suite.starts_with(&with_slash) {
-            return Some(version.to_owned());
-        }
+/// Return the newest Debian version among `publications` (empty when there is
+/// none), comparing candidates with `dpkg --compare-versions`.
+async fn newest_version(publications: &[launchpad::Publication]) -> Option<String> {
+    let mut best: Option<&str> = None;
+    for version in publications.iter().filter_map(|p| p.version.as_deref()) {
+        best = Some(match best {
+            None => version,
+            Some(current) => {
+                if dpkg_compare_versions(version, "gt", current).await {
+                    version
+                } else {
+                    current
+                }
+            }
+        });
     }
-    None
+    best.map(str::to_owned)
 }
 
 /// Compare two Debian version strings using `dpkg --compare-versions`.
@@ -759,89 +712,6 @@ mod tests {
 
     fn write(repo: &std::path::Path, name: &str, content: &str) {
         fs::write(repo.join(name), content).unwrap();
-    }
-
-    // ── parse_rmadison_version ─────────────────────────────────────────────
-
-    #[test]
-    fn parse_rmadison_version_picks_matching_suite() {
-        let out = "\
-rustc | 1.85.0+dfsg1~24.04-0ubuntu1~24.04.1 | noble-security | source
-rustc | 1.85.0+dfsg1~24.04-0ubuntu1~24.04.1 | noble-updates   | source
-rustc | 1.85.0+dfsg1-0ubuntu1               | noble           | source
-";
-        let v = parse_rmadison_version(out, "noble");
-        assert_eq!(v.as_deref(), Some("1.85.0+dfsg1~24.04-0ubuntu1~24.04.1"));
-    }
-
-    #[test]
-    fn parse_rmadison_version_returns_none_when_not_published() {
-        let out = "\
-rustc | 1.85.0+dfsg1-0ubuntu1 | oracular | source
-";
-        assert!(parse_rmadison_version(out, "jammy").is_none());
-    }
-
-    #[test]
-    fn parse_rmadison_version_skips_blank_and_warning_lines() {
-        let out = "\
-warning: some network hiccup
-\n\
-rustc | 1.85.0+dfsg1-0ubuntu1 | jammy | source
-";
-        let v = parse_rmadison_version(out, "jammy");
-        assert_eq!(v.as_deref(), Some("1.85.0+dfsg1-0ubuntu1"));
-    }
-
-    #[test]
-    fn parse_rmadison_version_handles_empty_output() {
-        assert!(parse_rmadison_version("", "jammy").is_none());
-    }
-
-    #[test]
-    fn parse_rmadison_version_handles_component_suffix() {
-        // rmadison emits the suite as `<suite>/<component>` rather than a bare
-        // suite name (e.g. `resolute/universe`, `stonking-proposed/universe`).
-        // Regression test for LLVM on Resolute, where the previous parser only
-        // matched `<release>` and `<release>-*` and so reported NotPublished.
-        let out = "\
-llvm-toolchain-22 | 1:22.1.2-1ubuntu1 | resolute/universe          | source
-llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe          | source
-llvm-toolchain-22 | 1:22.1.6-1ubuntu2 | stonking-proposed/universe | source
-";
-        let v = parse_rmadison_version(out, "resolute");
-        assert_eq!(v.as_deref(), Some("1:22.1.2-1ubuntu1"));
-    }
-
-    #[test]
-    fn parse_rmadison_version_component_suffix_for_pocket() {
-        // A pocket with a component (e.g. `resolute-proposed/universe`)
-        // should still match `release = "resolute"` via the `<release>-`
-        // rule, regardless of the trailing `/component`.
-        let out = "\
-llvm-toolchain-22 | 1:22.1.6-1ubuntu2 | resolute-proposed/universe | source
-llvm-toolchain-22 | 1:22.1.2-1ubuntu1 | resolute/universe          | source
-";
-        let v = parse_rmadison_version(out, "resolute");
-        assert_eq!(v.as_deref(), Some("1:22.1.6-1ubuntu2"));
-    }
-
-    #[test]
-    fn parse_rmadison_version_component_suffix_does_not_cross_release() {
-        // `stonking/universe` must not match `release = "resolute"`,
-        // nor vice versa, even though both carry `/universe`.
-        let out = "\
-llvm-toolchain-22 | 1:22.1.2-1ubuntu1 | resolute/universe | source
-llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe | source
-";
-        assert_eq!(
-            parse_rmadison_version(out, "resolute").as_deref(),
-            Some("1:22.1.2-1ubuntu1")
-        );
-        assert_eq!(
-            parse_rmadison_version(out, "stonking").as_deref(),
-            Some("1:22.1.6-1ubuntu1")
-        );
     }
 
     // ── infer_llvm_version ─────────────────────────────────────────────────

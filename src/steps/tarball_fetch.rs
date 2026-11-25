@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::cache;
 use crate::error::{Result, ThermiteError};
-use crate::shell::{run_command, run_interactive_command};
+use crate::shell;
+use crate::steps::launchpad;
 use crate::types::versions::{RustVersion, ShortRustVersion};
 
 /// File base for the rust-toolchain staging PPA on Launchpad, whose published
@@ -62,68 +62,30 @@ fn launchpad_files_url(base: &str, filename: &str) -> String {
 }
 
 /// Extract the deduplicated upstream version strings (e.g. `1.96.1+dfsg`)
-/// from `rmadison -u ubuntu rustc-<short>` output for every published source
-/// whose upstream base matches `rust_ver`.
+/// from Launchpad publications for every publication whose upstream base
+/// matches `rust_ver`.
 ///
-/// The upstream version is everything before the first `-`; only entries
-/// starting with `<rust_ver>+dfsg` are considered, so packaging-only
-/// versions without the dfsg suffix are skipped. Output order is preserved.
-pub fn parse_rmadison_upstream_versions(stdout: &str, rust_ver: &str) -> Vec<String> {
+/// The upstream version is everything before the first `-`; only versions
+/// starting with `<rust_ver>+dfsg` are considered, so packaging-only versions
+/// without the dfsg suffix are skipped. Series order is preserved.
+fn upstream_versions_from<'a>(
+    publications: impl IntoIterator<Item = &'a [launchpad::Publication]>,
+    rust_ver: &str,
+) -> Vec<String> {
     let prefix = format!("{rust_ver}+dfsg");
     let mut found: Vec<String> = Vec::new();
-    for line in stdout.lines() {
-        // Skip blank lines, warnings, and headers.
-        if line.trim().is_empty() || !line.contains('|') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split('|').map(str::trim).collect();
-        if parts.len() < 4 {
-            continue;
-        }
-        let version = parts[1];
-        let upstream = version.split('-').next().unwrap_or(version);
-        if upstream.starts_with(&prefix) && !found.contains(&upstream.to_owned()) {
-            found.push(upstream.to_owned());
+    for per_series in publications {
+        for publication in per_series {
+            let Some(version) = publication.version.as_deref() else {
+                continue;
+            };
+            let upstream = version.split('-').next().unwrap_or(version);
+            if upstream.starts_with(&prefix) && !found.contains(&upstream.to_owned()) {
+                found.push(upstream.to_owned());
+            }
         }
     }
     found
-}
-
-/// Download `url` to `dest` using `wget` (preferred) or `curl`, streaming
-/// progress to the terminal.
-///
-/// The caller is responsible for cleaning up partial files on failure.
-async fn download_to_file(url: &str, dest: &Path) -> Result<()> {
-    let dest_str = dest.to_string_lossy().to_string();
-    match run_interactive_command(
-        "wget",
-        &["--tries=3", "--connect-timeout=15", "-O", &dest_str, url],
-        Path::new("."),
-        &[],
-    )
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(ThermiteError::CommandNotFound(_)) => {
-            run_interactive_command(
-                "curl",
-                &[
-                    "-fL",
-                    "--retry",
-                    "2",
-                    "--connect-timeout",
-                    "15",
-                    "-o",
-                    &dest_str,
-                    url,
-                ],
-                Path::new("."),
-                &[],
-            )
-            .await
-        }
-        Err(e) => Err(e),
-    }
 }
 
 /// Attempt to fetch a source tarball automatically.
@@ -133,7 +95,7 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<()> {
 /// 1. the rust-toolchain staging PPA (the file already carries the
 ///    `~<series>` suffix of a previous backport upload), and
 /// 2. the primary Ubuntu archive, reusing the orig tarball published for the
-///    same upstream version (located via `rmadison`).
+///    same upstream version (publications resolved via the Launchpad API).
 ///
 /// `dfsg_suffix` is appended after `+dfsg` in the expected filename: `""` for
 /// plain update naming or `"~<series>"` for backport naming.
@@ -158,62 +120,64 @@ pub async fn fetch_tarball(
         launchpad_files_url(STAGING_PPA_FILES_BASE, &name),
         format!("staging PPA ({name})"),
     )];
-    let rmadison_query = format!("rustc-{rust_short}");
-    let rmadison_stdout = match cache::lookup_rmadison(&rmadison_query) {
-        Some(hit) => {
-            crate::shell::out_line(&format!(
-                "  rmadison: using cached result for {rmadison_query} ({})",
-                cache::format_age(hit.age_secs)
-            ));
-            hit.data
+    let source = format!("rustc-{rust_short}");
+    match primary_archive_upstreams(rust_ver, &source).await {
+        Ok(upstreams) => {
+            for upstream in upstreams {
+                let archive_name = format!("rustc-{rust_short}_{upstream}{}", kind.tail());
+                candidates.push((
+                    launchpad_files_url(PRIMARY_ARCHIVE_FILES_BASE, &archive_name),
+                    format!("Ubuntu archive ({archive_name})"),
+                ));
+            }
         }
-        None => match run_command(
-            "rmadison",
-            &["-u", "ubuntu", &rmadison_query],
-            Path::new("."),
-            &[],
-        )
-        .await
-        {
-            Ok(output) => {
-                cache::store_rmadison(&rmadison_query, &output.stdout);
-                output.stdout
-            }
-            Err(_) => {
-                crate::shell::out_line("  rmadison failed — skipping Ubuntu archive candidates");
-                String::new()
-            }
-        },
-    };
-    for upstream in parse_rmadison_upstream_versions(&rmadison_stdout, &rust_ver.to_string()) {
-        let archive_name = format!("rustc-{rust_short}_{upstream}{}", kind.tail());
-        candidates.push((
-            launchpad_files_url(PRIMARY_ARCHIVE_FILES_BASE, &archive_name),
-            format!("Ubuntu archive ({archive_name})"),
-        ));
+        Err(e) => {
+            shell::out_line(
+                "  Launchpad series lookup failed — skipping Ubuntu archive candidates",
+            );
+            tracing::debug!("Launchpad archive enumeration failed: {e}");
+        }
     }
 
     for (url, label) in &candidates {
-        crate::shell::out_line(&format!("  Trying {label} …"));
-        match download_to_file(url, &dest).await {
+        shell::out_line(&format!("  Trying {label} …"));
+        match launchpad::download_public_file(url, &dest).await {
+            Ok(()) if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 0) => {
+                return Ok(Some(dest));
+            }
             Ok(()) => {
-                if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 0) {
-                    return Ok(Some(dest));
-                }
                 let _ = std::fs::remove_file(&dest);
             }
-            Err(ThermiteError::CommandNotFound(_)) => {
-                crate::shell::out_line(
-                    "  Neither wget nor curl found — cannot download automatically.",
-                );
-                break;
-            }
-            Err(_) => {
+            Err(ThermiteError::Cancelled) => return Err(ThermiteError::Cancelled),
+            Err(e) => {
                 let _ = std::fs::remove_file(&dest);
+                tracing::debug!("candidate {label} failed: {e}");
             }
         }
     }
     Ok(None)
+}
+
+/// Upstream versions (e.g. `1.96.1+dfsg`) published for `source` in the
+/// primary archive of any Ubuntu series thermite cares about: the Launchpad
+/// active series (ESM releases like focal are absent there) unioned with the
+/// backport chain.
+async fn primary_archive_upstreams(rust_ver: &RustVersion, source: &str) -> Result<Vec<String>> {
+    let mut series_list = launchpad::cached_active_series().await?;
+    for info in crate::types::ubuntu::UbuntuRelease::backport_chain() {
+        let series = info.code_name_short;
+        if !series_list.iter().any(|s| s == series) {
+            series_list.push(series.to_owned());
+        }
+    }
+    let mut publications = Vec::new();
+    for series in &series_list {
+        publications.push(launchpad::cached_publications(series, source).await?);
+    }
+    Ok(upstream_versions_from(
+        publications.iter().map(Vec::as_slice),
+        &rust_ver.to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -264,47 +228,62 @@ mod tests {
         );
     }
 
+    fn publication(version: Option<&str>) -> launchpad::Publication {
+        launchpad::Publication {
+            pocket: None,
+            version: version.map(str::to_owned),
+            self_link: None,
+        }
+    }
+
     #[test]
-    fn parse_rmadison_finds_matching_upstream() {
-        let stdout = " rustc-1.96 | 1.96.1+dfsg-0ubuntu1 | stonking/universe | source, amd64\n\
-                      rustc-1.96 | 1.96.1+dfsg-0ubuntu1 | stonking | source\n";
+    fn upstream_versions_finds_matching_upstream() {
+        let publications = [vec![
+            publication(Some("1.96.1+dfsg-0ubuntu1")),
+            publication(Some("1.96.1+dfsg-0ubuntu1")),
+        ]];
         assert_eq!(
-            parse_rmadison_upstream_versions(stdout, "1.96.1"),
+            upstream_versions_from(publications.iter().map(Vec::as_slice), "1.96.1"),
             vec!["1.96.1+dfsg".to_owned()]
         );
     }
 
     #[test]
-    fn parse_rmadison_handles_series_suffixed_versions() {
-        let stdout = " rustc-1.85 | 1.85.1+dfsg0ubuntu2~bpo0-0ubuntu0.24.04.2 | noble-updates/universe | source\n\
-                      rustc-1.85 | 1.85.1+dfsg0ubuntu2~bpo0-0ubuntu0.24.04.2 | noble-security/universe | source\n\
-                      rustc-1.85 | 1.85.0+dfsg1~24.04-0ubuntu1~24.04.1 | noble | source\n";
+    fn upstream_versions_handles_series_suffixed_versions() {
+        let publications = [
+            vec![publication(Some(
+                "1.85.1+dfsg0ubuntu2~bpo0-0ubuntu0.24.04.2",
+            ))],
+            vec![publication(Some("1.85.0+dfsg1~24.04-0ubuntu1~24.04.1"))],
+        ];
         assert_eq!(
-            parse_rmadison_upstream_versions(stdout, "1.85.1"),
+            upstream_versions_from(publications.iter().map(Vec::as_slice), "1.85.1"),
             vec!["1.85.1+dfsg0ubuntu2~bpo0".to_owned()]
         );
         assert_eq!(
-            parse_rmadison_upstream_versions(stdout, "1.85.0"),
+            upstream_versions_from(publications.iter().map(Vec::as_slice), "1.85.0"),
             vec!["1.85.0+dfsg1~24.04".to_owned()]
         );
     }
 
     #[test]
-    fn parse_rmadison_skips_non_matching_and_malformed_lines() {
-        let stdout = "Get:1 https://api.launchpad.net\n\
-                      \n\
-                      rustc-1.96 | 1.96.1-0ubuntu1 | stonking/universe | source\n\
-                      rustc-1.96 | 1.96.0+dfsg-0ubuntu1 | other | source\n\
-                      rustc-1.96 | 1.96.0+dfsg1-0ubuntu1\n";
+    fn upstream_versions_skips_non_matching_and_malformed_versions() {
+        let publications = [
+            vec![publication(Some("1.96.1-0ubuntu1"))],
+            vec![publication(Some("1.96.0+dfsg-0ubuntu1"))],
+            vec![publication(None)],
+        ];
         assert_eq!(
-            parse_rmadison_upstream_versions(stdout, "1.96.0"),
+            upstream_versions_from(publications.iter().map(Vec::as_slice), "1.96.0"),
             vec!["1.96.0+dfsg".to_owned()]
         );
     }
 
     #[test]
-    fn parse_rmadison_returns_empty_for_no_matches() {
-        assert!(parse_rmadison_upstream_versions("", "1.96.0").is_empty());
-        assert!(parse_rmadison_upstream_versions("garbage line", "1.96.0").is_empty());
+    fn upstream_versions_returns_empty_for_no_matches() {
+        let publications: Vec<Vec<launchpad::Publication>> = vec![Vec::new()];
+        assert!(
+            upstream_versions_from(publications.iter().map(Vec::as_slice), "1.96.0").is_empty()
+        );
     }
 }

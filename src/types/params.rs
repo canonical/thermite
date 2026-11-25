@@ -457,8 +457,8 @@ mod tarball_params_tests {
     }
 }
 
-/// How thermite uses its persistent on-disk caches (currently the `rmadison`
-/// result cache under `~/.cache/canonical/thermite/`).
+/// How thermite uses its persistent on-disk caches (currently the Launchpad
+/// archive result cache under `~/.cache/canonical/thermite/`).
 ///
 /// The variants double as the accepted values of the global `--cache` flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]

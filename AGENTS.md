@@ -53,6 +53,18 @@ thermite makes heavy use of the `debian-packaging` skill.  This skill provides f
 
 thermite also uses the `lpcli` skill to create bug reports and manage interactions with Launchpad.  This skill is used in both the 'update' and 'backport' workflows to create bug reports for the work being done, and to manage interactions with Launchpad throughout the packaging process.
 
+## Launchpad access
+Archive queries (compatibility checks in `src/steps/compat.rs`, tarball candidate
+enumeration in `src/steps/tarball_fetch.rs`) go through the `lpcli` library crate
+(git dependency pinned in `Cargo.toml`), wrapped by `src/steps/launchpad.rs`.
+All reads are anonymous (`LaunchpadClient::new(None)`), so no `lpcli login` is
+needed. Results are cached on disk under `~/.cache/canonical/thermite/launchpad/`
+keyed `<series>_<package>` (see `src/cache.rs`). `launchpad.rs` also honours the
+TUI cancellation token: API calls run inside `tokio::select!` against
+`shell::cancellation_receiver`. The `lpcli` CLI binary is still used interactively
+by agents (the `lpcli` skill) for bug reports; `dput`, `ppa`, and `uscan` remain
+subprocess steps.
+
 ## Coding Standards
 - Follow idiomatic Rust practices and community standards as defined in `rust-instructions.md`.
 

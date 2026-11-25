@@ -26,8 +26,8 @@ struct Cli {
     #[arg(short = 'v', long, action = ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// How to use the persistent rmadison result cache
-    /// (~/.cache/canonical/thermite/rmadison/).
+    /// How to use the persistent Launchpad archive result cache
+    /// (~/.cache/canonical/thermite/launchpad/).
     #[arg(
         long,
         global = true,

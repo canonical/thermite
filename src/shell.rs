@@ -105,7 +105,7 @@ pub fn reset_cancellation() {
 }
 
 /// A `watch::Receiver<bool>` for the global token, or `None` outside TUI mode.
-fn cancellation_receiver() -> Option<watch::Receiver<bool>> {
+pub(crate) fn cancellation_receiver() -> Option<watch::Receiver<bool>> {
     CANCEL
         .lock()
         .expect("CANCEL mutex poisoned")
@@ -162,7 +162,7 @@ pub struct CommandOutput {
 ///
 /// A dropped sender (TUI teardown while a command is still running) is
 /// treated as "no cancellation" — the command then just runs to completion.
-async fn wait_for_cancel(rx: &mut watch::Receiver<bool>) -> bool {
+pub(crate) async fn wait_for_cancel(rx: &mut watch::Receiver<bool>) -> bool {
     let _ = rx.changed().await;
     *rx.borrow()
 }
