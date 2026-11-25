@@ -6,6 +6,7 @@ pub mod control;
 pub mod copyright;
 pub mod gbp;
 pub mod git;
+pub mod launchpad;
 pub mod lintian;
 pub mod overlay;
 pub mod patches;

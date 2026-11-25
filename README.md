@@ -102,8 +102,8 @@ Options:
                    Pass twice (-vv) to also show a concise explanation with
                    documentation links at the start of every phase.
       --cache <on|off|update|clear>
-                   How to use the persistent rmadison result cache
-                   (~/.cache/canonical/thermite/rmadison/). See "rmadison
+                   How to use the persistent Launchpad archive result cache
+                   (~/.cache/canonical/thermite/launchpad/). See "archive
                    result cache" below. [default: on]
   -h, --help       Print help
   -V, --version    Print version
@@ -313,7 +313,7 @@ thermite version bump ubuntu-revision
 
 Standalone management of the two source tarballs outside the full update/backport
 workflows. Each tarball can either be **downloaded** (staging PPA first, then the
-Ubuntu primary archive via `rmadison`, with a manual-placement fallback) or
+Ubuntu primary archive via the Launchpad API, with a manual-placement fallback) or
 **generated** (`uscan` for the orig tarball; `rustup` + `cargo-vendor-filterer` +
 `debian/rules vendor-tarball` for the vendor tarball). An already-obtained
 tarball can also be **overlaid** into the repo directory.
@@ -569,7 +569,7 @@ src/
     params.rs           UpdateParams and BackportParams — validated CLI parameters
     ubuntu.rs           UbuntuRelease — validated Ubuntu release names and series numbers
     versions.rs         RustVersion — X.Y.Z and X.Y version newtypes
-  cache.rs              Persistent on-disk caches (rmadison results)
+  cache.rs              Persistent on-disk caches (Launchpad archive results)
   error.rs              Unified ThermiteError type (thiserror)
   shell.rs              Async external command runner with streaming output
   ui.rs                 Terminal output helpers (phase headers, prompts, countdown)
@@ -578,25 +578,27 @@ src/
 
 ---
 
-## rmadison result cache
+## Launchpad archive result cache
 
 `thermite backport` and `thermite tarball download` query the Ubuntu archive
-with `rmadison` — once per compatibility-check dependency (LLVM, libgit2,
-dh-cargo, pkgconf, cmake, debhelper) and once per tarball download. These
+through the Launchpad REST API (via the [`lpcli`](https://github.com/canonical/lpcli)
+library) — once per compatibility-check dependency (LLVM, libgit2, dh-cargo,
+pkgconf, cmake, debhelper) and once per series during tarball download. These
 answers change rarely: a package that was once absent from a release's archive
 (e.g. a new LLVM in an older LTS) will essentially never appear there, and a
 cached version string stays valid until that package's next archive update.
 Re-querying on every run adds network latency without adding information, so
-thermite caches the raw `rmadison -u ubuntu <query>` output.
+thermite caches the publication pocket/version pairs.
 
-- **Location** — `$XDG_CACHE_HOME/canonical/thermite/rmadison/` (defaulting to
-  `~/.cache/canonical/thermite/rmadison/`), one plain-text file per query.
-- **Scope** — keyed by query only, so one cached `libgit2` result serves every
-  target release.
+- **Location** — `$XDG_CACHE_HOME/canonical/thermite/launchpad/` (defaulting to
+  `~/.cache/canonical/thermite/launchpad/`), one JSON file per query.
+- **Scope** — keyed by `<series>_<package>`, so each target release has its
+  own cached answer.
 - **Hits** — when a cached result is used, thermite prints its age (from the
-  file's modification time), e.g. `rmadison: using cached result for libgit2 (3d old)`.
-- **Misses** — only successful queries are cached; failures (network errors,
-  missing `rmadison`) are never stored.
+  file's modification time), e.g. `Launchpad: using cached result for libgit2
+  in noble (3d old)`.
+- **Misses** — only successful queries are cached; failures (network errors)
+  are never stored.
 - **Correctness** — the cache is best-effort. Unreadable, corrupt, or missing
   entries simply trigger a fresh query; cache errors never fail a workflow.
 
@@ -607,10 +609,10 @@ The `--cache` flag controls this behaviour (works on every subcommand):
 | `on` (default) | Use cached results when present; fetch, store, and return on a miss |
 | `off` | Ignore the cache entirely — always fetch, never read or write entries |
 | `update` | Always fetch fresh results and overwrite cached entries |
-| `clear` | Wipe the cached rmadison results, then behave like `on` |
+| `clear` | Wipe the cached Launchpad results, then behave like `on` |
 
 ```sh
-# Repeat a backport reusing earlier rmadison answers (default):
+# Repeat a backport reusing earlier Launchpad answers (default):
 thermite backport --rust-version 1.85.0 --source-release noble --release jammy --lpuser jdoe
 
 # Archive contents changed since the cache was populated (e.g. a package just
@@ -622,7 +624,7 @@ thermite --cache update backport \
 thermite --cache off backport \
   --rust-version 1.85.0 --source-release noble --release jammy --lpuser jdoe
 
-# One-off invalidation of every cached rmadison result:
+# One-off invalidation of every cached Launchpad result:
 thermite --cache clear backport \
   --rust-version 1.85.0 --source-release noble --release jammy --lpuser jdoe
 ```

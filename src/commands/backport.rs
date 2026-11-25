@@ -91,7 +91,7 @@ const PHASE_DOCS: &[PhaseDoc] = &[
             (1) LLVM version, (2) libgit2 version, (3) dh-cargo availability, \
             (4) pkgconf availability, (5) cmake version, (6) debhelper-compat level. \
             Each check infers the required version from the source packaging, queries \
-            the archive via rmadison, and reports whether action is needed. Fixes are \
+            the archive via the Launchpad API, and reports whether action is needed. Fixes are \
             applied before the orig tarball is generated so that vendored sources \
             (e.g. LLVM, libgit2) are included in a single uscan run.",
         anchor: "#common-backporting-changes",

@@ -59,6 +59,10 @@ pub enum ThermiteError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A Launchpad REST API request failed (via the `lpcli` library).
+    #[error("Launchpad error: {0}")]
+    Launchpad(#[from] lpcli::error::LpError),
+
     /// A command was cancelled by the user (e.g. `q`/Ctrl+C in the TUI).
     ///
     /// The child process was killed and the enclosing workflow should stop;

@@ -97,7 +97,7 @@ async fn download_orig(params: &TarballParams, parent_dir: &Path) -> Result<Path
         &[
             "Fetching the orig tarball automatically from, in order:",
             "  1. the rust-toolchain staging PPA (previous backport uploads), and",
-            "  2. the primary Ubuntu archive (candidates resolved via rmadison).",
+            "  2. the primary Ubuntu archive (candidates resolved via the Launchpad API).",
             "",
             "If neither source has it, you will be asked to place the file manually at:",
             &format!("  {}", expected.display()),
@@ -167,7 +167,7 @@ async fn download_vendor(params: &TarballParams, parent_dir: &Path) -> Result<Pa
         &[
             "Fetching the vendor tarball automatically from, in order:",
             "  1. the rust-toolchain staging PPA (previous backport uploads), and",
-            "  2. the primary Ubuntu archive (candidates resolved via rmadison).",
+            "  2. the primary Ubuntu archive (candidates resolved via the Launchpad API).",
             "",
             "If neither source has it, you will be asked to place the file manually at:",
             &format!("  {}", expected.display()),

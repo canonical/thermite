@@ -15,6 +15,9 @@ dialoguer = "0.12"
 # Process-group kill for cancellation (see shell::run_command_with_cancel);
 # already in the dependency tree via tokio.
 libc = "0.2"
+# Launchpad REST API access (anonymous reads: archive queries, file URLs).
+# Pinned to a tested upstream revision; GPL-3.0-or-later, like lpcli itself.
+lpcli = { git = "https://github.com/canonical/lpcli", rev = "c62844b647c8a0f5f0845206a11727773ee77cd5" }
 ratatui = { version = "0.30", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"

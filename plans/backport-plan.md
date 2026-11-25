@@ -173,7 +173,7 @@ staging PPA autopkgtests.
 
 - `compat::run_all_checks(repo_dir, release)` — for each of LLVM, libgit2, dh-cargo,
   pkgconf, cmake, and debhelper-compat, infer the version the source package needs and
-  check whether the target release's archive can satisfy it (via `rmadison -u ubuntu` and
+  check whether the target release's archive can satisfy it (via the Launchpad API (`lpcli` library) and
   `dpkg --compare-versions`).
 - Print a per-gate table (`OK` / `Needs change` / `Could not infer` / `Check failed`) and
   guide the user through applying any required changes manually.
@@ -190,7 +190,7 @@ Decision gate offering Reuse / Download / Regenerate / Abort:
   1. the rust-toolchain staging PPA on Launchpad, whose published source files already
      carry the `~<series>` suffix of a previous backport upload;
   2. the primary Ubuntu archive, reusing the orig tarball published for the same upstream
-     version (candidate filenames resolved via `rmadison -u ubuntu rustc-<X.Y>`).
+     version (candidate filenames resolved via Launchpad publication queries for `rustc-<X.Y>`).
   Both are served by Launchpad `+files` URLs and downloaded with `wget` (or `curl`).
   When no candidate has the file, fall back to a manual-placement prompt.
 - **Regenerate** — required when `Files-Excluded` changed in Phase 4:
@@ -319,7 +319,7 @@ All new pure functions are unit-tested:
 - `disable_self_build_test()` — two cases: block present (removed), block absent (no-op).
 - `tarball_fetch::expected_backport_tarball_name()` — both tarball kinds.
 - `tarball_fetch::launchpad_files_url()` — `+` percent-encoding, `~` preserved.
-- `tarball_fetch::parse_rmadison_upstream_versions()` — matching, series-suffixed,
-  non-matching, and malformed rmadison lines.
+- `tarball_fetch::upstream_versions_from()` — matching, series-suffixed,
+  and malformed publication versions.
 - `BackportParams::new()` — invalid lpuser, invalid bug number, same source/target release.
 - `find_changes_file()` in `backport.rs` — newest-file selection.

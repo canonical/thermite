@@ -430,7 +430,7 @@ in order:
    ```
 
 2. The primary Ubuntu archive, reusing the `.orig.tar.xz` published for the same upstream
-   version (candidate filenames are resolved with `rmadison -u ubuntu rustc-<X.Y>`):
+   version (candidate filenames are resolved via Launchpad publication queries for `rustc-<X.Y>`):
 
    ```
    https://launchpad.net/ubuntu/+archive/primary/+files/<filename>
