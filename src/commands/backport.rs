@@ -812,59 +812,47 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     );
     let check_results = compat::run_all_checks(repo_dir, release).await;
 
-    // Track how many checks need attention so the summary line is accurate.
-    let mut ok_count = 0usize;
+    // Track how each check concluded so the summary line is accurate.
+    let mut satisfied_archive = 0usize;
+    let mut satisfied_packaging = 0usize;
     let mut attention_count = 0usize;
-    let mut infer_failed_count = 0usize;
+    let mut unknown_count = 0usize;
     let mut archive_check_failed_count = 0usize;
 
     for result in &check_results {
         println!("\n  {}", result.name);
-        match &result.inference {
-            compat::Inference::Inferred { value, source } => {
-                if value.is_empty() {
-                    println!("    Inferred: (no version constraint) ({source})");
-                } else {
-                    println!("    Inferred: {value} ({source})");
-                }
+        let outcome = &result.outcome;
+        match outcome.kind {
+            compat::OutcomeKind::SatisfiedFromArchive => {
+                println!("    Archive: \u{2714} {}", outcome.summary);
+                satisfied_archive += 1;
             }
-            compat::Inference::CouldNotInfer(reason) => {
-                println!("    Could not infer automatically.");
-                println!("    Reason: {reason}");
-                infer_failed_count += 1;
+            compat::OutcomeKind::SatisfiedByPackaging => {
+                println!("    \u{2714} {}", outcome.summary);
+                satisfied_packaging += 1;
             }
-        }
-
-        match &result.archive_status {
-            compat::ArchiveStatus::Available(version) => {
-                println!("    Archive: \u{2714} available ({version})");
-                if result.inference.is_inferred() {
-                    ok_count += 1;
-                }
-            }
-            compat::ArchiveStatus::TooOld {
-                available,
-                required,
-            } => {
-                println!(
-                    "    Archive: \u{2717} too old — available {available}, required {required}"
-                );
+            compat::OutcomeKind::NeedsAttention => {
+                println!("    \u{2717} {}", outcome.summary);
                 attention_count += 1;
             }
-            compat::ArchiveStatus::NotPublished => {
-                println!("    Archive: \u{2717} not published in {release}");
-                attention_count += 1;
+            compat::OutcomeKind::Unknown => {
+                println!("    Could not infer automatically — {}", outcome.summary);
+                unknown_count += 1;
             }
-            compat::ArchiveStatus::CheckFailed(detail) => {
-                println!("    Archive: could not check ({detail})");
+            compat::OutcomeKind::ArchiveCheckFailed => {
+                println!("    Archive: could not check ({})", outcome.summary);
                 archive_check_failed_count += 1;
             }
         }
+        for line in &outcome.evidence {
+            println!("      - {line}");
+        }
 
-        if !result.is_ok() {
-            if !result.guidance.is_empty() {
-                println!("    Action needed: {}", result.guidance);
-            }
+        if result.outcome.kind == compat::OutcomeKind::NeedsAttention && !result.guidance.is_empty()
+        {
+            println!("    Action needed: {}", result.guidance);
+        }
+        if !result.is_ok() && !result.url.is_empty() {
             println!("    Reference: {}", result.url);
         }
     }
@@ -872,48 +860,56 @@ pub async fn run(params: &BackportParams, repo_dir: &Path) -> Result<()> {
     // Print a summary line.
     println!();
     let total = check_results.len();
-    if attention_count == 0 && infer_failed_count == 0 && archive_check_failed_count == 0 {
-        println!("  Summary: {ok_count}/{total} checks passed — no action needed.");
+    let satisfied = satisfied_archive + satisfied_packaging;
+    let split = if satisfied_packaging > 0 {
+        format!(
+            " ({satisfied_archive} from the archive, {satisfied_packaging} already handled by the packaging)"
+        )
     } else {
-        let parts: Vec<String> = [
-            if attention_count > 0 {
-                format!("{attention_count} need attention")
-            } else {
-                String::new()
-            },
-            if infer_failed_count > 0 {
-                format!("{infer_failed_count} could not infer")
-            } else {
-                String::new()
-            },
-            if archive_check_failed_count > 0 {
-                format!("{archive_check_failed_count} archive check failed")
-            } else {
-                String::new()
-            },
-        ]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
+        String::new()
+    };
+    let mut issues: Vec<String> = Vec::new();
+    if attention_count > 0 {
+        issues.push(format!("{attention_count} need attention"));
+    }
+    if unknown_count > 0 {
+        issues.push(format!("{unknown_count} could not infer"));
+    }
+    if archive_check_failed_count > 0 {
+        issues.push(format!(
+            "{archive_check_failed_count} archive checks failed"
+        ));
+    }
+
+    if issues.is_empty() {
+        println!("  Summary: {satisfied}/{total} checks satisfied{split} — no action needed.");
+    } else {
         println!(
-            "  Summary: {ok_count}/{total} checks passed, {}.",
-            parts.join(", ")
+            "  Summary: {satisfied}/{total} checks satisfied{split}; {}.",
+            issues.join(", ")
         );
 
-        print_info_box(
-            "Guidance for checks needing attention",
-            &[
-                "Apply all needed changes to debian/control, debian/control.in,",
-                "debian/copyright, debian/rules, and debian/config.toml.in as",
-                "described above. Commit them together before continuing.",
+        let needs_tarball_regen = check_results.iter().any(|r| r.needs_tarball_regen);
+        let mut box_lines: Vec<&str> = vec![
+            "Apply all needed changes to debian/control, debian/control.in,",
+            "debian/copyright, debian/rules, and the bootstrap config template",
+            "(debian/config.toml.in or debian/bootstrap.toml.in) as described",
+            "above. Commit them together before continuing.",
+            "",
+        ];
+        if needs_tarball_regen {
+            box_lines.extend([
+                "If vendoring LLVM or libgit2 is still needed, the orig tarball",
+                "(Phase 5) must be regenerated after editing Files-Excluded in",
+                "debian/copyright.",
                 "",
-                "If LLVM or libgit2 vendoring is needed, the orig tarball (Phase 5)",
-                "must be regenerated after editing Files-Excluded in debian/copyright.",
-                "",
-                "Full documentation:",
-                "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
-            ],
-        );
+            ]);
+        }
+        box_lines.extend([
+            "Full documentation:",
+            "  https://documentation.ubuntu.com/project/maintainers/niche-package-maintenance/rustc/backport-rust/",
+        ]);
+        print_info_box("Guidance for checks needing attention", &box_lines);
     }
 
     if prompt_select(

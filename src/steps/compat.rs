@@ -1,11 +1,19 @@
 //! Compatibility checks for backporting.
 //!
-//! Each check follows the same 5-step pattern:
-//!   1. Infer the required version/dependency from the source packaging.
-//!   2. Check whether the required version exists in the target release's archive.
-//!   3. If it exists, report a confirmation.
-//!   4. If it does not exist (or is too old), report the applicable fix.
-//!   5. If inference failed, explicitly state this and provide a manual check URL.
+//! Each check answers one question: how does this package satisfy the
+//! requirement on the target release, and what evidence supports that?
+//!
+//! - Satisfied from the archive: the required package/version is published
+//!   (checked with `rmadison` and `dpkg --compare-versions`).
+//! - Satisfied by the packaging: a common backporting fix is already applied
+//!   — vendored LLVM or libgit2, disabled dh-cargo, the pkg-config fallback,
+//!   a cmake-mozilla alternative.
+//! - Needs attention: a demonstrated problem (dependency too old, a fix only
+//!   half applied); the remaining edit is named.
+//! - Could not infer automatically: the evidence needed to distinguish the
+//!   archive path from an already-applied fix is missing or contradictory;
+//!   both sides are reported.
+//! - Archive check failed: a lookup was needed and attempted but failed.
 //!
 //! Only the known common fixes (LLVM, libgit2, dh-cargo, pkgconf, cmake,
 //! debhelper-compat) are detected — no attempt is made to diagnose arbitrary
@@ -19,41 +27,31 @@ use crate::shell::{run_command, which};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// The outcome of inferring a required version or dependency from the source
-/// packaging.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Inference {
-    /// A value was successfully inferred.
-    ///
-    /// `value` is the human-readable form (e.g. `"19"`, `"1.9.0~~"`); `source`
-    /// names where it was found (e.g. `"debian/rules: LLVM_VERSION = 19"`).
-    Inferred { value: String, source: String },
-    /// The value could not be determined automatically.
-    ///
-    /// `reason` explains what was expected and not found.
-    CouldNotInfer(String),
+/// The coarse conclusion of a compatibility check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeKind {
+    /// The required package/version is published in the target archive.
+    SatisfiedFromArchive,
+    /// The packaging itself satisfies the requirement; the archive is not
+    /// involved (vendored dependency, disabled tool, verified fallback).
+    SatisfiedByPackaging,
+    /// A demonstrated problem; the remaining edit is named.
+    NeedsAttention,
+    /// Evidence missing or contradictory; the check cannot decide.
+    Unknown,
+    /// An archive lookup was needed and attempted but failed.
+    ArchiveCheckFailed,
 }
 
-impl Inference {
-    /// Returns `true` when this is an `Inferred` value (regardless of whether
-    /// the value string is empty).
-    pub fn is_inferred(&self) -> bool {
-        matches!(self, Inference::Inferred { .. })
-    }
-}
-
-/// The status of a package/version in the target release's archive.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArchiveStatus {
-    /// The package is published in the archive; carries its version string.
-    Available(String),
-    /// The package is published but older than the required version.
-    TooOld { available: String, required: String },
-    /// The package is not published in the archive at all.
-    NotPublished,
-    /// The archive check itself failed (e.g. `rmadison` not installed,
-    /// network error).
-    CheckFailed(String),
+/// The conclusion of one compatibility check, with the evidence behind it.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub kind: OutcomeKind,
+    /// One-line conclusion (e.g. "already vendored — build uses the bundled
+    /// src/llvm-project tree").
+    pub summary: String,
+    /// What was observed, one line per item.
+    pub evidence: Vec<String>,
 }
 
 /// The combined result of a single compatibility check.
@@ -61,222 +59,432 @@ pub enum ArchiveStatus {
 pub struct CheckResult {
     /// Short human-readable name of the check (e.g. `"LLVM"`).
     pub name: &'static str,
-    /// What thermite inferred from the source packaging.
-    pub inference: Inference,
-    /// What thermite found (or failed to find) in the archive.
-    pub archive_status: ArchiveStatus,
+    pub outcome: Outcome,
     /// One-line summary of the applicable fix, or empty when no fix is needed.
     pub guidance: &'static str,
-    /// Launchpad URL for manual verification.
+    /// Launchpad URL for manual verification; empty when the packaging itself
+    /// satisfies the check (the evidence lines replace the link).
     pub url: String,
+    /// Whether the orig tarball (Phase 5) must be regenerated after the fix —
+    /// meaningful only when the check needs attention.
+    pub needs_tarball_regen: bool,
 }
 
 impl CheckResult {
     /// Returns `true` when the check passed and no action is needed.
     pub fn is_ok(&self) -> bool {
-        matches!(self.archive_status, ArchiveStatus::Available(_))
+        matches!(
+            self.outcome.kind,
+            OutcomeKind::SatisfiedFromArchive | OutcomeKind::SatisfiedByPackaging
+        )
     }
 }
 
-// ── Inference helpers ─────────────────────────────────────────────────────────
+// ── Packaging readers ─────────────────────────────────────────────────────────
 
-/// Read a file relative to `repo_dir`, returning an empty string on missing
-/// file so inference functions can treat "file not present" as "could not
-/// infer" uniformly.
-fn read_debian_file(repo_dir: &Path, name: &str) -> String {
-    std::fs::read_to_string(repo_dir.join(name)).unwrap_or_default()
+/// Read a file relative to `repo_dir`; `None` when missing or unreadable.
+fn read_debian_file(repo_dir: &Path, name: &str) -> Option<String> {
+    std::fs::read_to_string(repo_dir.join(name)).ok()
 }
 
 /// Iterate over the lines of `content`, skipping lines whose first non-space
-/// character is `#`. Used by inference functions so commented-out directives
-/// (common in backport branches) are not mistaken for active ones.
+/// character is `#`. Used when scanning make/rules/config content so
+/// commented-out directives (common in backport branches) are not mistaken
+/// for active ones.
 fn uncommented_lines(content: &str) -> impl Iterator<Item = &str> {
-    content.lines().filter(|line| {
-        let t = line.trim_start();
-        !t.starts_with('#')
-    })
+    content
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
 }
 
-/// Infer the LLVM major version required by this `rustc` package by scanning
-/// `debian/rules` for an uncommented `LLVM_VERSION = <N>` line.
-pub fn infer_llvm_version(repo_dir: &Path) -> Inference {
-    let content = read_debian_file(repo_dir, "debian/rules");
-    for line in uncommented_lines(&content) {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("LLVM_VERSION") {
-            // Accept optional surrounding whitespace and a '=' or ':' separator.
-            let rest = rest.trim_start_matches([' ', '=', ':', '\t']).trim_end();
-            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                let value = rest.to_owned();
-                return Inference::Inferred {
-                    value: value.clone(),
-                    source: format!("debian/rules: LLVM_VERSION = {value}"),
-                };
-            }
+/// Extract a folded control-style field value (e.g. `Build-Depends:` or
+/// `Files-Excluded:`) spanning multiple continuation lines. Full-line `#`
+/// comments are legal inside a field and are skipped. `None` when the field
+/// does not appear.
+fn folded_field(content: &str, field: &str) -> Option<String> {
+    let prefix = format!("{field}:");
+    let mut value: Option<String> = None;
+    for line in content.lines() {
+        if line.starts_with('#') {
+            continue;
         }
-    }
-    Inference::CouldNotInfer(
-        "no uncommented 'LLVM_VERSION = <N>' assignment found in debian/rules".to_owned(),
-    )
-}
-
-/// Infer the libgit2-dev minimum version from `debian/control` by looking for
-/// `libgit2-dev (>= X.Y.Z` in Build-Depends.
-pub fn infer_libgit2_version(repo_dir: &Path) -> Inference {
-    let content = read_debian_file(repo_dir, "debian/control");
-    for line in uncommented_lines(&content) {
-        let trimmed = line.trim();
-        if let Some(idx) = trimmed.find("libgit2-dev") {
-            let after = &trimmed[idx + "libgit2-dev".len()..];
-            // Look for `(>= <version>)`.
-            if let Some(ver_start) = after.find("(>=") {
-                let rest = &after[ver_start + "(>=".len()..];
-                if let Some(end) = rest.find(')') {
-                    let ver = rest[..end].trim().to_owned();
-                    if !ver.is_empty() {
-                        return Inference::Inferred {
-                            value: ver.clone(),
-                            source: format!("debian/control: libgit2-dev (>= {ver})"),
-                        };
+        match &mut value {
+            Some(v) => {
+                if line.starts_with(' ') || line.starts_with('\t') {
+                    if !v.is_empty() {
+                        v.push(' ');
                     }
+                    v.push_str(line.trim());
+                } else {
+                    break;
                 }
             }
-            // libgit2-dev present but no version constraint.
-            return Inference::Inferred {
-                value: String::new(),
-                source: "debian/control: libgit2-dev (no version constraint)".to_owned(),
-            };
+            None => {
+                if let Some(rest) = line.strip_prefix(prefix.as_str()) {
+                    value = Some(rest.trim().to_owned());
+                }
+            }
         }
     }
-    Inference::CouldNotInfer(
-        "no libgit2-dev entry found in debian/control Build-Depends".to_owned(),
-    )
+    value
 }
 
-/// Infer the dh-cargo minimum version from `debian/control`.
-///
-/// Returns `Some(version)` (possibly empty when no constraint is given) when
-/// dh-cargo is present, or `CouldNotInfer` when it is absent.
-pub fn infer_dh_cargo(repo_dir: &Path) -> Inference {
-    let content = read_debian_file(repo_dir, "debian/control");
-    for line in uncommented_lines(&content) {
-        let trimmed = line.trim();
-        if let Some(idx) = trimmed.find("dh-cargo") {
-            let after = &trimmed[idx + "dh-cargo".len()..];
-            if let Some(ver_start) = after.find("(>=") {
-                let rest = &after[ver_start + "(>=".len()..];
-                if let Some(end) = rest.find(')') {
-                    let ver = rest[..end].trim().to_owned();
-                    return Inference::Inferred {
-                        value: ver.clone(),
-                        source: format!("debian/control: dh-cargo (>= {ver})"),
-                    };
-                }
-            }
-            // dh-cargo present without version constraint.
-            return Inference::Inferred {
-                value: String::new(),
-                source: "debian/control: dh-cargo (no version constraint)".to_owned(),
-            };
-        }
+/// `PackagingState` for a tree whose `debian/control` could not be read;
+/// every Build-Depends check uses the same diagnostic.
+fn control_unreadable() -> PackagingState {
+    PackagingState::Unknown {
+        summary: "debian/control could not be read".to_owned(),
+        evidence: vec!["debian/control is missing or unreadable".to_owned()],
     }
-    Inference::CouldNotInfer("no dh-cargo entry found in debian/control".to_owned())
 }
 
-/// Infer whether pkgconf is used as a Build-Depends in `debian/control`.
-///
-/// Returns `Inferred { value: "present" }` when pkgconf is found, or
-/// `Inferred { value: "pkg-config" }` when pkg-config is already used instead,
-/// or `CouldNotInfer` when neither is present.
-pub fn infer_pkgconf(repo_dir: &Path) -> Inference {
-    let content = read_debian_file(repo_dir, "debian/control");
-    for line in uncommented_lines(&content) {
-        let trimmed = line.trim();
-        // Match `pkgconf` as a whole word, not `pkg-config`.
-        // Use a simple heuristic: look for `pkgconf` followed by whitespace,
-        // comma, or end-of-line.
-        if contains_word(trimmed, "pkgconf") && !contains_word(trimmed, "pkg-config") {
-            return Inference::Inferred {
-                value: "present".to_owned(),
-                source: "debian/control: pkgconf in Build-Depends".to_owned(),
-            };
-        }
-        if contains_word(trimmed, "pkg-config") {
-            return Inference::Inferred {
-                value: "pkg-config".to_owned(),
-                source: "debian/control: pkg-config in Build-Depends".to_owned(),
-            };
-        }
+/// The active Build-Depends value from `debian/control`, joined with
+/// `Build-Depends-Indep` (its entries must also be satisfiable at build
+/// time, e.g. the `clang-<N>:native` removal in the runbook's vendoring),
+/// and with the same fields from `debian/control.in` appended when that
+/// template exists (it is optional and absent on some backport branches).
+/// `None` when `debian/control` itself is missing or unreadable.
+fn build_depends_field(repo_dir: &Path) -> Option<String> {
+    let control = read_debian_file(repo_dir, "debian/control")?;
+    let mut field = folded_field(&control, "Build-Depends").unwrap_or_default();
+    if let Some(indep) = folded_field(&control, "Build-Depends-Indep") {
+        push_field(&mut field, &indep);
     }
-    Inference::CouldNotInfer("neither pkgconf nor pkg-config found in debian/control".to_owned())
+    let template = if repo_dir.join("debian/control.in").exists() {
+        read_debian_file(repo_dir, "debian/control.in")
+    } else {
+        None
+    };
+    if let Some(extra) = template
+        .as_deref()
+        .and_then(|c| folded_field(c, "Build-Depends"))
+    {
+        push_field(&mut field, &extra);
+    }
+    if let Some(extra) = template
+        .as_deref()
+        .and_then(|c| folded_field(c, "Build-Depends-Indep"))
+    {
+        push_field(&mut field, &extra);
+    }
+    Some(field)
 }
 
-/// Infer the cmake minimum version from `debian/control`.
-pub fn infer_cmake(repo_dir: &Path) -> Inference {
-    let content = read_debian_file(repo_dir, "debian/control");
-    for line in uncommented_lines(&content) {
-        let trimmed = line.trim();
-        // Match `cmake` as a whole word, but not `cmake-mozilla` or `cmake3`.
-        if let Some(idx) = find_word(trimmed, "cmake") {
-            let after = &trimmed[idx + "cmake".len()..];
-            // Skip cmake-mozilla / cmake3 — only match bare cmake.
-            if after.starts_with('-') || after.starts_with('3') {
-                continue;
-            }
-            if let Some(ver_start) = after.find("(>=") {
-                let rest = &after[ver_start + "(>=".len()..];
-                if let Some(end) = rest.find(')') {
-                    let ver = rest[..end].trim().to_owned();
-                    return Inference::Inferred {
-                        value: ver.clone(),
-                        source: format!("debian/control: cmake (>= {ver})"),
-                    };
-                }
-            }
-            return Inference::Inferred {
-                value: String::new(),
-                source: "debian/control: cmake (no version constraint)".to_owned(),
-            };
-        }
+/// Append one dependency field's value to a combined field value.
+fn push_field(field: &mut String, extra: &str) {
+    if !field.is_empty() {
+        field.push(' ');
     }
-    Inference::CouldNotInfer("no cmake entry found in debian/control".to_owned())
+    field.push_str(extra);
 }
 
-/// Infer the debhelper-compat level from `debian/control`.
-pub fn infer_debhelper_compat(repo_dir: &Path) -> Inference {
-    let content = read_debian_file(repo_dir, "debian/control");
-    for line in uncommented_lines(&content) {
-        let trimmed = line.trim();
-        if let Some(idx) = trimmed.find("debhelper-compat") {
-            let after = &trimmed[idx + "debhelper-compat".len()..];
-            // Look for `(= N)` or `(>= N)`.
-            if let Some(ver_start) = after.find("(=") {
-                let rest = &after[ver_start + "(=".len()..];
-                if let Some(end) = rest.find(')') {
-                    let ver = rest[..end].trim().to_owned();
-                    if !ver.is_empty() {
-                        return Inference::Inferred {
-                            value: ver.clone(),
-                            source: format!("debian/control: debhelper-compat (= {ver})"),
-                        };
-                    }
-                }
+/// Split a dependency field into comma-separated entries, ignoring commas
+/// inside version parentheses.
+fn split_entries(field: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for c in field.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
             }
-            if let Some(ver_start) = after.find("(>=") {
-                let rest = &after[ver_start + "(>=".len()..];
-                if let Some(end) = rest.find(')') {
-                    let ver = rest[..end].trim().to_owned();
-                    if !ver.is_empty() {
-                        return Inference::Inferred {
-                            value: ver.clone(),
-                            source: format!("debian/control: debhelper-compat (>= {ver})"),
-                        };
-                    }
-                }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                entries.push(current.trim().to_owned());
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    entries.push(current.trim().to_owned());
+    entries.retain(|e| !e.is_empty());
+    entries
+}
+
+/// Parse one alternative of a dependency entry into its package name and its
+/// `(op version)` relations. Architecture (`[...]`) and build-profile
+/// (`<...>`) annotations are ignored.
+fn parse_alternative(alt: &str) -> Option<(String, Vec<(String, String)>)> {
+    let trimmed = alt.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let name_end = trimmed.find(['(', '[', '<']).unwrap_or(trimmed.len());
+    let name = trimmed[..name_end].trim().to_owned();
+    if name.is_empty() {
+        return None;
+    }
+    let mut relations = Vec::new();
+    if let Some(open) = trimmed.find('(')
+        && let Some(close) = trimmed[open..].find(')')
+    {
+        let inner = &trimmed[open + 1..open + close];
+        for part in inner.split(',') {
+            let mut parts = part.split_whitespace();
+            if let (Some(op), Some(ver)) = (parts.next(), parts.next()) {
+                relations.push((op.to_owned(), ver.to_owned()));
             }
         }
     }
-    Inference::CouldNotInfer("no debhelper-compat entry found in debian/control".to_owned())
+    Some((name, relations))
+}
+
+/// The entries of `entries` that declare `package` as a whole word.
+fn entries_for(entries: &[String], package: &str) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| contains_word(e, package))
+        .cloned()
+        .collect()
+}
+
+/// Collapse a list of `(op, version)` relations into optional
+/// `(floor, ceiling)` versions. `=` is treated as a floor (the versioned
+/// build-dep semantics relevant here, e.g. `debhelper-compat (= 13)`).
+fn bounds_from_relations(relations: &[(String, String)]) -> (Option<String>, Option<String>) {
+    let mut floor = None;
+    let mut ceiling = None;
+    for (op, ver) in relations {
+        match op.as_str() {
+            ">=" | ">>" | "=" => floor = Some(ver.clone()),
+            "<=" | "<<" => ceiling = Some(ver.clone()),
+            _ => {}
+        }
+    }
+    (floor, ceiling)
+}
+
+/// The first uncommented line of `content` containing `needle`, with its
+/// 1-based line number.
+fn find_active_rule_line(content: &str, needle: &str) -> Option<(usize, String)> {
+    content
+        .lines()
+        .enumerate()
+        .find(|(_, line)| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('#') && trimmed.contains(needle)
+        })
+        .map(|(idx, line)| (idx + 1, line.trim().to_owned()))
+}
+
+/// The `Files-Excluded` value of `debian/copyright`, when the field exists.
+fn files_excluded(repo_dir: &Path) -> Option<String> {
+    let copyright = read_debian_file(repo_dir, "debian/copyright")?;
+    folded_field(&copyright, "Files-Excluded")
+}
+
+/// The quilt patches listed as active in `debian/patches/series`.
+fn active_patches(repo_dir: &Path) -> Vec<String> {
+    let Some(series) = read_debian_file(repo_dir, "debian/patches/series") else {
+        return Vec::new();
+    };
+    series
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("include"))
+        // A series entry may carry options after the patch path (e.g.
+        // "ubuntu/x.patch -p1"); only the path names the patch file.
+        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+        .collect()
+}
+
+/// Active quilt patches that add or remove the cargo `vendored-libgit2`
+/// feature line, as `(added_by, removed_by)` patch name lists.
+fn vendored_libgit2_patch_effects(repo_dir: &Path) -> (Vec<String>, Vec<String>) {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    for patch in active_patches(repo_dir) {
+        let Some(content) = read_debian_file(repo_dir, &format!("debian/patches/{patch}")) else {
+            continue;
+        };
+        let mut minus = 0usize;
+        let mut plus = 0usize;
+        for line in content.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("-vendored-libgit2") {
+                minus += 1;
+            } else if trimmed.starts_with("+vendored-libgit2") {
+                plus += 1;
+            }
+        }
+        if minus > plus {
+            removed.push(patch);
+        } else if plus > minus {
+            added.push(patch);
+        }
+    }
+    (added, removed)
+}
+
+/// The vendored `libgit2-sys-*` crate directories whose bundled `libgit2` C
+/// source is present (non-empty), sorted by crate name.
+fn vendored_libgit2_crates(repo_dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(repo_dir.join("vendor")) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("libgit2-sys-") {
+            continue;
+        }
+        let bundled = entry.path().join("libgit2");
+        let non_empty = std::fs::read_dir(&bundled)
+            .map(|mut dir| dir.next().is_some())
+            .unwrap_or(false);
+        if non_empty {
+            found.push(name);
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Whether `src/tools/cargo/Cargo.toml` declares the `vendored-libgit2`
+/// cargo feature.
+fn cargo_feature_vendored_libgit2_in_tree(repo_dir: &Path) -> bool {
+    read_debian_file(repo_dir, "src/tools/cargo/Cargo.toml")
+        .map(|content| {
+            content
+                .lines()
+                .any(|line| line.trim_start().starts_with("vendored-libgit2"))
+        })
+        .unwrap_or(false)
+}
+
+/// The `debian/*.install.in` files containing active `${env:VAR}`
+/// substitutions (compat-13 style; compat 12 needs `@VARIABLE@`).
+fn install_in_env_substitutions(repo_dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(repo_dir.join("debian")) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".install.in") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(entry.path())
+            && content.contains("${env:")
+        {
+            found.push(format!("debian/{name}"));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The LLVM major version from an uncommented `LLVM_VERSION = <N>` assignment
+/// in `debian/rules` (accepts `=`, `:=`, and `?=`).
+fn rules_llvm_major(rules: &str) -> Option<String> {
+    for line in uncommented_lines(rules) {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("LLVM_VERSION") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let rest = rest
+            .strip_prefix("?=")
+            .or_else(|| rest.strip_prefix(":="))
+            .or_else(|| rest.strip_prefix('='))
+            .unwrap_or(rest);
+        let rest = rest.trim();
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return Some(rest.to_owned());
+        }
+    }
+    None
+}
+
+/// A path (relative to the package root) proving that the bundled LLVM source
+/// is present in the tree.
+fn llvm_source_marker(repo_dir: &Path) -> Option<String> {
+    for marker in [
+        "src/llvm-project/llvm/CMakeLists.txt",
+        "src/llvm-project/cmake/Modules/LLVMVersion.cmake",
+    ] {
+        if repo_dir.join(marker).is_file() {
+            return Some(marker.to_owned());
+        }
+    }
+    let dir = repo_dir.join("src/llvm-project");
+    let non_empty = std::fs::read_dir(&dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    non_empty.then(|| "src/llvm-project (non-empty directory)".to_owned())
+}
+
+/// An uncommented `llvm-config = "/usr/..."` line in the bootstrap config
+/// template that selects the system LLVM. Template placeholders
+/// (`LLVM_DESTDIR`, `@LLVM_VERSION_MAJOR@`) are not `/usr/` paths and are
+/// ignored.
+fn config_llvm_config_line(content: &str) -> Option<String> {
+    for line in uncommented_lines(content) {
+        let trimmed = line.trim();
+        if trimmed.contains("llvm-config") && trimmed.contains("/usr/") {
+            return Some(trimmed.to_owned());
+        }
+    }
+    None
+}
+
+/// The LLVM major version named by a system `llvm-config` path, either
+/// `/usr/lib/llvm-<N>/...` or `/usr/bin/llvm-config-<N>`. `None` for an
+/// unversioned path such as `/usr/bin/llvm-config`.
+fn llvm_major_from_llvm_config(line: &str) -> Option<String> {
+    let candidates = [
+        line.find("/usr/lib/llvm-")
+            .map(|idx| idx + "/usr/lib/llvm-".len()),
+        line.find("llvm-config-")
+            .map(|idx| idx + "llvm-config-".len()),
+    ];
+    for start in candidates.into_iter().flatten() {
+        let digits: String = line[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !digits.is_empty() {
+            return Some(digits);
+        }
+    }
+    None
+}
+
+/// An uncommented `debian/rules` line setting `PKG_CONFIG` to a value that
+/// selects `pkg-config`, e.g. `export PKG_CONFIG=pkg-config`. Returns the
+/// line and whether it is exported: only exported variables are passed to
+/// the commands make runs, so an unexported setting is a half-applied fix.
+/// An exported line wins over an unexported one.
+fn pkg_config_setting(rules: &str) -> Option<(bool, usize, String)> {
+    let mut unexported = None;
+    for (idx, line) in rules.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || !trimmed.contains("PKG_CONFIG") {
+            continue;
+        }
+        let Some(eq) = trimmed.find('=') else {
+            continue;
+        };
+        let exported = trimmed.starts_with("export");
+        let lhs = trimmed[..eq]
+            .trim_end()
+            .trim_end_matches(['?', ':'])
+            .trim_end();
+        let rhs = trimmed[eq + 1..].trim();
+        if lhs.ends_with("PKG_CONFIG") && rhs.contains("pkg-config") {
+            let found = (exported, idx + 1, trimmed.to_owned());
+            if exported {
+                return Some(found);
+            }
+            unexported.get_or_insert(found);
+        }
+    }
+    unexported
 }
 
 // ── Word-boundary helpers ─────────────────────────────────────────────────────
@@ -318,6 +526,18 @@ fn is_word_boundary(b: u8) -> bool {
 }
 
 // ── Archive check ─────────────────────────────────────────────────────────────
+
+/// The status of a package/version in the target release's archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveStatus {
+    /// The package is published in the archive; carries its version string.
+    Available(String),
+    /// The package is not published in the archive at all.
+    NotPublished,
+    /// The archive check itself failed (e.g. `rmadison` not installed,
+    /// network error).
+    CheckFailed(String),
+}
 
 /// Check whether `package` is published in the `release` suite of the Ubuntu
 /// archive using `rmadison -u ubuntu <package>`.
@@ -429,301 +649,906 @@ pub async fn dpkg_compare_versions(a: &str, op: &str, b: &str) -> bool {
     }
 }
 
-// ── Per-gate check functions ──────────────────────────────────────────────────
+/// Normalize a version floor for comparison. Floors written with a doubled
+/// tilde (`1.9.0~~`, meaning "any 1.9.0 and newer") must drop the tildes;
+/// a single trailing tilde (`28ubuntu1~`) is meaningful to dpkg and is kept
+/// as-is.
+fn normalize_floor(version: &str) -> String {
+    if version.ends_with("~~") {
+        version.trim_end_matches('~').to_owned()
+    } else {
+        version.to_owned()
+    }
+}
+
+// ── Outcome evaluation ────────────────────────────────────────────────────────
+
+/// What the source packaging says about how a requirement is met, before any
+/// archive lookup.
+#[derive(Debug)]
+enum PackagingState {
+    /// The packaging already satisfies the requirement without the archive.
+    /// Non-empty `issues` mark a partially applied fix; `tarball_regen` marks
+    /// fixes that require regenerating the orig tarball.
+    SelfContained {
+        summary: String,
+        evidence: Vec<String>,
+        issues: Vec<String>,
+        tarball_regen: bool,
+    },
+    /// The package requires `requirement` from the target release's archive.
+    Archive {
+        requirement: Requirement,
+        evidence: Vec<String>,
+    },
+    /// Evidence is missing or contradictory; the check cannot decide.
+    Unknown {
+        summary: String,
+        evidence: Vec<String>,
+    },
+}
+
+/// A requirement the target release's archive must satisfy.
+#[derive(Debug)]
+enum Requirement {
+    /// One source package with optional version bounds.
+    Single {
+        package: String,
+        floor: Option<String>,
+        ceiling: Option<String>,
+    },
+    /// Declared alternatives, tried in order (e.g.
+    /// `cmake (>= 3.0) | cmake3 (>= 3.0) | cmake-mozilla (>= 3.0)`).
+    Alternatives(Vec<(String, Option<String>)>),
+}
+
+/// Turn a [`PackagingState`] into the final [`CheckResult`], querying the
+/// archive when the packaging points at it.
+async fn finalize_check(
+    name: &'static str,
+    state: PackagingState,
+    guidance: &'static str,
+    url: String,
+    release: &str,
+    tarball_on_attention: bool,
+) -> CheckResult {
+    let (outcome, state_regen) = match state {
+        PackagingState::SelfContained {
+            summary,
+            evidence,
+            issues,
+            tarball_regen,
+        } => {
+            let outcome = if issues.is_empty() {
+                Outcome {
+                    kind: OutcomeKind::SatisfiedByPackaging,
+                    summary,
+                    evidence,
+                }
+            } else {
+                Outcome {
+                    kind: OutcomeKind::NeedsAttention,
+                    summary: issues.join("; "),
+                    evidence,
+                }
+            };
+            (outcome, tarball_regen)
+        }
+        PackagingState::Unknown { summary, evidence } => (
+            Outcome {
+                kind: OutcomeKind::Unknown,
+                summary,
+                evidence,
+            },
+            false,
+        ),
+        PackagingState::Archive {
+            requirement,
+            evidence,
+        } => (
+            evaluate_requirement(&requirement, release, evidence).await,
+            true,
+        ),
+    };
+    // Archive-driven attention implies a tarball regen only when the check is
+    // flagged for it; a partially applied vendoring fix implies a regen only
+    // when the Files-Excluded exclusion is still in place.
+    let needs_tarball_regen =
+        tarball_on_attention && outcome.kind == OutcomeKind::NeedsAttention && state_regen;
+    CheckResult {
+        name,
+        outcome,
+        guidance,
+        url,
+        needs_tarball_regen,
+    }
+}
+
+/// Compare a requirement against the target release's archive.
+async fn evaluate_requirement(
+    requirement: &Requirement,
+    release: &str,
+    evidence: Vec<String>,
+) -> Outcome {
+    match requirement {
+        Requirement::Single {
+            package,
+            floor,
+            ceiling,
+        } => {
+            let status = check_archive(package, release).await;
+            match status {
+                ArchiveStatus::CheckFailed(detail) => Outcome {
+                    kind: OutcomeKind::ArchiveCheckFailed,
+                    summary: detail,
+                    evidence,
+                },
+                ArchiveStatus::NotPublished => Outcome {
+                    kind: OutcomeKind::NeedsAttention,
+                    summary: format!("{package} is not published in {release}"),
+                    evidence,
+                },
+                ArchiveStatus::Available(available) => {
+                    if let Some(floor) = floor.as_deref().filter(|f| !f.is_empty() && *f != "*") {
+                        let floor = normalize_floor(floor);
+                        if !dpkg_compare_versions(&available, "ge", &floor).await {
+                            return Outcome {
+                                kind: OutcomeKind::NeedsAttention,
+                                summary: format!(
+                                    "{package} {available} in {release} is older than the required {floor}"
+                                ),
+                                evidence,
+                            };
+                        }
+                    }
+                    if let Some(ceiling) = ceiling.as_deref().filter(|c| !c.is_empty())
+                        && !dpkg_compare_versions(&available, "lt", ceiling).await
+                    {
+                        return Outcome {
+                            kind: OutcomeKind::NeedsAttention,
+                            summary: format!(
+                                "{package} {available} in {release} is not below the required ceiling {ceiling}"
+                            ),
+                            evidence,
+                        };
+                    }
+                    Outcome {
+                        kind: OutcomeKind::SatisfiedFromArchive,
+                        summary: format!("{package} available in {release} ({available})"),
+                        evidence,
+                    }
+                }
+            }
+        }
+        Requirement::Alternatives(alternatives) => {
+            let mut too_old: Vec<String> = Vec::new();
+            let mut last_failure: Option<String> = None;
+            for (package, floor) in alternatives {
+                match check_archive(package, release).await {
+                    ArchiveStatus::Available(available) => {
+                        let satisfied =
+                            match floor.as_deref().filter(|f| !f.is_empty() && *f != "*") {
+                                Some(f) => {
+                                    dpkg_compare_versions(&available, "ge", &normalize_floor(f))
+                                        .await
+                                }
+                                None => true,
+                            };
+                        if satisfied {
+                            return Outcome {
+                                kind: OutcomeKind::SatisfiedFromArchive,
+                                summary: format!(
+                                    "{package} ({available}) satisfies the requirement in {release}"
+                                ),
+                                evidence,
+                            };
+                        }
+                        too_old.push(format!(
+                            "{package} {available} does not meet (>= {})",
+                            floor.as_deref().unwrap_or("")
+                        ));
+                    }
+                    ArchiveStatus::NotPublished => {
+                        last_failure = Some(format!("{package} is not published in {release}"));
+                    }
+                    ArchiveStatus::CheckFailed(detail) => {
+                        last_failure = Some(detail);
+                    }
+                }
+            }
+            if !too_old.is_empty() {
+                Outcome {
+                    kind: OutcomeKind::NeedsAttention,
+                    summary: format!(
+                        "none of the declared alternatives is sufficient: {}",
+                        too_old.join("; ")
+                    ),
+                    evidence,
+                }
+            } else if let Some(detail) = last_failure {
+                Outcome {
+                    kind: OutcomeKind::ArchiveCheckFailed,
+                    summary: detail,
+                    evidence,
+                }
+            } else {
+                Outcome {
+                    kind: OutcomeKind::Unknown,
+                    summary: "no declared alternative could be evaluated".to_owned(),
+                    evidence,
+                }
+            }
+        }
+    }
+}
+
+// ── Per-gate checks ───────────────────────────────────────────────────────────
 
 /// Construct a Launchpad source package URL for `package` in `release`.
 fn lp_source_url(release: &str, package: &str) -> String {
     format!("https://launchpad.net/ubuntu/{release}/+source/{package}")
 }
 
+/// How the package satisfies its LLVM requirement.
+///
+/// Vendoring is recognized from real evidence: the bundled `src/llvm-project`
+/// source in the tree, the `Files-Excluded` state in `debian/copyright`, and
+/// the active build configuration (either `debian/config.toml.in` or the
+/// older `debian/bootstrap.toml.in` template). A system LLVM requirement is
+/// inferred from an `LLVM_VERSION = <N>` assignment in `debian/rules` or a
+/// system `llvm-config` path in the config template.
+/// Whether a Build-Depends entry is a versioned LLVM toolchain package that
+/// the vendored build does not use. The runbook's vendoring removes entries
+/// like `llvm-<N>-dev:native`, `llvm-<N>-tools:native`,
+/// `libclang-rt-<N>-dev`, `libclang-common-<N>-dev` and `clang-<N>:native`.
+/// Unversioned names (`llvm-dev`, `libclang-dev`) are not flagged — the
+/// documented fix only removes versioned ones.
+fn is_llvm_toolchain_entry(entry: &str) -> bool {
+    entry.split('|').any(|alt| {
+        let Some((name, _)) = parse_alternative(alt) else {
+            return false;
+        };
+        // Strip the `:native`/`:any` architecture qualifier.
+        let name = name.split(':').next().unwrap_or(&name);
+        let Some((prefix, rest)) = name.split_once('-') else {
+            return false;
+        };
+        matches!(prefix, "llvm" | "libclang" | "clang")
+            && rest
+                .split('-')
+                .any(|segment| !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
+fn assess_llvm(repo_dir: &Path) -> PackagingState {
+    let rules = read_debian_file(repo_dir, "debian/rules");
+    let rules_major = rules.as_deref().and_then(rules_llvm_major);
+
+    let config = read_debian_file(repo_dir, "debian/config.toml.in")
+        .map(|content| ("debian/config.toml.in".to_owned(), content))
+        .or_else(|| {
+            read_debian_file(repo_dir, "debian/bootstrap.toml.in")
+                .map(|content| ("debian/bootstrap.toml.in".to_owned(), content))
+        });
+    let config_system_line = config.as_ref().and_then(|(name, content)| {
+        config_llvm_config_line(content).map(|line| (name.clone(), line))
+    });
+    let config_system_major = config_system_line.as_ref().and_then(|(name, line)| {
+        llvm_major_from_llvm_config(line).map(|major| (name.clone(), line.clone(), major))
+    });
+    let source_marker = llvm_source_marker(repo_dir);
+    let excluded = files_excluded(repo_dir)
+        .map(|fe| fe.contains("src/llvm-project"))
+        .unwrap_or(false);
+    let rules_reference = rules
+        .as_deref()
+        .and_then(|rules| find_active_rule_line(rules, "src/llvm-project"));
+
+    if let Some(marker) = source_marker {
+        let mut evidence = vec![format!(
+            "{marker} present — the bundled LLVM source is in the tree"
+        )];
+        if excluded {
+            evidence
+                .push("debian/copyright Files-Excluded still lists src/llvm-project".to_owned());
+        } else {
+            evidence.push("debian/copyright does not exclude src/llvm-project".to_owned());
+        }
+        if let Some((lineno, line)) = rules_reference {
+            evidence.push(format!("debian/rules:{lineno}: {line}"));
+        }
+        match &config {
+            Some((name, _)) => {
+                if config_system_line.is_none() {
+                    evidence.push(format!(
+                        "{name} does not point llvm-config at the system toolchain"
+                    ));
+                }
+            }
+            None => evidence
+                .push("no debian/config.toml.in or debian/bootstrap.toml.in found".to_owned()),
+        }
+
+        let mut issues = Vec::new();
+        if excluded {
+            issues.push(
+                "src/llvm-project is still listed in Files-Excluded in debian/copyright; \
+                 remove that exclusion so the vendored LLVM ships in the orig tarball"
+                    .to_owned(),
+            );
+        }
+        if let Some((name, line)) = &config_system_line {
+            issues.push(format!(
+                "{name} still points llvm-config at the system toolchain ({line}); \
+                 remove that line so the build uses the bundled LLVM"
+            ));
+        }
+        // The runbook's vendoring also removes the versioned LLVM toolchain
+        // packages from Build-Depends; a half-applied fix leaves them declared
+        // and would fail sbuild on a release without llvm-toolchain-<N>.
+        let leftover = build_depends_field(repo_dir)
+            .map(|field| {
+                split_entries(&field)
+                    .into_iter()
+                    .filter(|entry| is_llvm_toolchain_entry(entry))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !leftover.is_empty() {
+            issues.push(format!(
+                "remove the versioned LLVM toolchain packages from Build-Depends — the \
+                 vendored build does not use them: {}",
+                leftover.join(", ")
+            ));
+            for entry in &leftover {
+                evidence.push(format!("debian/control: {entry}"));
+            }
+        }
+        return PackagingState::SelfContained {
+            summary: "already vendored — build uses the bundled src/llvm-project tree".to_owned(),
+            evidence,
+            issues,
+            tarball_regen: excluded,
+        };
+    }
+
+    // No bundled source: does the package require a system LLVM?
+    if let Some(major) = rules_major {
+        return PackagingState::Archive {
+            requirement: Requirement::Single {
+                package: format!("llvm-toolchain-{major}"),
+                floor: Some(major.clone()),
+                ceiling: None,
+            },
+            evidence: vec![format!("debian/rules: LLVM_VERSION = {major}")],
+        };
+    }
+    if let Some((name, line, major)) = config_system_major {
+        return PackagingState::Archive {
+            requirement: Requirement::Single {
+                package: format!("llvm-toolchain-{major}"),
+                floor: Some(major.clone()),
+                ceiling: None,
+            },
+            evidence: vec![format!("{name}: {line}")],
+        };
+    }
+
+    // Neither side has usable evidence — report what was and was not found.
+    let mut evidence = vec![
+        "system LLVM: no uncommented 'LLVM_VERSION = <N>' assignment in debian/rules".to_owned(),
+        "vendored LLVM: no src/llvm-project/llvm/CMakeLists.txt (or \
+         src/llvm-project/cmake/Modules/LLVMVersion.cmake) in the tree"
+            .to_owned(),
+    ];
+    match &config {
+        Some((name, _)) => match &config_system_line {
+            Some((_, line)) => evidence.push(format!(
+                "system LLVM: {name} points llvm-config at the system toolchain ({line}) \
+                 but the major version could not be determined — check the \
+                 llvm-toolchain-<N> availability manually"
+            )),
+            None => evidence.push(format!(
+                "system LLVM: {name} has no llvm-config line pointing at /usr"
+            )),
+        },
+        None => {
+            evidence.push("no debian/config.toml.in or debian/bootstrap.toml.in found".to_owned())
+        }
+    }
+    if let Some(fe) = files_excluded(repo_dir)
+        && !fe.contains("src/llvm-project")
+    {
+        evidence.push(
+            "note: debian/copyright does not exclude src/llvm-project, but that alone \
+             does not establish that the source is present"
+                .to_owned(),
+        );
+    }
+    PackagingState::Unknown {
+        summary: "cannot tell whether LLVM is used from the archive or vendored".to_owned(),
+        evidence,
+    }
+}
+
 /// Check whether the LLVM version required by the package is available in the
-/// target release's archive.
+/// target release's archive, or whether LLVM is already vendored.
 pub async fn check_llvm(repo_dir: &Path, release: &str) -> CheckResult {
-    let inference = infer_llvm_version(repo_dir);
+    let state = assess_llvm(repo_dir);
+    let url = match &state {
+        PackagingState::Archive {
+            requirement: Requirement::Single { package, .. },
+            ..
+        } => lp_source_url(release, package),
+        _ => String::new(),
+    };
     let guidance = "Vendor LLVM: remove src/llvm-project from Files-Excluded \
                     in debian/copyright, regenerate the orig tarball, update \
-                    debian/control and debian/config.toml.in per the backporting guide.";
+                    debian/control and the bootstrap config template per the \
+                    backporting guide.";
+    finalize_check("LLVM", state, guidance, url, release, true).await
+}
 
-    match &inference {
-        Inference::Inferred { value, .. } => {
-            let pkg = format!("llvm-toolchain-{value}");
-            let url = lp_source_url(release, &pkg);
-            let status = check_archive(&pkg, release).await;
-            CheckResult {
-                name: "LLVM",
-                inference,
-                archive_status: status,
-                guidance,
-                url,
+/// How the package satisfies its libgit2 requirement.
+///
+/// Vendoring is recognized from the bundled `vendor/libgit2-sys-*/libgit2` C
+/// source, the `Files-Excluded` state, removal of `libgit2-dev` and
+/// `libhttp-parser-dev` from Build-Depends, and whether the cargo
+/// `vendored-libgit2` feature survives the active quilt patches.
+fn assess_libgit2(repo_dir: &Path) -> PackagingState {
+    let Some(field) = build_depends_field(repo_dir) else {
+        return control_unreadable();
+    };
+    let entries = split_entries(&field);
+    let dev_entries = entries_for(&entries, "libgit2-dev");
+    let http_parser = !entries_for(&entries, "libhttp-parser-dev").is_empty();
+
+    if !dev_entries.is_empty() {
+        let mut evidence: Vec<String> = dev_entries
+            .iter()
+            .map(|entry| format!("debian/control: {entry}"))
+            .collect();
+        if http_parser {
+            evidence.push("debian/control: libhttp-parser-dev in Build-Depends".to_owned());
+        }
+        let vendored = vendored_libgit2_crates(repo_dir);
+        if !vendored.is_empty() {
+            evidence.push(format!(
+                "note: bundled libgit2 source also present ({}) while libgit2-dev is still declared",
+                vendored.join(", ")
+            ));
+        }
+        let mut floor = None;
+        let mut ceiling = None;
+        for entry in &dev_entries {
+            for alt in entry.split('|') {
+                if let Some((name, relations)) = parse_alternative(alt) {
+                    if name != "libgit2-dev" {
+                        continue;
+                    }
+                    let (entry_floor, entry_ceiling) = bounds_from_relations(&relations);
+                    floor = entry_floor.or(floor);
+                    ceiling = entry_ceiling.or(ceiling);
+                }
             }
         }
-        Inference::CouldNotInfer(reason) => {
-            let url = format!("https://launchpad.net/ubuntu/{release}/+source/llvm-toolchain-<N>");
-            CheckResult {
-                name: "LLVM",
-                inference: Inference::CouldNotInfer(reason.clone()),
-                archive_status: ArchiveStatus::CheckFailed(reason.clone()),
-                guidance,
-                url,
-            }
+        return PackagingState::Archive {
+            requirement: Requirement::Single {
+                package: "libgit2".to_owned(),
+                floor,
+                ceiling,
+            },
+            evidence,
+        };
+    }
+
+    // libgit2-dev is not declared — is the bundled source used instead?
+    let vendored = vendored_libgit2_crates(repo_dir);
+    if vendored.is_empty() {
+        let mut evidence = vec![
+            "system libgit2: no libgit2-dev entry in Build-Depends".to_owned(),
+            "vendored libgit2: no vendor/libgit2-sys-*/libgit2 source in the tree".to_owned(),
+        ];
+        if http_parser {
+            evidence.push("debian/control: libhttp-parser-dev still in Build-Depends".to_owned());
         }
+        return PackagingState::Unknown {
+            summary: "cannot tell how libgit2 is provided".to_owned(),
+            evidence,
+        };
+    }
+
+    let excluded = files_excluded(repo_dir)
+        .map(|fe| fe.contains("libgit2-sys"))
+        .unwrap_or(false);
+    let (added, removed) = vendored_libgit2_patch_effects(repo_dir);
+    let tree_feature = cargo_feature_vendored_libgit2_in_tree(repo_dir);
+    let feature_effective = !added.is_empty() || (tree_feature && removed.is_empty());
+
+    let mut evidence = vec![
+        format!("bundled libgit2 source present for {}", vendored.join(", ")),
+        if excluded {
+            "debian/copyright Files-Excluded still lists vendor/libgit2-sys-*/libgit2".to_owned()
+        } else {
+            "debian/copyright does not exclude vendor/libgit2-sys-*/libgit2".to_owned()
+        },
+        "libgit2-dev is not in Build-Depends".to_owned(),
+    ];
+    let mut issues = Vec::new();
+    if excluded {
+        issues.push(
+            "vendor/libgit2-sys-*/libgit2 is still listed in Files-Excluded in \
+             debian/copyright; remove that exclusion so the vendored libgit2 \
+             ships in the orig tarball"
+                .to_owned(),
+        );
+    }
+    if !feature_effective {
+        issues.push(
+            "the cargo vendored-libgit2 feature is not enabled for the build; keep it in \
+             src/tools/cargo/Cargo.toml and make sure no active quilt patch removes it"
+                .to_owned(),
+        );
+    }
+    if http_parser {
+        issues.push(
+            "libhttp-parser-dev is still in Build-Depends; remove it (it is bundled \
+             within the vendored libgit2 source)"
+                .to_owned(),
+        );
+    } else {
+        evidence.push("libhttp-parser-dev is not in Build-Depends".to_owned());
+    }
+    if !removed.is_empty() {
+        evidence.push(format!(
+            "active patch(es) remove the vendored-libgit2 feature: {}",
+            removed.join(", ")
+        ));
+    } else if !added.is_empty() {
+        evidence.push(format!(
+            "active patch(es) re-add the vendored-libgit2 feature: {}",
+            added.join(", ")
+        ));
+    } else if tree_feature {
+        evidence.push("vendored-libgit2 feature present in src/tools/cargo/Cargo.toml".to_owned());
+    }
+
+    PackagingState::SelfContained {
+        summary: "already vendored — libgit2 is built from the bundled vendor/libgit2-sys-* source"
+            .to_owned(),
+        evidence,
+        issues,
+        tarball_regen: excluded,
     }
 }
 
 /// Check whether the libgit2-dev version required by the package is available
-/// in the target release's archive.
+/// in the target release's archive, or whether libgit2 is already vendored.
 pub async fn check_libgit2(repo_dir: &Path, release: &str) -> CheckResult {
-    let inference = infer_libgit2_version(repo_dir);
+    let state = assess_libgit2(repo_dir);
+    let url = match &state {
+        PackagingState::Archive { .. } => lp_source_url(release, "libgit2"),
+        _ => String::new(),
+    };
     let guidance = "Either downgrade the libgit2-dev version constraint in \
                     debian/control and debian/control.in (when the archive \
                     version is API-compatible), or vendor libgit2 (comment \
                     out the libgit2 exclusion in debian/copyright, regenerate \
                     the orig tarball, remove libgit2-dev from Build-Depends).";
+    finalize_check("libgit2", state, guidance, url, release, true).await
+}
 
-    match &inference {
-        Inference::Inferred { value, source } => {
-            let url = lp_source_url(release, "libgit2");
-            if value.is_empty() {
-                // No version constraint — treat as available if the package is
-                // published at all.
-                let status = check_archive("libgit2", release).await;
-                return CheckResult {
-                    name: "libgit2",
-                    inference: Inference::Inferred {
-                        value: value.clone(),
-                        source: source.clone(),
-                    },
-                    archive_status: status,
-                    guidance,
-                    url,
-                };
+/// How the package satisfies its dh-cargo requirement.
+///
+/// Disabling dh-cargo (the documented fix for older releases) is recognized
+/// only when both the Build-Depends entry and the
+/// `dh-cargo-vendored-sources` invocation in `debian/rules` are gone; a
+/// bundled copy of the helper script does not cancel a declared
+/// Build-Depends.
+fn assess_dh_cargo(repo_dir: &Path) -> PackagingState {
+    let Some(field) = build_depends_field(repo_dir) else {
+        return control_unreadable();
+    };
+    let entries = split_entries(&field);
+    let invocation = read_debian_file(repo_dir, "debian/rules")
+        .as_deref()
+        .and_then(|rules| find_active_rule_line(rules, "dh-cargo-vendored-sources"));
+
+    match entries_for(&entries, "dh-cargo").first() {
+        Some(entry) => {
+            let mut evidence = vec![format!("debian/control: {entry}")];
+            if let Some((lineno, line)) = &invocation {
+                evidence.push(format!("debian/rules:{lineno}: {line}"));
             }
-            let status = check_archive("libgit2", release).await;
-            let final_status = match status {
-                ArchiveStatus::Available(available) => {
-                    let required_norm = value.trim_end_matches('~');
-                    if dpkg_compare_versions(&available, "ge", required_norm).await {
-                        ArchiveStatus::Available(available)
-                    } else {
-                        ArchiveStatus::TooOld {
-                            available,
-                            required: value.clone(),
-                        }
-                    }
-                }
-                other => other,
-            };
-            CheckResult {
-                name: "libgit2",
-                inference: Inference::Inferred {
-                    value: value.clone(),
-                    source: source.clone(),
+            let floor = parse_alternative(entry)
+                .and_then(|(_, relations)| bounds_from_relations(&relations).0);
+            PackagingState::Archive {
+                requirement: Requirement::Single {
+                    package: "dh-cargo".to_owned(),
+                    floor,
+                    ceiling: None,
                 },
-                archive_status: final_status,
-                guidance,
-                url,
+                evidence,
             }
         }
-        Inference::CouldNotInfer(reason) => CheckResult {
-            name: "libgit2",
-            inference: Inference::CouldNotInfer(reason.clone()),
-            archive_status: ArchiveStatus::CheckFailed(reason.clone()),
-            guidance,
-            url: lp_source_url(release, "libgit2"),
-        },
+        None => {
+            let mut evidence =
+                vec!["debian/control: no dh-cargo entry in Build-Depends".to_owned()];
+            let mut issues = Vec::new();
+            match &invocation {
+                Some((lineno, line)) => issues.push(format!(
+                    "dh-cargo was removed from Build-Depends but debian/rules:{lineno} still \
+                     invokes the vendored-sources check ({line}); remove that invocation"
+                )),
+                None => evidence.push(
+                    "debian/rules: no active dh-cargo-vendored-sources invocation".to_owned(),
+                ),
+            }
+            PackagingState::SelfContained {
+                summary: "already disabled — the build does not require dh-cargo".to_owned(),
+                evidence,
+                issues,
+                tarball_regen: false,
+            }
+        }
     }
 }
 
-/// Check whether dh-cargo (>= 28ubuntu1~) is available in the target release.
+/// Check whether dh-cargo is available (new enough) in the target release, or
+/// whether it has already been disabled.
 pub async fn check_dh_cargo(repo_dir: &Path, release: &str) -> CheckResult {
-    let inference = infer_dh_cargo(repo_dir);
+    let state = assess_dh_cargo(repo_dir);
+    let url = match &state {
+        PackagingState::Archive { .. } => lp_source_url(release, "dh-cargo"),
+        _ => String::new(),
+    };
     let guidance = "Comment out dh-cargo from Build-Depends in debian/control \
                     and debian/control.in; remove the dh-cargo-vendored-sources \
                     check from debian/rules.";
+    finalize_check("dh-cargo", state, guidance, url, release, false).await
+}
 
-    match &inference {
-        Inference::Inferred { value, source } => {
-            let url = lp_source_url(release, "dh-cargo");
-            let status = check_archive("dh-cargo", release).await;
-            let final_status = if value.is_empty() {
-                status
-            } else {
-                match status {
-                    ArchiveStatus::Available(available) => {
-                        if dpkg_compare_versions(&available, "ge", value).await {
-                            ArchiveStatus::Available(available)
-                        } else {
-                            ArchiveStatus::TooOld {
-                                available,
-                                required: value.clone(),
-                            }
-                        }
-                    }
-                    other => other,
+/// How the package satisfies its pkg-config requirement.
+///
+/// The documented fallback (replacing `pkgconf` with `pkg-config`) is
+/// recognized when `pkg-config` is declared in Build-Depends and
+/// `debian/rules` exports `PKG_CONFIG=pkg-config`; a missing export is a
+/// half-applied fix.
+fn assess_pkgconf(repo_dir: &Path) -> PackagingState {
+    let Some(field) = build_depends_field(repo_dir) else {
+        return control_unreadable();
+    };
+    let entries = split_entries(&field);
+    let pkgconf_entries = entries_for(&entries, "pkgconf");
+    let pkg_config_entries = entries_for(&entries, "pkg-config");
+
+    match (pkgconf_entries.is_empty(), pkg_config_entries.is_empty()) {
+        (false, false) => {
+            // A deliberate alternative (`pkgconf | pkg-config`) works without
+            // the export — pkgconf ships the pkg-config drop-in binary.
+            if pkgconf_entries
+                .iter()
+                .any(|entry| contains_word(entry, "pkg-config"))
+            {
+                PackagingState::Archive {
+                    requirement: Requirement::Single {
+                        package: "pkgconf".to_owned(),
+                        floor: None,
+                        ceiling: None,
+                    },
+                    evidence: pkgconf_entries
+                        .iter()
+                        .map(|entry| format!("debian/control: {entry}"))
+                        .collect(),
                 }
-            };
-            CheckResult {
-                name: "dh-cargo",
-                inference: Inference::Inferred {
-                    value: value.clone(),
-                    source: source.clone(),
-                },
-                archive_status: final_status,
-                guidance,
-                url,
+            } else {
+                PackagingState::Unknown {
+                    summary: "both pkgconf and pkg-config appear in Build-Depends; remove \
+                         pkgconf if the pkg-config fallback was intended"
+                        .to_owned(),
+                    evidence: pkgconf_entries
+                        .iter()
+                        .chain(pkg_config_entries.iter())
+                        .map(|entry| format!("debian/control: {entry}"))
+                        .collect(),
+                }
             }
         }
-        Inference::CouldNotInfer(reason) => CheckResult {
-            name: "dh-cargo",
-            inference: Inference::CouldNotInfer(reason.clone()),
-            archive_status: ArchiveStatus::CheckFailed(reason.clone()),
-            guidance,
-            url: lp_source_url(release, "dh-cargo"),
+        (false, true) => PackagingState::Archive {
+            requirement: Requirement::Single {
+                package: "pkgconf".to_owned(),
+                floor: None,
+                ceiling: None,
+            },
+            evidence: pkgconf_entries
+                .iter()
+                .map(|entry| format!("debian/control: {entry}"))
+                .collect(),
+        },
+        (true, false) => {
+            let export = read_debian_file(repo_dir, "debian/rules")
+                .as_deref()
+                .and_then(pkg_config_setting);
+            let evidence: Vec<String> = pkg_config_entries
+                .iter()
+                .map(|entry| format!("debian/control: {entry}"))
+                .collect();
+            match export {
+                Some((true, lineno, line)) => {
+                    let mut evidence = evidence;
+                    evidence.push(format!("debian/rules:{lineno}: {line}"));
+                    PackagingState::SelfContained {
+                        summary: "already switched to pkg-config".to_owned(),
+                        evidence,
+                        issues: Vec::new(),
+                        tarball_regen: false,
+                    }
+                }
+                Some((false, lineno, line)) => PackagingState::SelfContained {
+                    summary: "pkg-config is declared but the debian/rules setting is not \
+                         exported"
+                        .to_owned(),
+                    evidence: {
+                        let mut evidence = evidence;
+                        evidence.push(format!("debian/rules:{lineno}: {line}"));
+                        evidence
+                    },
+                    issues: vec![format!(
+                        "export the setting (e.g. 'export PKG_CONFIG=pkg-config') so make \
+                         passes it to the build commands; as written ({line}) it only \
+                         defines a make variable and never reaches the build"
+                    )],
+                    tarball_regen: false,
+                },
+                None => PackagingState::SelfContained {
+                    summary: "pkg-config is declared but debian/rules does not export \
+                         PKG_CONFIG=pkg-config"
+                        .to_owned(),
+                    evidence,
+                    issues: vec![
+                        "add 'export PKG_CONFIG=pkg-config' to debian/rules so Cargo uses \
+                         pkg-config instead of pkgconf"
+                            .to_owned(),
+                    ],
+                    tarball_regen: false,
+                },
+            }
+        }
+        (true, true) => PackagingState::Unknown {
+            summary: "neither pkgconf nor pkg-config found in debian/control Build-Depends"
+                .to_owned(),
+            evidence: Vec::new(),
         },
     }
 }
 
-/// Check whether pkgconf is available in the target release's archive.
+/// Check whether pkgconf is available in the target release's archive, or
+/// whether the pkg-config fallback has already been applied.
 pub async fn check_pkgconf(repo_dir: &Path, release: &str) -> CheckResult {
-    let inference = infer_pkgconf(repo_dir);
+    let state = assess_pkgconf(repo_dir);
+    let url = match &state {
+        PackagingState::Archive { .. } => lp_source_url(release, "pkgconf"),
+        _ => String::new(),
+    };
     let guidance = "Replace pkgconf with pkg-config in debian/control and \
                     debian/control.in; add 'export PKG_CONFIG=pkg-config' to \
                     debian/rules.";
+    finalize_check("pkgconf", state, guidance, url, release, false).await
+}
 
-    match &inference {
-        Inference::Inferred { value, source } => {
-            // When pkg-config is already used, no action is needed.
-            if value == "pkg-config" {
-                return CheckResult {
-                    name: "pkgconf",
-                    inference: Inference::Inferred {
-                        value: value.clone(),
-                        source: source.clone(),
-                    },
-                    archive_status: ArchiveStatus::Available(
-                        "pkg-config (already in use)".to_owned(),
-                    ),
-                    guidance: "",
-                    url: lp_source_url(release, "pkgconf"),
-                };
-            }
-            let url = lp_source_url(release, "pkgconf");
-            let status = check_archive("pkgconf", release).await;
-            CheckResult {
-                name: "pkgconf",
-                inference: Inference::Inferred {
-                    value: value.clone(),
-                    source: source.clone(),
-                },
-                archive_status: status,
-                guidance,
-                url,
-            }
+/// How the package satisfies its cmake requirement: the declared alternatives
+/// (`cmake`, `cmake3`, `cmake-mozilla`) are evaluated in order, each with its
+/// own version constraint.
+fn assess_cmake(repo_dir: &Path) -> PackagingState {
+    let Some(field) = build_depends_field(repo_dir) else {
+        return control_unreadable();
+    };
+    let entries = split_entries(&field);
+    let is_cmake_provider = |name: &str| matches!(name, "cmake" | "cmake3" | "cmake-mozilla");
+    let entry = entries.iter().find(|entry| {
+        entry.split('|').any(
+            |alt| matches!(parse_alternative(alt), Some((ref name, _)) if is_cmake_provider(name)),
+        )
+    });
+    let Some(entry) = entry else {
+        return PackagingState::Unknown {
+            summary: "no cmake entry found in debian/control Build-Depends".to_owned(),
+            evidence: Vec::new(),
+        };
+    };
+    let mut alternatives = Vec::new();
+    for alt in entry.split('|') {
+        if let Some((name, relations)) = parse_alternative(alt)
+            && is_cmake_provider(&name)
+        {
+            let (floor, _) = bounds_from_relations(&relations);
+            alternatives.push((name, floor));
         }
-        Inference::CouldNotInfer(reason) => CheckResult {
-            name: "pkgconf",
-            inference: Inference::CouldNotInfer(reason.clone()),
-            archive_status: ArchiveStatus::CheckFailed(reason.clone()),
-            guidance,
-            url: lp_source_url(release, "pkgconf"),
-        },
+    }
+    PackagingState::Archive {
+        requirement: Requirement::Alternatives(alternatives),
+        evidence: vec![format!("debian/control: {entry}")],
     }
 }
 
-/// Check whether cmake (>= 3.0) is available in the target release's archive.
+/// Check whether one of the declared cmake alternatives is available in the
+/// target release's archive.
 pub async fn check_cmake(repo_dir: &Path, release: &str) -> CheckResult {
-    let inference = infer_cmake(repo_dir);
+    let state = assess_cmake(repo_dir);
+    let url = match &state {
+        PackagingState::Archive {
+            requirement: Requirement::Alternatives(alternatives),
+            ..
+        } => alternatives
+            .first()
+            .map(|(package, _)| lp_source_url(release, package))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
     let guidance = "Add cmake-mozilla (>= 3.0) as a fallback cmake provider in \
                     debian/control and debian/control.in.";
+    finalize_check("cmake", state, guidance, url, release, false).await
+}
 
-    match &inference {
-        Inference::Inferred { value, source } => {
-            let url = lp_source_url(release, "cmake");
-            let status = check_archive("cmake", release).await;
-            let final_status = if value.is_empty() {
-                status
-            } else {
-                match status {
-                    ArchiveStatus::Available(available) => {
-                        if dpkg_compare_versions(&available, "ge", value).await {
-                            ArchiveStatus::Available(available)
-                        } else {
-                            ArchiveStatus::TooOld {
-                                available,
-                                required: value.clone(),
-                            }
-                        }
-                    }
-                    other => other,
-                }
-            };
-            CheckResult {
-                name: "cmake",
-                inference: Inference::Inferred {
-                    value: value.clone(),
-                    source: source.clone(),
-                },
-                archive_status: final_status,
-                guidance,
-                url,
-            }
-        }
-        Inference::CouldNotInfer(reason) => CheckResult {
-            name: "cmake",
-            inference: Inference::CouldNotInfer(reason.clone()),
-            archive_status: ArchiveStatus::CheckFailed(reason.clone()),
-            guidance,
-            url: lp_source_url(release, "cmake"),
+/// How the package satisfies its debhelper-compat requirement.
+fn assess_debhelper_compat(repo_dir: &Path) -> PackagingState {
+    let Some(field) = build_depends_field(repo_dir) else {
+        return control_unreadable();
+    };
+    let entries = split_entries(&field);
+    let Some(entry) = entries_for(&entries, "debhelper-compat").into_iter().next() else {
+        return PackagingState::Unknown {
+            summary: "no debhelper-compat entry found in debian/control Build-Depends".to_owned(),
+            evidence: Vec::new(),
+        };
+    };
+    let floor =
+        parse_alternative(&entry).and_then(|(_, relations)| bounds_from_relations(&relations).0);
+    PackagingState::Archive {
+        requirement: Requirement::Single {
+            package: "debhelper".to_owned(),
+            floor,
+            ceiling: None,
         },
+        evidence: vec![format!("debian/control: {entry}")],
     }
 }
 
-/// Check whether the required debhelper-compat level is available in the
-/// target release's archive.
+/// Check whether the required debhelper-compat level is supported by the
+/// debhelper in the target release's archive. When attention is needed, also
+/// report `.install.in` files still using `${env:...}` substitution, which
+/// must be converted when downgrading the compat level.
 pub async fn check_debhelper_compat(repo_dir: &Path, release: &str) -> CheckResult {
-    let inference = infer_debhelper_compat(repo_dir);
+    let state = assess_debhelper_compat(repo_dir);
     let guidance = "Downgrade the debhelper-compat level in debian/control and \
                     debian/control.in, and update .install.in substitution \
                     variables to match the lower compat level.";
-
-    match &inference {
-        Inference::Inferred { value, source } => {
-            let url = lp_source_url(release, "debhelper");
-            let status = check_archive("debhelper", release).await;
-            let final_status = match status {
-                ArchiveStatus::Available(available) => {
-                    // Compare the debhelper archive version against the
-                    // required compat level (treated as a version floor).
-                    if dpkg_compare_versions(&available, "ge", value).await {
-                        ArchiveStatus::Available(available)
-                    } else {
-                        ArchiveStatus::TooOld {
-                            available,
-                            required: value.clone(),
-                        }
-                    }
-                }
-                other => other,
-            };
-            CheckResult {
-                name: "debhelper-compat",
-                inference: Inference::Inferred {
-                    value: value.clone(),
-                    source: source.clone(),
-                },
-                archive_status: final_status,
-                guidance,
-                url,
+    let mut result = finalize_check(
+        "debhelper-compat",
+        state,
+        guidance,
+        lp_source_url(release, "debhelper"),
+        release,
+        false,
+    )
+    .await;
+    if result.outcome.kind == OutcomeKind::NeedsAttention {
+        let leftovers = install_in_env_substitutions(repo_dir);
+        if leftovers.is_empty() {
+            result
+                .outcome
+                .evidence
+                .push("no debian/*.install.in file uses ${env:...} substitution".to_owned());
+        } else {
+            for file in leftovers {
+                result.outcome.evidence.push(format!(
+                    "{file} still uses ${{env:...}} substitution; switch it to \
+                     @VARIABLE@ when downgrading the compat level"
+                ));
             }
         }
-        Inference::CouldNotInfer(reason) => CheckResult {
-            name: "debhelper-compat",
-            inference: Inference::CouldNotInfer(reason.clone()),
-            archive_status: ArchiveStatus::CheckFailed(reason.clone()),
-            guidance,
-            url: lp_source_url(release, "debhelper"),
-        },
     }
+    result
 }
 
 /// Run all six compatibility checks and return the results in display order.
@@ -744,8 +1569,9 @@ pub async fn run_all_checks(repo_dir: &Path, release: &str) -> Vec<CheckResult> 
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
-    fn temp_repo() -> std::path::PathBuf {
+    fn temp_repo() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "thermite-compat-{}",
             std::time::SystemTime::now()
@@ -758,6 +1584,7 @@ mod tests {
     }
 
     fn write(repo: &std::path::Path, name: &str, content: &str) {
+        fs::create_dir_all(repo.join(name).parent().unwrap()).unwrap();
         fs::write(repo.join(name), content).unwrap();
     }
 
@@ -844,219 +1671,142 @@ llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe | source
         );
     }
 
-    // ── infer_llvm_version ─────────────────────────────────────────────────
+    // ── packaging readers ──────────────────────────────────────────────────
 
     #[test]
-    fn infer_llvm_version_from_rules() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/rules",
-            "#!/usr/bin/make -f\nLLVM_VERSION = 19\nOLD_LLVM_VERSION = 18\n",
+    fn folded_field_joins_continuation_lines() {
+        let content =
+            "Source: rustc-1.85\nBuild-Depends:\n a,\n b (>= 1),\nStandards-Version: 4.6\n";
+        assert_eq!(
+            folded_field(content, "Build-Depends").as_deref(),
+            Some("a, b (>= 1),")
         );
-        match infer_llvm_version(&repo) {
-            Inference::Inferred { value, source } => {
-                assert_eq!(value, "19");
-                assert!(source.contains("LLVM_VERSION = 19"));
-            }
-            other => panic!("expected Inferred, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
-    fn infer_llvm_version_skips_commented_assignment() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/rules",
-            "# # Use system LLVM (comment out to use vendored LLVM)\n# LLVM_VERSION = 19\n",
+    fn folded_field_handles_same_line_value() {
+        let content = "Build-Depends: debhelper (>= 9), pkgconf\nArchitecture: any\n";
+        assert_eq!(
+            folded_field(content, "Build-Depends").as_deref(),
+            Some("debhelper (>= 9), pkgconf")
         );
-        assert!(matches!(
-            infer_llvm_version(&repo),
-            Inference::CouldNotInfer(_)
-        ));
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
-    fn infer_llvm_version_missing_returns_could_not_infer() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/rules",
-            "#!/usr/bin/make -f\nall:\n\techo hi\n",
+    fn folded_field_finds_files_excluded() {
+        let content = "Format: ...Files-Excluded-Compressed: xz\nFiles-Excluded:\n src/llvm-project\n vendor/openssl-src-*\nComment: x\n";
+        assert_eq!(
+            folded_field(content, "Files-Excluded").as_deref(),
+            Some("src/llvm-project vendor/openssl-src-*")
         );
-        assert!(matches!(
-            infer_llvm_version(&repo),
-            Inference::CouldNotInfer(_)
-        ));
-        let _ = fs::remove_dir_all(&repo);
     }
 
-    // ── infer_libgit2_version ──────────────────────────────────────────────
-
     #[test]
-    fn infer_libgit2_version_with_constraint() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Source: rustc-1.85\nBuild-Depends:\n libgit2-dev (>= 1.9.0~~),\n libssl-dev,\n",
+    fn folded_field_skips_comments_inside_the_field() {
+        // debian/control routinely carries full-line comments inside a folded
+        // field; they must not terminate it.
+        let content =
+            "Build-Depends:\n debhelper (>= 9),\n# needed by some vendor crates\n pkgconf,\n";
+        assert_eq!(
+            folded_field(content, "Build-Depends").as_deref(),
+            Some("debhelper (>= 9), pkgconf,")
         );
-        match infer_libgit2_version(&repo) {
-            Inference::Inferred { value, .. } => assert_eq!(value, "1.9.0~~"),
-            other => panic!("expected Inferred, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
-    fn infer_libgit2_version_without_constraint() {
-        let repo = temp_repo();
-        write(&repo, "debian/control", "Build-Depends:\n libgit2-dev,\n");
-        match infer_libgit2_version(&repo) {
-            Inference::Inferred { value, .. } => assert!(value.is_empty()),
-            other => panic!("expected Inferred, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&repo);
+    fn folded_field_returns_none_when_absent() {
+        assert!(folded_field("Source: x\n", "Build-Depends").is_none());
     }
 
     #[test]
-    fn infer_libgit2_version_absent_returns_could_not_infer() {
-        let repo = temp_repo();
-        write(&repo, "debian/control", "Build-Depends:\n libssl-dev,\n");
-        assert!(matches!(
-            infer_libgit2_version(&repo),
-            Inference::CouldNotInfer(_)
-        ));
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    // ── infer_dh_cargo ─────────────────────────────────────────────────────
-
-    #[test]
-    fn infer_dh_cargo_with_constraint() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Build-Depends:\n dh-cargo (>= 28ubuntu1~),\n",
+    fn split_entries_ignores_commas_in_parens() {
+        let entries = split_entries("cmake (>= 3.0, << 4), pkgconf, python3:native");
+        assert_eq!(
+            entries,
+            ["cmake (>= 3.0, << 4)", "pkgconf", "python3:native"]
         );
-        match infer_dh_cargo(&repo) {
-            Inference::Inferred { value, .. } => assert_eq!(value, "28ubuntu1~"),
-            other => panic!("expected Inferred, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
-    fn infer_dh_cargo_absent_returns_could_not_infer() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Build-Depends:\n debhelper (>= 13),\n",
+    fn parse_alternative_reads_relations() {
+        let (name, relations) = parse_alternative("libgit2-dev (>= 1.9.0~~)").expect("parsed");
+        assert_eq!(name, "libgit2-dev");
+        assert_eq!(relations, [(">=".to_owned(), "1.9.0~~".to_owned())]);
+    }
+
+    #[test]
+    fn parse_alternative_ignores_annotations() {
+        let (name, relations) = parse_alternative("cargo-1.96 <!nocheck>").expect("parsed");
+        assert_eq!(name, "cargo-1.96");
+        assert!(relations.is_empty());
+    }
+
+    #[test]
+    fn normalize_floor_keeps_single_tilde_and_strips_double() {
+        assert_eq!(normalize_floor("1.9.0~~"), "1.9.0");
+        assert_eq!(normalize_floor("28ubuntu1~"), "28ubuntu1~");
+        assert_eq!(normalize_floor("13"), "13");
+        assert_eq!(normalize_floor("*"), "*");
+    }
+
+    #[test]
+    fn rules_llvm_major_accepts_make_assignments() {
+        assert_eq!(
+            rules_llvm_major("#!/usr/bin/make -f\nLLVM_VERSION = 19\nOLD_LLVM_VERSION = 18\n"),
+            Some("19".to_owned())
         );
-        assert!(matches!(infer_dh_cargo(&repo), Inference::CouldNotInfer(_)));
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    // ── infer_pkgconf ──────────────────────────────────────────────────────
-
-    #[test]
-    fn infer_pkgconf_present() {
-        let repo = temp_repo();
-        write(&repo, "debian/control", "Build-Depends:\n pkgconf,\n");
-        match infer_pkgconf(&repo) {
-            Inference::Inferred { value, .. } => assert_eq!(value, "present"),
-            other => panic!("expected Inferred, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn infer_pkgconf_pkg_config_in_use() {
-        let repo = temp_repo();
-        write(&repo, "debian/control", "Build-Depends:\n pkg-config,\n");
-        match infer_pkgconf(&repo) {
-            Inference::Inferred { value, .. } => assert_eq!(value, "pkg-config"),
-            other => panic!("expected Inferred, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn infer_pkgconf_absent_returns_could_not_infer() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Build-Depends:\n debhelper (>= 13),\n",
+        assert_eq!(
+            rules_llvm_major("LLVM_VERSION := 19\n"),
+            Some("19".to_owned())
         );
-        assert!(matches!(infer_pkgconf(&repo), Inference::CouldNotInfer(_)));
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    // ── infer_cmake ────────────────────────────────────────────────────────
-
-    #[test]
-    fn infer_cmake_with_constraint() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Build-Depends:\n cmake (>= 3.0) | cmake3,\n",
+        assert_eq!(
+            rules_llvm_major("LLVM_VERSION ?= 19\n"),
+            Some("19".to_owned())
         );
-        match infer_cmake(&repo) {
-            Inference::Inferred { value, .. } => assert_eq!(value, "3.0"),
-            other => panic!("expected Inferred, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&repo);
+        assert_eq!(rules_llvm_major("# LLVM_VERSION = 19\n"), None);
+        assert_eq!(rules_llvm_major("LLVM_VERSION_MAJOR := 19\n"), None);
+        assert_eq!(rules_llvm_major("LLVM_VERSION = $(shell echo 19)\n"), None);
     }
 
     #[test]
-    fn infer_cmake_skips_cmake_mozilla() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Build-Depends:\n cmake-mozilla (>= 3.0),\n",
+    fn llvm_major_from_llvm_config_reads_both_path_shapes() {
+        assert_eq!(
+            llvm_major_from_llvm_config(r#"llvm-config = "/usr/lib/llvm-18/bin/llvm-config""#),
+            Some("18".to_owned())
         );
-        assert!(matches!(infer_cmake(&repo), Inference::CouldNotInfer(_)));
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    // ── infer_debhelper_compat ─────────────────────────────────────────────
-
-    #[test]
-    fn infer_debhelper_compat_equals() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Build-Depends:\n debhelper-compat (= 13),\n",
+        assert_eq!(
+            llvm_major_from_llvm_config(r#"llvm-config = "/usr/bin/llvm-config-19""#),
+            Some("19".to_owned())
         );
-        match infer_debhelper_compat(&repo) {
-            Inference::Inferred { value, .. } => assert_eq!(value, "13"),
-            other => panic!("expected Inferred, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&repo);
+        // Template placeholders carry no version digits.
+        assert_eq!(
+            llvm_major_from_llvm_config(
+                r#"llvm-config = "LLVM_DESTDIR/usr/lib/llvm-LLVM_VERSION/bin/llvm-config""#
+            ),
+            None
+        );
     }
 
     #[test]
-    fn infer_debhelper_compat_absent_returns_could_not_infer() {
-        let repo = temp_repo();
-        write(
-            &repo,
-            "debian/control",
-            "Build-Depends:\n debhelper (>= 13),\n",
-        );
-        assert!(matches!(
-            infer_debhelper_compat(&repo),
-            Inference::CouldNotInfer(_)
-        ));
-        let _ = fs::remove_dir_all(&repo);
+    fn pkg_config_setting_prefers_exported_lines_and_flags_unexported_ones() {
+        let rules = "export LIBSSH2_SYS_USE_PKG_CONFIG=1\nexport PKG_CONFIG=pkg-config\n";
+        let (exported, lineno, line) = pkg_config_setting(rules).expect("found");
+        assert!(exported);
+        assert_eq!(lineno, 2);
+        assert!(line.contains("PKG_CONFIG=pkg-config"));
+        // Unexported `?=` never reaches the build commands.
+        let (exported, _, _) = pkg_config_setting("PKG_CONFIG ?= pkg-config\n").expect("found");
+        assert!(!exported);
+        let (exported, _, _) =
+            pkg_config_setting("export PKG_CONFIG ?= pkg-config\n").expect("found");
+        assert!(exported);
+        // An exported line wins over a later unexported one.
+        let (exported, _, _) =
+            pkg_config_setting("export PKG_CONFIG=pkg-config\nPKG_CONFIG ?= pkg-config\n")
+                .expect("found");
+        assert!(exported);
+        assert!(pkg_config_setting("export LIBSSH2_SYS_USE_PKG_CONFIG=1\n").is_none());
+        assert!(pkg_config_setting("# export PKG_CONFIG=pkg-config\n").is_none());
     }
 
     // ── word-boundary helpers ──────────────────────────────────────────────
@@ -1074,6 +1824,8 @@ llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe | source
         // boundary.
         assert!(!contains_word("pkg-config", "pkgconf"));
         assert!(!contains_word("cmake-mozilla", "cmake"));
+        assert!(!contains_word("cmake3", "cmake"));
+        assert!(!contains_word("libgit2-dev", "libgit2"));
     }
 
     #[test]
@@ -1082,32 +1834,883 @@ llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe | source
         assert_eq!(find_word("pkg-config", "pkgconf"), None);
     }
 
-    // ── CheckResult::is_ok ─────────────────────────────────────────────────
+    // ── LLVM ───────────────────────────────────────────────────────────────
 
     #[test]
-    fn check_result_is_ok_only_when_available() {
+    fn assess_llvm_vendored_is_satisfied() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/rules",
+            "LLVM_MAJOR := $(shell sed -n 's/x/x/' \\\n  $(CURDIR)/src/llvm-project/cmake/Modules/LLVMVersion.cmake)\n",
+        );
+        write(
+            &repo,
+            "debian/copyright",
+            "Files-Excluded:\n vendor/openssl-src-*\n",
+        );
+        write(
+            &repo,
+            "debian/bootstrap.toml.in",
+            "download-ci-llvm = false\n",
+        );
+        write(&repo, "src/llvm-project/llvm/CMakeLists.txt", "cmake\n");
+        match assess_llvm(&repo) {
+            PackagingState::SelfContained {
+                summary,
+                evidence,
+                issues,
+                tarball_regen,
+            } => {
+                assert!(issues.is_empty());
+                assert!(!tarball_regen);
+                assert!(summary.contains("already vendored"));
+                assert!(evidence.iter().any(|e| e.contains("CMakeLists.txt")));
+                assert!(evidence.iter().any(|e| e.contains("bootstrap.toml.in")));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_vendored_with_leftover_build_depends_needs_attention() {
+        // The runbook's vendoring removes the versioned LLVM toolchain
+        // packages from Build-Depends; a half-applied fix leaves them.
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n llvm-19-dev:native,\n \
+             llvm-19-tools:native,\n libclang-rt-19-dev (>= 1:19.1.2),\n \
+             libclang-common-19-dev (>= 1:19.1.2),\n cmake (>= 3.0),\n",
+        );
+        write(&repo, "src/llvm-project/llvm/CMakeLists.txt", "cmake\n");
+        write(
+            &repo,
+            "debian/bootstrap.toml.in",
+            "download-ci-llvm = false\n",
+        );
+        match assess_llvm(&repo) {
+            PackagingState::SelfContained {
+                evidence, issues, ..
+            } => {
+                assert_eq!(issues.len(), 1);
+                let issue = &issues[0];
+                assert!(issue.contains("llvm-19-dev:native"));
+                assert!(issue.contains("libclang-rt-19-dev"));
+                assert!(issue.contains("libclang-common-19-dev"));
+                assert!(evidence.iter().any(|e| e.contains("llvm-19-tools:native")));
+                // Unversioned and unrelated entries are not flagged.
+                assert!(!issue.contains("cmake"));
+                assert!(!issue.contains("debhelper"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_vendored_leftover_spotted_in_build_depends_indep() {
+        // The runbook also removes `clang-<N>:native` from
+        // Build-Depends-Indep.
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n\nBuild-Depends-Indep:\n \
+             clang-19:native,\n libssl-dev,\n",
+        );
+        write(&repo, "src/llvm-project/llvm/CMakeLists.txt", "cmake\n");
+        match assess_llvm(&repo) {
+            PackagingState::SelfContained { issues, .. } => {
+                assert!(issues[0].contains("clang-19:native"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_unversioned_config_line_is_unknown_with_honest_evidence() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/bootstrap.toml.in",
+            "llvm-config = \"/usr/bin/llvm-config\"\n",
+        );
+        match assess_llvm(&repo) {
+            PackagingState::Unknown { evidence, .. } => {
+                let joined = evidence.join("\n");
+                assert!(joined.contains("/usr/bin/llvm-config"));
+                assert!(joined.contains("major version could not be determined"));
+                // The old text claimed no line pointed at /usr — wrong here.
+                assert!(!joined.contains("has no llvm-config line"));
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_vendored_with_unversioned_config_line_needs_attention() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/bootstrap.toml.in",
+            "llvm-config = \"/usr/bin/llvm-config\"\n",
+        );
+        write(&repo, "src/llvm-project/llvm/CMakeLists.txt", "cmake\n");
+        match assess_llvm(&repo) {
+            PackagingState::SelfContained {
+                evidence, issues, ..
+            } => {
+                assert!(issues.iter().any(|i| i.contains("/usr/bin/llvm-config")));
+                // The old text claimed no line pointed at /usr — wrong here.
+                assert!(
+                    !evidence
+                        .iter()
+                        .any(|e| e.contains("does not point llvm-config"))
+                );
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn is_llvm_toolchain_entry_matches_versioned_names_only() {
+        for entry in [
+            "llvm-19-dev:native",
+            "llvm-19-tools:native",
+            "libclang-rt-19-dev (>= 1:19.1.2)",
+            "libclang-common-19-dev",
+            "clang-19:native",
+            "llvm-19",
+        ] {
+            assert!(is_llvm_toolchain_entry(entry), "{entry} should match");
+        }
+        for entry in [
+            "llvm-dev",
+            "libclang-dev",
+            "clang",
+            "clang-format",
+            "cargo-1.97",
+            "rustc-1.97",
+            "cmake (>= 3.0)",
+            "debhelper (>= 9)",
+        ] {
+            assert!(!is_llvm_toolchain_entry(entry), "{entry} should not match");
+        }
+    }
+
+    #[test]
+    fn assess_llvm_vendored_but_excluded_needs_attention() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/copyright",
+            "Files-Excluded:\n src/llvm-project\n",
+        );
+        write(&repo, "src/llvm-project/llvm/CMakeLists.txt", "cmake\n");
+        match assess_llvm(&repo) {
+            PackagingState::SelfContained {
+                issues,
+                tarball_regen,
+                ..
+            } => {
+                assert_eq!(issues.len(), 1);
+                assert!(issues[0].contains("Files-Excluded"));
+                assert!(tarball_regen);
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_unknown_reports_both_sides() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/copyright",
+            "Files-Excluded:\n vendor/openssl-src-*\n",
+        );
+        match assess_llvm(&repo) {
+            PackagingState::Unknown { evidence, .. } => {
+                let joined = evidence.join("\n");
+                assert!(joined.contains("LLVM_VERSION"));
+                assert!(joined.contains("src/llvm-project"));
+                assert!(joined.contains("does not establish"));
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_system_from_rules() {
+        let repo = temp_repo();
+        write(&repo, "debian/rules", "LLVM_VERSION = 19\n");
+        match assess_llvm(&repo) {
+            PackagingState::Archive {
+                requirement,
+                evidence,
+            } => {
+                match requirement {
+                    Requirement::Single {
+                        package,
+                        floor,
+                        ceiling,
+                    } => {
+                        assert_eq!(package, "llvm-toolchain-19");
+                        assert_eq!(floor.as_deref(), Some("19"));
+                        assert!(ceiling.is_none());
+                    }
+                    other => panic!("expected Single, got {other:?}"),
+                }
+                assert!(evidence.iter().any(|e| e.contains("LLVM_VERSION = 19")));
+            }
+            other => panic!("expected Archive, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_system_from_config_template() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/config.toml.in",
+            "llvm-config = \"/usr/lib/llvm-18/bin/llvm-config\"\n",
+        );
+        match assess_llvm(&repo) {
+            PackagingState::Archive {
+                requirement,
+                evidence,
+            } => {
+                match requirement {
+                    Requirement::Single { package, .. } => {
+                        assert_eq!(package, "llvm-toolchain-18");
+                    }
+                    other => panic!("expected Single, got {other:?}"),
+                }
+                assert!(evidence.iter().any(|e| e.contains("config.toml.in")));
+            }
+            other => panic!("expected Archive, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    // ── libgit2 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn assess_libgit2_vendored_is_satisfied() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n pkgconf,\n",
+        );
+        write(
+            &repo,
+            "debian/copyright",
+            "Files-Excluded:\n vendor/libssh2-sys-*/libssh2\n",
+        );
+        write(
+            &repo,
+            "src/tools/cargo/Cargo.toml",
+            "[features]\nvendored-libgit2 = [\"libgit2-sys/vendored\"]\n",
+        );
+        write(
+            &repo,
+            "vendor/libgit2-sys-0.18.2+1.9.1/libgit2/CMakeLists.txt",
+            "cmake\n",
+        );
+        write(
+            &repo,
+            "vendor/libgit2-sys-0.18.3+1.9.2/libgit2/CMakeLists.txt",
+            "cmake\n",
+        );
+        match assess_libgit2(&repo) {
+            PackagingState::SelfContained {
+                summary,
+                evidence,
+                issues,
+                tarball_regen,
+            } => {
+                assert!(issues.is_empty());
+                assert!(!tarball_regen);
+                assert!(summary.contains("already vendored"));
+                let joined = evidence.join("\n");
+                assert!(joined.contains("0.18.2+1.9.1"));
+                assert!(joined.contains("0.18.3+1.9.2"));
+                assert!(joined.contains("does not exclude"));
+                assert!(joined.contains("libhttp-parser-dev is not in Build-Depends"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_libgit2_vendored_but_excluded_needs_attention() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n",
+        );
+        write(
+            &repo,
+            "debian/copyright",
+            "Files-Excluded:\n vendor/libgit2-sys-*/libgit2\n",
+        );
+        write(
+            &repo,
+            "vendor/libgit2-sys-0.18.2+1.9.1/libgit2/CMakeLists.txt",
+            "cmake\n",
+        );
+        match assess_libgit2(&repo) {
+            PackagingState::SelfContained {
+                issues,
+                tarball_regen,
+                ..
+            } => {
+                assert!(issues.iter().any(|i| i.contains("Files-Excluded")));
+                assert!(tarball_regen);
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_libgit2_feature_stripped_by_patch_needs_attention() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n",
+        );
+        write(
+            &repo,
+            "src/tools/cargo/Cargo.toml",
+            "[features]\nvendored-libgit2 = [\"libgit2-sys/vendored\"]\n",
+        );
+        write(&repo, "debian/patches/series", "ubuntu/x.patch\n");
+        write(
+            &repo,
+            "debian/patches/ubuntu/x.patch",
+            "--- a/src/tools/cargo/Cargo.toml\n+++ b/src/tools/cargo/Cargo.toml\n-vendored-libgit2 = [\"libgit2-sys/vendored\"]\n",
+        );
+        write(
+            &repo,
+            "vendor/libgit2-sys-0.18.2+1.9.1/libgit2/CMakeLists.txt",
+            "cmake\n",
+        );
+        match assess_libgit2(&repo) {
+            PackagingState::SelfContained {
+                evidence, issues, ..
+            } => {
+                assert!(issues.iter().any(|i| i.contains("vendored-libgit2")));
+                assert!(evidence.iter().any(|e| e.contains("ubuntu/x.patch")));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_libgit2_patch_effects_read_series_options() {
+        // A series entry may carry options after the patch path; the path
+        // must still be resolved and its effect detected.
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n",
+        );
+        write(
+            &repo,
+            "src/tools/cargo/Cargo.toml",
+            "[features]\nvendored-libgit2 = [\"libgit2-sys/vendored\"]\n",
+        );
+        write(&repo, "debian/patches/series", "ubuntu/x.patch -p1\n");
+        write(
+            &repo,
+            "debian/patches/ubuntu/x.patch",
+            "--- a/src/tools/cargo/Cargo.toml\n+++ b/src/tools/cargo/Cargo.toml\n-vendored-libgit2 = [\"libgit2-sys/vendored\"]\n",
+        );
+        write(
+            &repo,
+            "vendor/libgit2-sys-0.18.2+1.9.1/libgit2/CMakeLists.txt",
+            "cmake\n",
+        );
+        match assess_libgit2(&repo) {
+            PackagingState::SelfContained { issues, .. } => {
+                assert!(issues.iter().any(|i| i.contains("vendored-libgit2")));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_libgit2_unknown_reports_both_sides() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n",
+        );
+        match assess_libgit2(&repo) {
+            PackagingState::Unknown { evidence, .. } => {
+                let joined = evidence.join("\n");
+                assert!(joined.contains("libgit2-dev"));
+                assert!(joined.contains("vendor/libgit2-sys"));
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_libgit2_system_reads_both_bounds() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n libgit2-dev (>= 1.9.0~~),\n libgit2-dev (<< 1.10~~),\n",
+        );
+        match assess_libgit2(&repo) {
+            PackagingState::Archive { requirement, .. } => match requirement {
+                Requirement::Single {
+                    package,
+                    floor,
+                    ceiling,
+                } => {
+                    assert_eq!(package, "libgit2");
+                    assert_eq!(floor.as_deref(), Some("1.9.0~~"));
+                    assert_eq!(ceiling.as_deref(), Some("1.10~~"));
+                }
+                other => panic!("expected Single, got {other:?}"),
+            },
+            other => panic!("expected Archive, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    // ── dh-cargo ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn assess_dh_cargo_disabled_is_satisfied() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n",
+        );
+        write(
+            &repo,
+            "debian/rules",
+            "# CARGO_BIN=... CARGO_VENDOR_DIR=... debian/dh-cargo-vendored-sources\n",
+        );
+        match assess_dh_cargo(&repo) {
+            PackagingState::SelfContained {
+                summary,
+                evidence,
+                issues,
+                ..
+            } => {
+                assert!(issues.is_empty());
+                assert!(summary.contains("already disabled"));
+                let joined = evidence.join("\n");
+                assert!(joined.contains("no dh-cargo entry"));
+                assert!(joined.contains("no active dh-cargo-vendored-sources"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_dh_cargo_half_disabled_needs_attention() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n",
+        );
+        write(
+            &repo,
+            "debian/rules",
+            "CARGO_BIN=\"x\" CARGO_VENDOR_DIR=y debian/dh-cargo-vendored-sources\n",
+        );
+        match assess_dh_cargo(&repo) {
+            PackagingState::SelfContained { issues, .. } => {
+                assert_eq!(issues.len(), 1);
+                assert!(issues[0].contains("debian/rules:1"));
+                assert!(issues[0].contains("dh-cargo-vendored-sources"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_dh_cargo_active_goes_to_archive() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n dh-cargo (>= 28ubuntu1~),\n",
+        );
+        write(
+            &repo,
+            "debian/rules",
+            "CARGO_BIN=\"x\" CARGO_VENDOR_DIR=y debian/dh-cargo-vendored-sources\n",
+        );
+        match assess_dh_cargo(&repo) {
+            PackagingState::Archive {
+                requirement,
+                evidence,
+            } => {
+                match requirement {
+                    Requirement::Single { package, floor, .. } => {
+                        assert_eq!(package, "dh-cargo");
+                        assert_eq!(floor.as_deref(), Some("28ubuntu1~"));
+                    }
+                    other => panic!("expected Single, got {other:?}"),
+                }
+                assert_eq!(evidence.len(), 2);
+            }
+            other => panic!("expected Archive, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    // ── pkgconf ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn assess_pkgconf_pkg_config_without_export_needs_attention() {
+        let repo = temp_repo();
+        write(&repo, "debian/control", "Build-Depends:\n pkg-config,\n");
+        write(
+            &repo,
+            "debian/rules",
+            "export LIBSSH2_SYS_USE_PKG_CONFIG=1\n",
+        );
+        match assess_pkgconf(&repo) {
+            PackagingState::SelfContained { issues, .. } => {
+                assert_eq!(issues.len(), 1);
+                assert!(issues[0].contains("PKG_CONFIG=pkg-config"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_pkgconf_pkg_config_with_export_is_satisfied() {
+        let repo = temp_repo();
+        write(&repo, "debian/control", "Build-Depends:\n pkg-config,\n");
+        write(
+            &repo,
+            "debian/rules",
+            "export LIBSSH2_SYS_USE_PKG_CONFIG=1\nexport PKG_CONFIG=pkg-config\n",
+        );
+        match assess_pkgconf(&repo) {
+            PackagingState::SelfContained {
+                summary, issues, ..
+            } => {
+                assert!(issues.is_empty());
+                assert!(summary.contains("already switched to pkg-config"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_pkgconf_unexported_setting_is_half_applied() {
+        let repo = temp_repo();
+        write(&repo, "debian/control", "Build-Depends:\n pkg-config,\n");
+        write(
+            &repo,
+            "debian/rules",
+            "export LIBSSH2_SYS_USE_PKG_CONFIG=1\nPKG_CONFIG ?= pkg-config\n",
+        );
+        match assess_pkgconf(&repo) {
+            PackagingState::SelfContained {
+                summary, issues, ..
+            } => {
+                assert!(summary.contains("not exported"));
+                assert_eq!(issues.len(), 1);
+                assert!(issues[0].contains("export PKG_CONFIG=pkg-config"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_pkgconf_alternative_is_archive() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n pkgconf | pkg-config,\n",
+        );
+        match assess_pkgconf(&repo) {
+            PackagingState::Archive {
+                requirement: Requirement::Single { package, .. },
+                evidence,
+            } => {
+                assert_eq!(package, "pkgconf");
+                assert_eq!(evidence, vec!["debian/control: pkgconf | pkg-config"]);
+            }
+            other => panic!("expected Archive, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_pkgconf_both_present_is_unknown() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n pkgconf,\n pkg-config,\n",
+        );
+        assert!(matches!(
+            assess_pkgconf(&repo),
+            PackagingState::Unknown { .. }
+        ));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_pkgconf_present_goes_to_archive() {
+        let repo = temp_repo();
+        write(&repo, "debian/control", "Build-Depends:\n pkgconf,\n");
+        match assess_pkgconf(&repo) {
+            PackagingState::Archive { requirement, .. } => match requirement {
+                Requirement::Single { package, floor, .. } => {
+                    assert_eq!(package, "pkgconf");
+                    assert!(floor.is_none());
+                }
+                other => panic!("expected Single, got {other:?}"),
+            },
+            other => panic!("expected Archive, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    // ── cmake ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn assess_cmake_parses_alternatives_with_constraints() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n cmake (>= 3.0) | cmake3 (>= 3.0) | cmake-mozilla (>= 3.0),\n",
+        );
+        match assess_cmake(&repo) {
+            PackagingState::Archive {
+                requirement,
+                evidence,
+            } => {
+                match requirement {
+                    Requirement::Alternatives(alternatives) => {
+                        assert_eq!(
+                            alternatives,
+                            vec![
+                                ("cmake".to_owned(), Some("3.0".to_owned())),
+                                ("cmake3".to_owned(), Some("3.0".to_owned())),
+                                ("cmake-mozilla".to_owned(), Some("3.0".to_owned())),
+                            ]
+                        );
+                    }
+                    other => panic!("expected Alternatives, got {other:?}"),
+                }
+                assert!(evidence.iter().any(|e| e.contains("cmake-mozilla")));
+            }
+            other => panic!("expected Archive, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_cmake_mozilla_only_entry_is_recognized() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n cmake-mozilla (>= 3.0),\n",
+        );
+        match assess_cmake(&repo) {
+            PackagingState::Archive { requirement, .. } => match requirement {
+                Requirement::Alternatives(alternatives) => {
+                    assert_eq!(alternatives.len(), 1);
+                    assert_eq!(alternatives[0].0, "cmake-mozilla");
+                }
+                other => panic!("expected Alternatives, got {other:?}"),
+            },
+            other => panic!("expected Archive, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_cmake_star_constraint_is_kept() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n cmake (>= *) | cmake3 (>= *),\n",
+        );
+        match assess_cmake(&repo) {
+            PackagingState::Archive { requirement, .. } => match requirement {
+                Requirement::Alternatives(alternatives) => {
+                    assert_eq!(alternatives[0].1.as_deref(), Some("*"));
+                }
+                other => panic!("expected Alternatives, got {other:?}"),
+            },
+            other => panic!("expected Archive, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_cmake_missing_is_unknown() {
+        let repo = temp_repo();
+        write(&repo, "debian/control", "Build-Depends:\n pkgconf,\n");
+        assert!(matches!(
+            assess_cmake(&repo),
+            PackagingState::Unknown { .. }
+        ));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    // ── debhelper-compat ───────────────────────────────────────────────────
+
+    #[test]
+    fn assess_debhelper_compat_reads_level() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper-compat (= 13),\n",
+        );
+        match assess_debhelper_compat(&repo) {
+            PackagingState::Archive { requirement, .. } => match requirement {
+                Requirement::Single { package, floor, .. } => {
+                    assert_eq!(package, "debhelper");
+                    assert_eq!(floor.as_deref(), Some("13"));
+                }
+                other => panic!("expected Single, got {other:?}"),
+            },
+            other => panic!("expected Archive, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_debhelper_compat_missing_is_unknown() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n",
+        );
+        assert!(matches!(
+            assess_debhelper_compat(&repo),
+            PackagingState::Unknown { .. }
+        ));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn install_in_env_substitutions_lists_offending_files() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/libstd-rust-1.97-dev.install.in",
+            "usr/lib/rust-${env:RUST_VERSION}/lib/\n",
+        );
+        write(&repo, "debian/rustc-1.97.install.in", "usr/bin/rustc\n");
+        assert_eq!(
+            install_in_env_substitutions(&repo),
+            vec!["debian/libstd-rust-1.97-dev.install.in".to_owned()]
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    // ── outcome plumbing ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dpkg_version_comparison_sanity() {
+        // `1.9.0~~` sorts below every `1.9.0*`; a single `~` is a real dpkg
+        // revision marker and must be kept.
+        assert!(dpkg_compare_versions("1.9.0", "ge", "1.9.0~~").await);
+        assert!(!dpkg_compare_versions("28", "ge", "28ubuntu1~").await);
+        assert!(dpkg_compare_versions("1.9.1", "lt", "1.10~~").await);
+        assert!(dpkg_compare_versions("3.22.1-1ubuntu1", "ge", "3.0").await);
+    }
+
+    #[test]
+    fn check_result_is_ok_only_for_satisfied_outcomes() {
         let ok = CheckResult {
             name: "test",
-            inference: Inference::Inferred {
-                value: "x".to_owned(),
-                source: "src".to_owned(),
+            outcome: Outcome {
+                kind: OutcomeKind::SatisfiedByPackaging,
+                summary: "already vendored".to_owned(),
+                evidence: vec![],
             },
-            archive_status: ArchiveStatus::Available("1.0".to_owned()),
             guidance: "",
-            url: "u".to_owned(),
+            url: String::new(),
+            needs_tarball_regen: false,
         };
         assert!(ok.is_ok());
 
-        let not_ok = CheckResult {
+        let attention = CheckResult {
             name: "test",
-            inference: Inference::Inferred {
-                value: "x".to_owned(),
-                source: "src".to_owned(),
+            outcome: Outcome {
+                kind: OutcomeKind::NeedsAttention,
+                summary: "too old".to_owned(),
+                evidence: vec![],
             },
-            archive_status: ArchiveStatus::NotPublished,
-            guidance: "",
+            guidance: "fix it",
             url: "u".to_owned(),
+            needs_tarball_regen: true,
         };
-        assert!(!not_ok.is_ok());
+        assert!(!attention.is_ok());
+        assert!(attention.needs_tarball_regen);
+    }
+
+    // ── manual probe (not run by default) ──────────────────────────────────
+
+    /// Print the raw assessments for a real packaging tree, e.g.:
+    /// `THERMITE_COMPAT_PROBE_DIR=../rustc/rustc cargo test --lib \
+    ///  probe_real_tree -- --nocapture`
+    #[test]
+    fn probe_real_tree() {
+        let Some(dir) = std::env::var_os("THERMITE_COMPAT_PROBE_DIR") else {
+            return;
+        };
+        let repo = PathBuf::from(dir);
+        println!("== {repo:?}");
+        for (name, state) in [
+            ("LLVM", assess_llvm(&repo)),
+            ("libgit2", assess_libgit2(&repo)),
+            ("dh-cargo", assess_dh_cargo(&repo)),
+            ("pkgconf", assess_pkgconf(&repo)),
+            ("cmake", assess_cmake(&repo)),
+            ("debhelper-compat", assess_debhelper_compat(&repo)),
+        ] {
+            println!("{name}: {state:#?}");
+        }
     }
 }
