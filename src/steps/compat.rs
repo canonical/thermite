@@ -129,24 +129,53 @@ fn folded_field(content: &str, field: &str) -> Option<String> {
     value
 }
 
-/// The active Build-Depends value from `debian/control`, with the value from
-/// `debian/control.in` appended when that template exists (it is optional and
-/// absent on some backport branches). `None` when `debian/control` itself is
-/// missing or unreadable.
+/// `PackagingState` for a tree whose `debian/control` could not be read;
+/// every Build-Depends check uses the same diagnostic.
+fn control_unreadable() -> PackagingState {
+    PackagingState::Unknown {
+        summary: "debian/control could not be read".to_owned(),
+        evidence: vec!["debian/control is missing or unreadable".to_owned()],
+    }
+}
+
+/// The active Build-Depends value from `debian/control`, joined with
+/// `Build-Depends-Indep` (its entries must also be satisfiable at build
+/// time, e.g. the `clang-<N>:native` removal in the runbook's vendoring),
+/// and with the same fields from `debian/control.in` appended when that
+/// template exists (it is optional and absent on some backport branches).
+/// `None` when `debian/control` itself is missing or unreadable.
 fn build_depends_field(repo_dir: &Path) -> Option<String> {
     let control = read_debian_file(repo_dir, "debian/control")?;
     let mut field = folded_field(&control, "Build-Depends").unwrap_or_default();
-    if repo_dir.join("debian/control.in").exists()
-        && let Some(extra) = read_debian_file(repo_dir, "debian/control.in")
-            .as_deref()
-            .and_then(|c| folded_field(c, "Build-Depends"))
+    if let Some(indep) = folded_field(&control, "Build-Depends-Indep") {
+        push_field(&mut field, &indep);
+    }
+    let template = if repo_dir.join("debian/control.in").exists() {
+        read_debian_file(repo_dir, "debian/control.in")
+    } else {
+        None
+    };
+    if let Some(extra) = template
+        .as_deref()
+        .and_then(|c| folded_field(c, "Build-Depends"))
     {
-        if !field.is_empty() {
-            field.push(' ');
-        }
-        field.push_str(&extra);
+        push_field(&mut field, &extra);
+    }
+    if let Some(extra) = template
+        .as_deref()
+        .and_then(|c| folded_field(c, "Build-Depends-Indep"))
+    {
+        push_field(&mut field, &extra);
     }
     Some(field)
+}
+
+/// Append one dependency field's value to a combined field value.
+fn push_field(field: &mut String, extra: &str) {
+    if !field.is_empty() {
+        field.push(' ');
+    }
+    field.push_str(extra);
 }
 
 /// Split a dependency field into comma-separated entries, ignoring commas
@@ -391,24 +420,22 @@ fn llvm_source_marker(repo_dir: &Path) -> Option<String> {
 }
 
 /// An uncommented `llvm-config = "/usr/..."` line in the bootstrap config
-/// template that selects the system LLVM, together with the major version it
-/// names. Template placeholders (`LLVM_DESTDIR`, `@LLVM_VERSION_MAJOR@`)
-/// carry no version digits and are ignored.
-fn config_system_llvm_config(content: &str) -> Option<(String, String)> {
+/// template that selects the system LLVM. Template placeholders
+/// (`LLVM_DESTDIR`, `@LLVM_VERSION_MAJOR@`) are not `/usr/` paths and are
+/// ignored.
+fn config_llvm_config_line(content: &str) -> Option<String> {
     for line in uncommented_lines(content) {
         let trimmed = line.trim();
-        if !trimmed.contains("llvm-config") || !trimmed.contains("/usr/") {
-            continue;
-        }
-        if let Some(major) = llvm_major_from_llvm_config(trimmed) {
-            return Some((trimmed.to_owned(), major));
+        if trimmed.contains("llvm-config") && trimmed.contains("/usr/") {
+            return Some(trimmed.to_owned());
         }
     }
     None
 }
 
 /// The LLVM major version named by a system `llvm-config` path, either
-/// `/usr/lib/llvm-<N>/...` or `/usr/bin/llvm-config-<N>`.
+/// `/usr/lib/llvm-<N>/...` or `/usr/bin/llvm-config-<N>`. `None` for an
+/// unversioned path such as `/usr/bin/llvm-config`.
 fn llvm_major_from_llvm_config(line: &str) -> Option<String> {
     let candidates = [
         line.find("/usr/lib/llvm-")
@@ -870,6 +897,29 @@ fn lp_source_url(release: &str, package: &str) -> String {
 /// older `debian/bootstrap.toml.in` template). A system LLVM requirement is
 /// inferred from an `LLVM_VERSION = <N>` assignment in `debian/rules` or a
 /// system `llvm-config` path in the config template.
+/// Whether a Build-Depends entry is a versioned LLVM toolchain package that
+/// the vendored build does not use. The runbook's vendoring removes entries
+/// like `llvm-<N>-dev:native`, `llvm-<N>-tools:native`,
+/// `libclang-rt-<N>-dev`, `libclang-common-<N>-dev` and `clang-<N>:native`.
+/// Unversioned names (`llvm-dev`, `libclang-dev`) are not flagged — the
+/// documented fix only removes versioned ones.
+fn is_llvm_toolchain_entry(entry: &str) -> bool {
+    entry.split('|').any(|alt| {
+        let Some((name, _)) = parse_alternative(alt) else {
+            return false;
+        };
+        // Strip the `:native`/`:any` architecture qualifier.
+        let name = name.split(':').next().unwrap_or(&name);
+        let Some((prefix, rest)) = name.split_once('-') else {
+            return false;
+        };
+        matches!(prefix, "llvm" | "libclang" | "clang")
+            && rest
+                .split('-')
+                .any(|segment| !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
 fn assess_llvm(repo_dir: &Path) -> PackagingState {
     let rules = read_debian_file(repo_dir, "debian/rules");
     let rules_major = rules.as_deref().and_then(rules_llvm_major);
@@ -880,8 +930,11 @@ fn assess_llvm(repo_dir: &Path) -> PackagingState {
             read_debian_file(repo_dir, "debian/bootstrap.toml.in")
                 .map(|content| ("debian/bootstrap.toml.in".to_owned(), content))
         });
-    let config_system = config.as_ref().and_then(|(name, content)| {
-        config_system_llvm_config(content).map(|(line, major)| (name.clone(), line, major))
+    let config_system_line = config.as_ref().and_then(|(name, content)| {
+        config_llvm_config_line(content).map(|line| (name.clone(), line))
+    });
+    let config_system_major = config_system_line.as_ref().and_then(|(name, line)| {
+        llvm_major_from_llvm_config(line).map(|major| (name.clone(), line.clone(), major))
     });
     let source_marker = llvm_source_marker(repo_dir);
     let excluded = files_excluded(repo_dir)
@@ -906,7 +959,7 @@ fn assess_llvm(repo_dir: &Path) -> PackagingState {
         }
         match &config {
             Some((name, _)) => {
-                if config_system.is_none() {
+                if config_system_line.is_none() {
                     evidence.push(format!(
                         "{name} does not point llvm-config at the system toolchain"
                     ));
@@ -924,11 +977,32 @@ fn assess_llvm(repo_dir: &Path) -> PackagingState {
                     .to_owned(),
             );
         }
-        if let Some((name, line, _major)) = &config_system {
+        if let Some((name, line)) = &config_system_line {
             issues.push(format!(
                 "{name} still points llvm-config at the system toolchain ({line}); \
                  remove that line so the build uses the bundled LLVM"
             ));
+        }
+        // The runbook's vendoring also removes the versioned LLVM toolchain
+        // packages from Build-Depends; a half-applied fix leaves them declared
+        // and would fail sbuild on a release without llvm-toolchain-<N>.
+        let leftover = build_depends_field(repo_dir)
+            .map(|field| {
+                split_entries(&field)
+                    .into_iter()
+                    .filter(|entry| is_llvm_toolchain_entry(entry))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !leftover.is_empty() {
+            issues.push(format!(
+                "remove the versioned LLVM toolchain packages from Build-Depends — the \
+                 vendored build does not use them: {}",
+                leftover.join(", ")
+            ));
+            for entry in &leftover {
+                evidence.push(format!("debian/control: {entry}"));
+            }
         }
         return PackagingState::SelfContained {
             summary: "already vendored — build uses the bundled src/llvm-project tree".to_owned(),
@@ -949,7 +1023,7 @@ fn assess_llvm(repo_dir: &Path) -> PackagingState {
             evidence: vec![format!("debian/rules: LLVM_VERSION = {major}")],
         };
     }
-    if let Some((name, line, major)) = config_system {
+    if let Some((name, line, major)) = config_system_major {
         return PackagingState::Archive {
             requirement: Requirement::Single {
                 package: format!("llvm-toolchain-{major}"),
@@ -968,9 +1042,16 @@ fn assess_llvm(repo_dir: &Path) -> PackagingState {
             .to_owned(),
     ];
     match &config {
-        Some((name, _)) => evidence.push(format!(
-            "system LLVM: {name} has no llvm-config line pointing at /usr"
-        )),
+        Some((name, _)) => match &config_system_line {
+            Some((_, line)) => evidence.push(format!(
+                "system LLVM: {name} points llvm-config at the system toolchain ({line}) \
+                 but the major version could not be determined — check the \
+                 llvm-toolchain-<N> availability manually"
+            )),
+            None => evidence.push(format!(
+                "system LLVM: {name} has no llvm-config line pointing at /usr"
+            )),
+        },
         None => {
             evidence.push("no debian/config.toml.in or debian/bootstrap.toml.in found".to_owned())
         }
@@ -1016,10 +1097,7 @@ pub async fn check_llvm(repo_dir: &Path, release: &str) -> CheckResult {
 /// `vendored-libgit2` feature survives the active quilt patches.
 fn assess_libgit2(repo_dir: &Path) -> PackagingState {
     let Some(field) = build_depends_field(repo_dir) else {
-        return PackagingState::Unknown {
-            summary: "debian/control could not be read".to_owned(),
-            evidence: vec!["debian/control is missing or unreadable".to_owned()],
-        };
+        return control_unreadable();
     };
     let entries = split_entries(&field);
     let dev_entries = entries_for(&entries, "libgit2-dev");
@@ -1169,10 +1247,7 @@ pub async fn check_libgit2(repo_dir: &Path, release: &str) -> CheckResult {
 /// Build-Depends.
 fn assess_dh_cargo(repo_dir: &Path) -> PackagingState {
     let Some(field) = build_depends_field(repo_dir) else {
-        return PackagingState::Unknown {
-            summary: "debian/control could not be read".to_owned(),
-            evidence: vec!["debian/control is missing or unreadable".to_owned()],
-        };
+        return control_unreadable();
     };
     let entries = split_entries(&field);
     let invocation = read_debian_file(repo_dir, "debian/rules")
@@ -1241,10 +1316,7 @@ pub async fn check_dh_cargo(repo_dir: &Path, release: &str) -> CheckResult {
 /// half-applied fix.
 fn assess_pkgconf(repo_dir: &Path) -> PackagingState {
     let Some(field) = build_depends_field(repo_dir) else {
-        return PackagingState::Unknown {
-            summary: "debian/control could not be read".to_owned(),
-            evidence: vec!["debian/control is missing or unreadable".to_owned()],
-        };
+        return control_unreadable();
     };
     let entries = split_entries(&field);
     let pkgconf_entries = entries_for(&entries, "pkgconf");
@@ -1369,10 +1441,7 @@ pub async fn check_pkgconf(repo_dir: &Path, release: &str) -> CheckResult {
 /// own version constraint.
 fn assess_cmake(repo_dir: &Path) -> PackagingState {
     let Some(field) = build_depends_field(repo_dir) else {
-        return PackagingState::Unknown {
-            summary: "debian/control could not be read".to_owned(),
-            evidence: vec!["debian/control is missing or unreadable".to_owned()],
-        };
+        return control_unreadable();
     };
     let entries = split_entries(&field);
     let is_cmake_provider = |name: &str| matches!(name, "cmake" | "cmake3" | "cmake-mozilla");
@@ -1424,10 +1493,7 @@ pub async fn check_cmake(repo_dir: &Path, release: &str) -> CheckResult {
 /// How the package satisfies its debhelper-compat requirement.
 fn assess_debhelper_compat(repo_dir: &Path) -> PackagingState {
     let Some(field) = build_depends_field(repo_dir) else {
-        return PackagingState::Unknown {
-            summary: "debian/control could not be read".to_owned(),
-            evidence: vec!["debian/control is missing or unreadable".to_owned()],
-        };
+        return control_unreadable();
     };
     let entries = split_entries(&field);
     let Some(entry) = entries_for(&entries, "debhelper-compat").into_iter().next() else {
@@ -1729,17 +1795,15 @@ llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe | source
         assert_eq!(lineno, 2);
         assert!(line.contains("PKG_CONFIG=pkg-config"));
         // Unexported `?=` never reaches the build commands.
-        let (exported, _, _) =
-            pkg_config_setting("PKG_CONFIG ?= pkg-config\n").expect("found");
+        let (exported, _, _) = pkg_config_setting("PKG_CONFIG ?= pkg-config\n").expect("found");
         assert!(!exported);
         let (exported, _, _) =
             pkg_config_setting("export PKG_CONFIG ?= pkg-config\n").expect("found");
         assert!(exported);
         // An exported line wins over a later unexported one.
-        let (exported, _, _) = pkg_config_setting(
-            "export PKG_CONFIG=pkg-config\nPKG_CONFIG ?= pkg-config\n",
-        )
-        .expect("found");
+        let (exported, _, _) =
+            pkg_config_setting("export PKG_CONFIG=pkg-config\nPKG_CONFIG ?= pkg-config\n")
+                .expect("found");
         assert!(exported);
         assert!(pkg_config_setting("export LIBSSH2_SYS_USE_PKG_CONFIG=1\n").is_none());
         assert!(pkg_config_setting("# export PKG_CONFIG=pkg-config\n").is_none());
@@ -1807,6 +1871,137 @@ llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe | source
             other => panic!("expected SelfContained, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_vendored_with_leftover_build_depends_needs_attention() {
+        // The runbook's vendoring removes the versioned LLVM toolchain
+        // packages from Build-Depends; a half-applied fix leaves them.
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n llvm-19-dev:native,\n \
+             llvm-19-tools:native,\n libclang-rt-19-dev (>= 1:19.1.2),\n \
+             libclang-common-19-dev (>= 1:19.1.2),\n cmake (>= 3.0),\n",
+        );
+        write(&repo, "src/llvm-project/llvm/CMakeLists.txt", "cmake\n");
+        write(
+            &repo,
+            "debian/bootstrap.toml.in",
+            "download-ci-llvm = false\n",
+        );
+        match assess_llvm(&repo) {
+            PackagingState::SelfContained {
+                evidence, issues, ..
+            } => {
+                assert_eq!(issues.len(), 1);
+                let issue = &issues[0];
+                assert!(issue.contains("llvm-19-dev:native"));
+                assert!(issue.contains("libclang-rt-19-dev"));
+                assert!(issue.contains("libclang-common-19-dev"));
+                assert!(evidence.iter().any(|e| e.contains("llvm-19-tools:native")));
+                // Unversioned and unrelated entries are not flagged.
+                assert!(!issue.contains("cmake"));
+                assert!(!issue.contains("debhelper"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_vendored_leftover_spotted_in_build_depends_indep() {
+        // The runbook also removes `clang-<N>:native` from
+        // Build-Depends-Indep.
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n\nBuild-Depends-Indep:\n \
+             clang-19:native,\n libssl-dev,\n",
+        );
+        write(&repo, "src/llvm-project/llvm/CMakeLists.txt", "cmake\n");
+        match assess_llvm(&repo) {
+            PackagingState::SelfContained { issues, .. } => {
+                assert!(issues[0].contains("clang-19:native"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_unversioned_config_line_is_unknown_with_honest_evidence() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/bootstrap.toml.in",
+            "llvm-config = \"/usr/bin/llvm-config\"\n",
+        );
+        match assess_llvm(&repo) {
+            PackagingState::Unknown { evidence, .. } => {
+                let joined = evidence.join("\n");
+                assert!(joined.contains("/usr/bin/llvm-config"));
+                assert!(joined.contains("major version could not be determined"));
+                // The old text claimed no line pointed at /usr — wrong here.
+                assert!(!joined.contains("has no llvm-config line"));
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_llvm_vendored_with_unversioned_config_line_needs_attention() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/bootstrap.toml.in",
+            "llvm-config = \"/usr/bin/llvm-config\"\n",
+        );
+        write(&repo, "src/llvm-project/llvm/CMakeLists.txt", "cmake\n");
+        match assess_llvm(&repo) {
+            PackagingState::SelfContained {
+                evidence, issues, ..
+            } => {
+                assert!(issues.iter().any(|i| i.contains("/usr/bin/llvm-config")));
+                // The old text claimed no line pointed at /usr — wrong here.
+                assert!(
+                    !evidence
+                        .iter()
+                        .any(|e| e.contains("does not point llvm-config"))
+                );
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn is_llvm_toolchain_entry_matches_versioned_names_only() {
+        for entry in [
+            "llvm-19-dev:native",
+            "llvm-19-tools:native",
+            "libclang-rt-19-dev (>= 1:19.1.2)",
+            "libclang-common-19-dev",
+            "clang-19:native",
+            "llvm-19",
+        ] {
+            assert!(is_llvm_toolchain_entry(entry), "{entry} should match");
+        }
+        for entry in [
+            "llvm-dev",
+            "libclang-dev",
+            "clang",
+            "clang-format",
+            "cargo-1.97",
+            "rustc-1.97",
+            "cmake (>= 3.0)",
+            "debhelper (>= 9)",
+        ] {
+            assert!(!is_llvm_toolchain_entry(entry), "{entry} should not match");
+        }
     }
 
     #[test]
