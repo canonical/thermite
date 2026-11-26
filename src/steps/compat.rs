@@ -258,7 +258,9 @@ fn active_patches(repo_dir: &Path) -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("include"))
-        .map(str::to_owned)
+        // A series entry may carry options after the patch path (e.g.
+        // "ubuntu/x.patch -p1"); only the path names the patch file.
+        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
         .collect()
 }
 
@@ -426,9 +428,13 @@ fn llvm_major_from_llvm_config(line: &str) -> Option<String> {
     None
 }
 
-/// An uncommented `debian/rules` line exporting `PKG_CONFIG` with a value
-/// that selects `pkg-config`, e.g. `export PKG_CONFIG=pkg-config`.
-fn pkg_config_export_line(rules: &str) -> Option<(usize, String)> {
+/// An uncommented `debian/rules` line setting `PKG_CONFIG` to a value that
+/// selects `pkg-config`, e.g. `export PKG_CONFIG=pkg-config`. Returns the
+/// line and whether it is exported: only exported variables are passed to
+/// the commands make runs, so an unexported setting is a half-applied fix.
+/// An exported line wins over an unexported one.
+fn pkg_config_setting(rules: &str) -> Option<(bool, usize, String)> {
+    let mut unexported = None;
     for (idx, line) in rules.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') || !trimmed.contains("PKG_CONFIG") {
@@ -437,16 +443,21 @@ fn pkg_config_export_line(rules: &str) -> Option<(usize, String)> {
         let Some(eq) = trimmed.find('=') else {
             continue;
         };
+        let exported = trimmed.starts_with("export");
         let lhs = trimmed[..eq]
             .trim_end()
             .trim_end_matches(['?', ':'])
             .trim_end();
         let rhs = trimmed[eq + 1..].trim();
         if lhs.ends_with("PKG_CONFIG") && rhs.contains("pkg-config") {
-            return Some((idx + 1, trimmed.to_owned()));
+            let found = (exported, idx + 1, trimmed.to_owned());
+            if exported {
+                return Some(found);
+            }
+            unexported.get_or_insert(found);
         }
     }
-    None
+    unexported
 }
 
 // ── Word-boundary helpers ─────────────────────────────────────────────────────
@@ -1240,16 +1251,37 @@ fn assess_pkgconf(repo_dir: &Path) -> PackagingState {
     let pkg_config_entries = entries_for(&entries, "pkg-config");
 
     match (pkgconf_entries.is_empty(), pkg_config_entries.is_empty()) {
-        (false, false) => PackagingState::Unknown {
-            summary: "both pkgconf and pkg-config appear in Build-Depends; remove pkgconf if the \
-                 pkg-config fallback was intended"
-                .to_owned(),
-            evidence: pkgconf_entries
+        (false, false) => {
+            // A deliberate alternative (`pkgconf | pkg-config`) works without
+            // the export — pkgconf ships the pkg-config drop-in binary.
+            if pkgconf_entries
                 .iter()
-                .chain(pkg_config_entries.iter())
-                .map(|entry| format!("debian/control: {entry}"))
-                .collect(),
-        },
+                .any(|entry| contains_word(entry, "pkg-config"))
+            {
+                PackagingState::Archive {
+                    requirement: Requirement::Single {
+                        package: "pkgconf".to_owned(),
+                        floor: None,
+                        ceiling: None,
+                    },
+                    evidence: pkgconf_entries
+                        .iter()
+                        .map(|entry| format!("debian/control: {entry}"))
+                        .collect(),
+                }
+            } else {
+                PackagingState::Unknown {
+                    summary: "both pkgconf and pkg-config appear in Build-Depends; remove \
+                         pkgconf if the pkg-config fallback was intended"
+                        .to_owned(),
+                    evidence: pkgconf_entries
+                        .iter()
+                        .chain(pkg_config_entries.iter())
+                        .map(|entry| format!("debian/control: {entry}"))
+                        .collect(),
+                }
+            }
+        }
         (false, true) => PackagingState::Archive {
             requirement: Requirement::Single {
                 package: "pkgconf".to_owned(),
@@ -1264,13 +1296,13 @@ fn assess_pkgconf(repo_dir: &Path) -> PackagingState {
         (true, false) => {
             let export = read_debian_file(repo_dir, "debian/rules")
                 .as_deref()
-                .and_then(pkg_config_export_line);
+                .and_then(pkg_config_setting);
             let evidence: Vec<String> = pkg_config_entries
                 .iter()
                 .map(|entry| format!("debian/control: {entry}"))
                 .collect();
             match export {
-                Some((lineno, line)) => {
+                Some((true, lineno, line)) => {
                     let mut evidence = evidence;
                     evidence.push(format!("debian/rules:{lineno}: {line}"));
                     PackagingState::SelfContained {
@@ -1280,6 +1312,22 @@ fn assess_pkgconf(repo_dir: &Path) -> PackagingState {
                         tarball_regen: false,
                     }
                 }
+                Some((false, lineno, line)) => PackagingState::SelfContained {
+                    summary: "pkg-config is declared but the debian/rules setting is not \
+                         exported"
+                        .to_owned(),
+                    evidence: {
+                        let mut evidence = evidence;
+                        evidence.push(format!("debian/rules:{lineno}: {line}"));
+                        evidence
+                    },
+                    issues: vec![format!(
+                        "export the setting (e.g. 'export PKG_CONFIG=pkg-config') so make \
+                         passes it to the build commands; as written ({line}) it only \
+                         defines a make variable and never reaches the build"
+                    )],
+                    tarball_regen: false,
+                },
                 None => PackagingState::SelfContained {
                     summary: "pkg-config is declared but debian/rules does not export \
                          PKG_CONFIG=pkg-config"
@@ -1674,13 +1722,27 @@ llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe | source
     }
 
     #[test]
-    fn pkg_config_export_line_matches_export_and_ignores_other_vars() {
+    fn pkg_config_setting_prefers_exported_lines_and_flags_unexported_ones() {
         let rules = "export LIBSSH2_SYS_USE_PKG_CONFIG=1\nexport PKG_CONFIG=pkg-config\n";
-        let (lineno, line) = pkg_config_export_line(rules).expect("found");
+        let (exported, lineno, line) = pkg_config_setting(rules).expect("found");
+        assert!(exported);
         assert_eq!(lineno, 2);
         assert!(line.contains("PKG_CONFIG=pkg-config"));
-        assert!(pkg_config_export_line("export LIBSSH2_SYS_USE_PKG_CONFIG=1\n").is_none());
-        assert!(pkg_config_export_line("# export PKG_CONFIG=pkg-config\n").is_none());
+        // Unexported `?=` never reaches the build commands.
+        let (exported, _, _) =
+            pkg_config_setting("PKG_CONFIG ?= pkg-config\n").expect("found");
+        assert!(!exported);
+        let (exported, _, _) =
+            pkg_config_setting("export PKG_CONFIG ?= pkg-config\n").expect("found");
+        assert!(exported);
+        // An exported line wins over a later unexported one.
+        let (exported, _, _) = pkg_config_setting(
+            "export PKG_CONFIG=pkg-config\nPKG_CONFIG ?= pkg-config\n",
+        )
+        .expect("found");
+        assert!(exported);
+        assert!(pkg_config_setting("export LIBSSH2_SYS_USE_PKG_CONFIG=1\n").is_none());
+        assert!(pkg_config_setting("# export PKG_CONFIG=pkg-config\n").is_none());
     }
 
     // ── word-boundary helpers ──────────────────────────────────────────────
@@ -1965,6 +2027,41 @@ llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe | source
     }
 
     #[test]
+    fn assess_libgit2_patch_effects_read_series_options() {
+        // A series entry may carry options after the patch path; the path
+        // must still be resolved and its effect detected.
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n debhelper (>= 9),\n",
+        );
+        write(
+            &repo,
+            "src/tools/cargo/Cargo.toml",
+            "[features]\nvendored-libgit2 = [\"libgit2-sys/vendored\"]\n",
+        );
+        write(&repo, "debian/patches/series", "ubuntu/x.patch -p1\n");
+        write(
+            &repo,
+            "debian/patches/ubuntu/x.patch",
+            "--- a/src/tools/cargo/Cargo.toml\n+++ b/src/tools/cargo/Cargo.toml\n-vendored-libgit2 = [\"libgit2-sys/vendored\"]\n",
+        );
+        write(
+            &repo,
+            "vendor/libgit2-sys-0.18.2+1.9.1/libgit2/CMakeLists.txt",
+            "cmake\n",
+        );
+        match assess_libgit2(&repo) {
+            PackagingState::SelfContained { issues, .. } => {
+                assert!(issues.iter().any(|i| i.contains("vendored-libgit2")));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn assess_libgit2_unknown_reports_both_sides() {
         let repo = temp_repo();
         write(
@@ -2136,6 +2233,49 @@ llvm-toolchain-22 | 1:22.1.6-1ubuntu1 | stonking/universe | source
                 assert!(summary.contains("already switched to pkg-config"));
             }
             other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_pkgconf_unexported_setting_is_half_applied() {
+        let repo = temp_repo();
+        write(&repo, "debian/control", "Build-Depends:\n pkg-config,\n");
+        write(
+            &repo,
+            "debian/rules",
+            "export LIBSSH2_SYS_USE_PKG_CONFIG=1\nPKG_CONFIG ?= pkg-config\n",
+        );
+        match assess_pkgconf(&repo) {
+            PackagingState::SelfContained {
+                summary, issues, ..
+            } => {
+                assert!(summary.contains("not exported"));
+                assert_eq!(issues.len(), 1);
+                assert!(issues[0].contains("export PKG_CONFIG=pkg-config"));
+            }
+            other => panic!("expected SelfContained, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn assess_pkgconf_alternative_is_archive() {
+        let repo = temp_repo();
+        write(
+            &repo,
+            "debian/control",
+            "Build-Depends:\n pkgconf | pkg-config,\n",
+        );
+        match assess_pkgconf(&repo) {
+            PackagingState::Archive {
+                requirement: Requirement::Single { package, .. },
+                evidence,
+            } => {
+                assert_eq!(package, "pkgconf");
+                assert_eq!(evidence, vec!["debian/control: pkgconf | pkg-config"]);
+            }
+            other => panic!("expected Archive, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&repo);
     }
